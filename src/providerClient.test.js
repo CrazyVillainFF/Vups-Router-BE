@@ -206,6 +206,9 @@ test("propagates HTTP 405 with safe diagnostics for both request modes", async (
       }
     }));
   });
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = message => warnings.push(String(message));
   try {
     const baseUrl = `http://127.0.0.1:${port}/v1`;
     const run = () => chatCompletion({
@@ -235,7 +238,16 @@ test("propagates HTTP 405 with safe diagnostics for both request modes", async (
     }
     assert.equal(requests.length, 2);
     assert.ok(requests.every(request => request.method === "POST"));
+    assert.equal(warnings.length, 2);
+    for (const warning of warnings) {
+      assert.match(warning, /POST http:\/\/127\.0\.0\.1:\d+\/v1\/chat\/completions -> HTTP 405/);
+      assert.match(warning, /GPT models must use \/v1\/responses/);
+      assert.ok(!warning.includes("sk-test-secret-123456"));
+      assert.ok(!warning.includes("abc.def.secret"));
+      assert.match(warning, /Bearer \[redacted\]/);
+    }
   } finally {
+    console.warn = originalWarn;
     await close(server);
   }
 });

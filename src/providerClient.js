@@ -184,6 +184,20 @@ export function redactSecrets(value) {
     .replace(/\bsk-[A-Za-z0-9_-]{6,}/g, "sk-[redacted]");
 }
 
+function logProviderFailure(url, status, payload) {
+  let target = "unresolved";
+  try {
+    const parsed = new URL(url);
+    target = parsed.origin + parsed.pathname;
+  } catch {
+    target = String(url).replace(/[?#].*$/, "");
+  }
+  const detail = redactSecrets(truncate(
+    payload?.error?.message || payload?.message || (typeof payload === "string" ? payload : "")
+  ));
+  console.warn(`Provider request failed: POST ${target} -> HTTP ${status}${detail ? `. ${detail}` : ""}`);
+}
+
 export function describeProviderError(status, payload) {
   const detail = redactSecrets(truncate(
     payload?.error?.message || payload?.message || (typeof payload === "string" ? payload : "")
@@ -350,7 +364,9 @@ export async function chatCompletion({ baseUrl, apiKey, model, messages, tempera
     throw networkError(error, url);
   }
   if (!response.ok) {
-    throw describeProviderError(response.status, await readJsonSafely(response));
+    const failure = await readJsonSafely(response);
+    logProviderFailure(url, response.status, failure);
+    throw describeProviderError(response.status, failure);
   }
   const payload = await readJsonSafely(response);
   const content = extractResponseText(payload);
@@ -384,7 +400,9 @@ export async function startChatCompletionStream({ baseUrl, apiKey, model, messag
     throw networkError(error, url);
   }
   if (!response.ok) {
-    throw describeProviderError(response.status, await readJsonSafely(response));
+    const failure = await readJsonSafely(response);
+    logProviderFailure(url, response.status, failure);
+    throw describeProviderError(response.status, failure);
   }
   if (!response.body) {
     throw new ProviderError("The provider did not return a response stream.", response.status, "empty_stream");
