@@ -8,7 +8,7 @@ import { checkOpenRouter, openRouterConfigured, openRouterModel, openRouterProvi
 
 export { setSharedModelEnabled } from "./ollama.js";
 
-export const SHARED_OWNER_LABEL = "VupsRouter shared · no key needed";
+export const SHARED_OWNER_LABEL = "Shared · Free · No API key needed";
 
 export async function sharedModelStatus() {
   const enabled = await sharedModelEnabled();
@@ -19,7 +19,8 @@ export async function sharedModelStatus() {
       provider: "openrouter",
       model: check.model,
       available: enabled && check.available,
-      status: enabled ? check.status : "disabled"
+      status: enabled ? check.status : "disabled",
+      models: check.models ?? []
     };
   }
   const check = await checkOllama();
@@ -28,7 +29,8 @@ export async function sharedModelStatus() {
     provider: "ollama",
     model: check.model,
     available: enabled && check.available,
-    status: enabled ? check.status : "disabled"
+    status: enabled ? check.status : "disabled",
+    models: [{ id: check.model, name: check.model, available: check.available }]
   };
 }
 

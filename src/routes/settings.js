@@ -193,12 +193,15 @@ router.get("/models", async (req, res, next) => {
   try {
     await connectToDatabase();
     const shared = await sharedModelStatus();
-    const sharedEntry = shared.available
-      ? [{ id: shared.model, ownedBy: SHARED_OWNER_LABEL, shared: true }]
+    const sharedModels = Array.isArray(shared.models) ? shared.models : [];
+    const sharedEntries = shared.available
+      ? sharedModels
+          .filter(model => model.available !== false)
+          .map(model => ({ id: model.id, name: model.name || model.id, ownedBy: SHARED_OWNER_LABEL, shared: true }))
       : [];
     const stored = await loadStoredConfig(req.userId);
     if (!stored) {
-      if (sharedEntry.length === 0) {
+      if (sharedEntries.length === 0) {
         return res.status(400).json({
           message: shared.enabled
             ? "The shared AI model is unavailable right now. Try again later or save your own provider configuration."
@@ -207,7 +210,7 @@ router.get("/models", async (req, res, next) => {
           shared
         });
       }
-      return res.json({ models: sharedEntry, shared });
+      return res.json({ models: sharedEntries, shared });
     }
     let apiKey;
     try {
@@ -217,7 +220,7 @@ router.get("/models", async (req, res, next) => {
     }
     try {
       const models = await listProviderModels({ baseUrl: stored.baseUrl, apiKey });
-      const merged = [...models, ...sharedEntry.filter(entry => !models.some(model => model.id === entry.id))];
+      const merged = [...sharedEntries, ...models.filter(model => !sharedEntries.some(entry => entry.id === model.id))];
       return res.json({ models: merged, shared });
     } catch (error) {
       if (error instanceof ProviderError) {

@@ -30,6 +30,7 @@ export async function startFakeProvider() {
     behavior: {
       listStatus: 200,
       chatStatus: 200,
+      chatStatusText: "",
       failStreamMidway: false,
       invalidKey: false
     },
@@ -41,6 +42,7 @@ export async function startFakeProvider() {
       state.modelsRequests = 0;
       state.behavior.listStatus = 200;
       state.behavior.chatStatus = 200;
+      state.behavior.chatStatusText = "";
       state.behavior.failStreamMidway = false;
       state.behavior.invalidKey = false;
     }
@@ -67,7 +69,9 @@ export async function startFakeProvider() {
         return json(res, 401, { error: { message: "Invalid API key provided." } });
       }
       if (state.behavior.chatStatus !== 200) {
-        if (state.behavior.chatStatus === 429) return json(res, 429, { error: { message: "Rate limit reached for this model." } });
+        if (state.behavior.chatStatus === 429) {
+          return json(res, 429, { error: { message: state.behavior.chatStatusText || "Rate limit reached for this model." } });
+        }
         if (state.behavior.chatStatus === 402) return json(res, 402, { error: { message: "Insufficient credits." } });
         if (state.behavior.chatStatus === 404) return json(res, 404, { error: { message: "The model does not exist." } });
         return json(res, state.behavior.chatStatus, { error: { message: "Provider failure." } });

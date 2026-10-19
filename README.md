@@ -159,16 +159,19 @@ Security: if a `.env` file was ever committed to this repo (it was, in the initi
 
 ## OpenRouter shared model (production)
 
-When `OPENROUTER_API_KEY` is set, every registered user — including brand-new accounts — gets a shared OpenRouter model with no personal key. OpenRouter takes precedence over the Ollama shared model (below); if no OpenRouter key is set, the Ollama shared model is used.
+When `OPENROUTER_API_KEY` is set, every registered user — including brand-new accounts — gets shared OpenRouter models with no personal key. Up to four free models are offered in the in-chat model menu under "Shared · Free"; OpenRouter takes precedence over the Ollama shared model (below); if no OpenRouter key is set, the Ollama shared model is used.
 
-Verified live (2026-10): `nvidia/nemotron-3.5-lightning:free` is available on OpenRouter and answered a streamed chat through this backend. The backend checks `GET /api/v1/models` and only reports `available` when the exact configured model ID is currently listed; otherwise the status is `missing_model` / `unreachable`, and chat is blocked with a clear error instead of pretending to work.
+Verified live: the enabled free models answer real chat completions through this backend. The backend checks `GET /api/v1/models` and only lists models that are currently available; if the configured default is missing, status is `missing_model` / `unreachable`, and chat is blocked with a clear error instead of pretending to work. Enabled-but-unavailable models are rejected with `shared_model_unavailable` and the error names an available alternative.
+
+Note (live-testing history): `google/gemma-4-31b-it:free` was dropped from the default set because its upstream provider (Google AI Studio) repeatedly returned `429 temporarily rate-limited upstream` on chat probes while the rest of the catalog stayed healthy — a provider-side throttle, not an invalid model ID. `nvidia/nemotron-3-ultra-550b-a55b:free` was probed live (`finish_reason: stop`) and replaced it. Re-run `scripts/verify-openrouter.mjs` after any model-list change.
 
 Environment variables (set in the Render dashboard):
 
 | Variable | Value |
 | --- | --- |
 | `OPENROUTER_API_KEY` | your OpenRouter key (`sk-or-v1-...`). Server-side only; never commit it and never send it to the frontend. |
-| `OPENROUTER_MODEL` | `nvidia/nemotron-3.5-lightning:free` (default). Any free chat model ID currently in the OpenRouter list works. |
+| `OPENROUTER_MODELS` | comma-separated list of enabled shared model IDs. Defaults to `nvidia/nemotron-3.5-lightning:free,nvidia/nemotron-3-super-120b-a12b:free,cohere/north-mini-code:free,nvidia/nemotron-3-ultra-550b-a55b:free`. Only these IDs are accepted from clients — anything else is rejected with `400 invalid_model` before any upstream call. |
+| `OPENROUTER_MODEL` | `nvidia/nemotron-3.5-lightning:free` (default). Sets which enabled model is the default; it is automatically included in the enabled list. |
 | `OPENROUTER_MAX_OUTPUT_TOKENS` | `1024` (default) — maximum output tokens per shared reply. |
 | `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` (default; override only for testing). |
 | `PROVIDER_TIMEOUT_MS` / `PROVIDER_STREAM_TIMEOUT_MS` | `60000` / `300000` (defaults) — upstream timeouts, both personal and shared providers. |
@@ -177,11 +180,11 @@ Behavior and safety:
 
 - Chat goes through the existing authenticated `POST /api/chat` proxy; the browser never contacts OpenRouter directly and never sees the key, the base URL, or any provider response headers.
 - Shared requests reuse all existing protections: auth, chat rate limiting, per-user daily quota (`AI_DAILY_QUOTA`), per-user concurrency cap (`AI_MAX_CONCURRENCY`), message validation, and the output-token cap above.
-- OpenRouter quota exhaustion (HTTP 429/402) is handled safely: users get `429 {"code":"shared_quota_exhausted"}` — "The shared AI model is temporarily at capacity. Try again later, or connect your own provider." Upstream key problems (401/403) map to `503 {"code":"shared_unavailable"}` and never instruct users to fix a personal key. No raw provider text or account details leak.
+- Rate limits are distinguished: a model-specific rate limit returns `429 {"code":"shared_model_rate_limited"}` ("pick another shared model"), while account-wide free-quota exhaustion (OpenRouter `free-models-per-day` text or HTTP 402) returns `429 {"code":"shared_quota_exhausted"}` and explicitly says switching models will not help. Upstream key problems (401/403) map to `503 {"code":"shared_unavailable"}` and never instruct users to fix a personal key. No raw provider text or account details leak.
 - Free OpenRouter models are shared across the whole account (roughly 50 free requests/day for accounts with under $10 balance), so the per-user daily quota protects the shared pool.
 - Admins (`ADMIN_EMAILS`) can disable/re-enable the shared model at runtime: `POST /api/admin/shared-model {"enabled": false}`.
 
-For a deploy sanity check, `node scripts/verify-openrouter.mjs` (with `OPENROUTER_API_KEY` in the environment) confirms the model list, the key, and performs a minimal chat completion — it never prints the key.
+For a deploy sanity check, `node scripts/verify-openrouter.mjs` (with `OPENROUTER_API_KEY` in the environment) checks every enabled model against the live catalog and performs a minimal chat completion with each — it never prints the key and exits non-zero if any model is missing or not responding.
 
 ## Shared Ollama model (optional)
 
@@ -214,7 +217,7 @@ Do **not** run Ollama inside the existing Render web service. Render's free/stan
    ```
    curl https://vups-router-be.onrender.com/api/health          # database still connected
    ```
-   Sign in as any user and open the app — the model selector should show `gemma3:4b` labeled "Shared · no key needed". `GET /api/settings/shared-model` (authenticated) reports `status: "available"` only when the model is actually installed and the server is reachable.
+   Sign in as any user and open the app — the model selector should show `gemma3:4b` labeled "Shared · Free · No API key needed". `GET /api/settings/shared-model` (authenticated) reports `status: "available"` only when the model is actually installed and the server is reachable.
 6. If the Ollama host is unreachable from Render (private network not routable), requests fail cleanly with `shared_unavailable`; users with personal providers are unaffected.
 
 ### Admin controls

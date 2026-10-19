@@ -2,7 +2,7 @@ import AppSetting from "./appSetting.js";
 
 export const SHARED_SETTING_KEY = "sharedOllamaEnabled";
 export const SHARED_PROVIDER_LABEL = "VupsRouter Shared";
-export const SHARED_OWNER_LABEL = "VupsRouter shared · no key needed";
+export const SHARED_OWNER_LABEL = "Shared · Free · No API key needed";
 export const DEFAULT_SHARED_MODEL = "gemma3:4b";
 
 const TAGS_TIMEOUT_MS = 5000;

@@ -49,7 +49,12 @@ const SHARED_UNAVAILABLE_MESSAGES = {
   missing_model: "The shared model is not installed on the shared server. Please try again later or use your own provider."
 };
 
-function sharedRoute(shared) {
+function sharedModelsOf(shared) {
+  if (Array.isArray(shared?.models) && shared.models.length > 0) return shared.models;
+  return shared?.model ? [{ id: shared.model, name: shared.model, available: shared.available !== false }] : [];
+}
+
+function sharedRoute(shared, requestedModel = "") {
   if (!shared.enabled) {
     throw new ProviderError(
       "The shared AI model has been disabled by an administrator. Configure your own provider in API settings or try again later.",
@@ -68,12 +73,41 @@ function sharedRoute(shared) {
   if (!provider) {
     throw new ProviderError("The shared AI model is not configured on this server.", 503, "shared_unavailable");
   }
+  const enabledModels = sharedModelsOf(shared);
+  const readyIds = enabledModels.filter(model => model.available !== false).map(model => model.id);
+  if (readyIds.length === 0) {
+    throw new ProviderError(
+      "The shared AI models are unavailable right now. Please try again later or use your own provider.",
+      503,
+      "shared_unavailable"
+    );
+  }
+  let model;
+  if (requestedModel) {
+    if (readyIds.includes(requestedModel)) {
+      model = requestedModel;
+    } else if (enabledModels.some(entry => entry.id === requestedModel)) {
+      throw new ProviderError(
+        `That shared model is not available right now. Pick another shared model (${readyIds.join(", ")}) or try again later.`,
+        503,
+        "shared_model_unavailable"
+      );
+    } else {
+      throw new ProviderError(
+        `"${requestedModel.slice(0, 80)}" is not an enabled shared model. Choose one of: ${readyIds.join(", ")}.`,
+        400,
+        "invalid_model"
+      );
+    }
+  } else {
+    model = readyIds[0];
+  }
   return {
     shared: true,
     provider: provider.provider,
     baseUrl: provider.baseUrl,
     apiKey: provider.apiKey,
-    defaultModel: provider.defaultModel,
+    defaultModel: model,
     maxTokens: provider.maxTokens
   };
 }
@@ -81,11 +115,12 @@ function sharedRoute(shared) {
 async function resolveProvider(userId, requestedModel) {
   const shared = await sharedModelStatus();
   const config = await ProviderConfig.findOne({ userId }).select("+encryptedApiKey");
-  if (!config) {
-    return sharedRoute(shared);
+  const sharedIds = new Set(sharedModelsOf(shared).map(model => model.id));
+  if (requestedModel && sharedIds.has(requestedModel)) {
+    return sharedRoute(shared, requestedModel);
   }
-  if (requestedModel && requestedModel === shared.model) {
-    return sharedRoute(shared);
+  if (!config) {
+    return sharedRoute(shared, requestedModel);
   }
   let apiKey;
   try {
@@ -142,10 +177,22 @@ function providerFailureStatus(error) {
 
 function providerFailure(provider, error) {
   if (provider?.shared && (error.code === "rate_limited" || error.code === "insufficient_credits")) {
+    const accountWide =
+      error.code === "insufficient_credits" ||
+      /free-models-per-day|per.day|daily|credits|balance/i.test(String(error.message || ""));
+    if (accountWide) {
+      return {
+        status: 429,
+        message:
+          "The shared free-model quota is temporarily exhausted for the whole account. Switching models will not help until it resets — try again later, or connect your own provider in API settings.",
+        code: "shared_quota_exhausted"
+      };
+    }
     return {
       status: 429,
-      message: "The shared AI model is temporarily at capacity. Try again later, or connect your own provider in API settings.",
-      code: "shared_quota_exhausted"
+      message:
+        "This shared model is rate-limited right now. Pick another shared model from the model menu, or try again in a minute.",
+      code: "shared_model_rate_limited"
     };
   }
   if (provider?.shared && (error.code === "invalid_api_key" || error.code === "forbidden")) {

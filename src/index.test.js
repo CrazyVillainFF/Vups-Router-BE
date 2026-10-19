@@ -846,9 +846,10 @@ test("a user without a provider cannot borrow another user's personal model or c
     body: { stream: false, model: "fake-model-mini", messages: [{ role: "user", content: "give me the personal model" }] }
   });
   assert.equal(response.status, 400);
+  assert.equal(response.body.code, "invalid_model");
   assert.equal(fakeProvider.state.chatRequests.length, 0, "stranger must not reach the owner's provider");
-  assert.equal(fakeOllama.state.chatRequests.length, 1, "request must go to the shared server with the owner's key absent");
-  assert.ok(!fakeOllama.state.chatRequests[0].authorization.includes(FAKE_API_KEY));
+  assert.equal(fakeOllama.state.chatRequests.length, 0, "unknown model IDs must be rejected before any upstream call");
+  assert.ok(!JSON.stringify(response.body).includes(FAKE_API_KEY), "no credential material may appear in the response");
 });
 
 test("unauthorized requests cannot use the shared model", async () => {
@@ -1033,7 +1034,8 @@ async function withOpenRouterEnv(overrides, fn) {
   const previous = {
     OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY,
     OPENROUTER_BASE_URL: process.env.OPENROUTER_BASE_URL,
-    OPENROUTER_MODEL: process.env.OPENROUTER_MODEL
+    OPENROUTER_MODEL: process.env.OPENROUTER_MODEL,
+    OPENROUTER_MODELS: process.env.OPENROUTER_MODELS
   };
   const apply = (name, value) => {
     if (value === undefined) delete process.env[name];
@@ -1042,6 +1044,7 @@ async function withOpenRouterEnv(overrides, fn) {
   apply("OPENROUTER_API_KEY", overrides.apiKey);
   apply("OPENROUTER_BASE_URL", overrides.baseUrl);
   apply("OPENROUTER_MODEL", overrides.model);
+  apply("OPENROUTER_MODELS", overrides.models);
   try {
     return await fn();
   } finally {
@@ -1095,11 +1098,25 @@ test("OpenRouter quota exhaustion is handled safely with a clear 429", async () 
       body: { stream: false, messages: [{ role: "user", content: "quota?" }] }
     });
     assert.equal(rateLimited.status, 429);
-    assert.equal(rateLimited.body.code, "shared_quota_exhausted");
-    assert.match(rateLimited.body.message, /capacity/i);
+    assert.equal(rateLimited.body.code, "shared_model_rate_limited");
+    assert.match(rateLimited.body.message, /another shared model/i);
     assert.ok(!/fake|rate limit reached/i.test(rateLimited.body.message), "raw provider quota text must not leak");
 
-    fakeProvider.state.set({ chatStatus: 402 });
+    fakeProvider.state.set({
+      chatStatus: 429,
+      chatStatusText: "Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day"
+    });
+    const accountWide = await api("/api/chat", {
+      method: "POST",
+      cookie,
+      body: { stream: false, messages: [{ role: "user", content: "daily quota?" }] }
+    });
+    assert.equal(accountWide.status, 429);
+    assert.equal(accountWide.body.code, "shared_quota_exhausted");
+    assert.match(accountWide.body.message, /switching models will not help/i);
+    assert.ok(!/free-models-per-day|credits/i.test(accountWide.body.message), "raw provider quota text must not leak");
+
+    fakeProvider.state.set({ chatStatus: 402, chatStatusText: "" });
     const credits = await api("/api/chat", {
       method: "POST",
       cookie,
@@ -1108,6 +1125,89 @@ test("OpenRouter quota exhaustion is handled safely with a clear 429", async () 
     assert.equal(credits.status, 429);
     assert.equal(credits.body.code, "shared_quota_exhausted");
   });
+});
+
+test("multiple shared models are listed, selectable, and validated server-side", async () => {
+  await withOpenRouterEnv(
+    {
+      apiKey: FAKE_API_KEY,
+      baseUrl: fakeProvider.baseUrl,
+      model: "fake-model-mini",
+      models: "fake-model-mini,fake-model-pro"
+    },
+    async () => {
+      const { cookie } = await signupUser();
+
+      const status = await api("/api/settings/shared-model", { cookie });
+      assert.equal(status.body.shared.available, true);
+      assert.deepEqual(
+        status.body.shared.models.map(model => model.id),
+        ["fake-model-mini", "fake-model-pro"]
+      );
+      assert.equal(status.body.shared.model, "fake-model-mini");
+
+      const models = await api("/api/settings/models", { cookie });
+      assert.equal(models.status, 200);
+      const sharedIds = models.body.models.filter(model => model.shared).map(model => model.id);
+      assert.deepEqual(sharedIds, ["fake-model-mini", "fake-model-pro"]);
+
+      fakeProvider.state.reset();
+      const second = await api("/api/chat", {
+        method: "POST",
+        cookie,
+        body: { stream: false, model: "fake-model-pro", messages: [{ role: "user", content: "use the second model" }] }
+      });
+      assert.equal(second.status, 200);
+      assert.match(second.body.message.content, /Echo from fake-model-pro/);
+      assert.equal(fakeProvider.state.chatRequests[0].body.model, "fake-model-pro");
+
+      fakeProvider.state.reset();
+      const unknown = await api("/api/chat", {
+        method: "POST",
+        cookie,
+        body: { stream: false, model: "totally-made-up-model", messages: [{ role: "user", content: "hack?" }] }
+      });
+      assert.equal(unknown.status, 400);
+      assert.equal(unknown.body.code, "invalid_model");
+      assert.match(unknown.body.message, /fake-model-mini, fake-model-pro/);
+      assert.equal(fakeProvider.state.chatRequests.length, 0, "invalid model IDs must never reach the upstream provider");
+    }
+  );
+});
+
+test("an enabled but unavailable shared model is reported with a clear alternative", async () => {
+  await withOpenRouterEnv(
+    {
+      apiKey: FAKE_API_KEY,
+      baseUrl: fakeProvider.baseUrl,
+      model: "fake-model-mini",
+      models: "fake-model-mini,fake-model-ghost"
+    },
+    async () => {
+      const { cookie } = await signupUser();
+
+      const status = await api("/api/settings/shared-model", { cookie });
+      assert.equal(status.body.shared.available, true);
+      const ghost = status.body.shared.models.find(model => model.id === "fake-model-ghost");
+      assert.equal(ghost.available, false);
+
+      const models = await api("/api/settings/models", { cookie });
+      assert.deepEqual(
+        models.body.models.filter(model => model.shared).map(model => model.id),
+        ["fake-model-mini"]
+      );
+
+      const chat = await api("/api/chat", {
+        method: "POST",
+        cookie,
+        body: { stream: false, model: "fake-model-ghost", messages: [{ role: "user", content: "ghost?" }] }
+      });
+      assert.equal(chat.status, 503);
+      assert.equal(chat.body.code, "shared_model_unavailable");
+      assert.match(chat.body.message, /fake-model-mini/);
+      assert.equal(fakeProvider.state.chatRequests.length, 0);
+    }
+  );
 });
 
 test("OpenRouter server-side key problems never leak details to users", async () => {

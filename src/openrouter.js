@@ -1,4 +1,10 @@
 export const DEFAULT_OPENROUTER_MODEL = "nvidia/nemotron-3.5-lightning:free";
+export const DEFAULT_OPENROUTER_MODELS = [
+  "nvidia/nemotron-3.5-lightning:free",
+  "nvidia/nemotron-3-super-120b-a12b:free",
+  "cohere/north-mini-code:free",
+  "nvidia/nemotron-3-ultra-550b-a55b:free"
+];
 export const OPENROUTER_API_BASE = "https://openrouter.ai/api/v1";
 
 const MODELS_TIMEOUT_MS = 10000;
@@ -30,16 +36,28 @@ export function openRouterModel() {
   return model || DEFAULT_OPENROUTER_MODEL;
 }
 
+export function openRouterModels() {
+  const configured = (process.env.OPENROUTER_MODELS || "")
+    .split(",")
+    .map(value => value.trim())
+    .filter(Boolean);
+  const list = configured.length > 0 ? configured : DEFAULT_OPENROUTER_MODELS;
+  const ordered = [openRouterModel(), ...list].filter(Boolean);
+  return [...new Set(ordered)];
+}
+
 export function openRouterMaxOutputTokens() {
   const value = Number(process.env.OPENROUTER_MAX_OUTPUT_TOKENS);
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : 1024;
 }
 
 export async function checkOpenRouter() {
-  const model = openRouterModel();
+  const models = openRouterModels();
+  const configuredDefault = openRouterModel();
+  const unavailable = models.map(id => ({ id, name: id, available: false }));
   const key = openRouterApiKey();
   const baseUrl = openRouterBaseUrl();
-  if (!key || !baseUrl) return { status: "not_configured", model, available: false };
+  if (!key || !baseUrl) return { status: "not_configured", model: configuredDefault, available: false, models: unavailable };
 
   let response;
   try {
@@ -48,19 +66,36 @@ export async function checkOpenRouter() {
       signal: AbortSignal.timeout(MODELS_TIMEOUT_MS)
     });
   } catch {
-    return { status: "unreachable", model, available: false };
+    return { status: "unreachable", model: configuredDefault, available: false, models: unavailable };
   }
-  if (!response.ok) return { status: "unreachable", model, available: false };
+  if (!response.ok) return { status: "unreachable", model: configuredDefault, available: false, models: unavailable };
 
   let payload;
   try {
     payload = await response.json();
   } catch {
-    return { status: "unreachable", model, available: false };
+    return { status: "unreachable", model: configuredDefault, available: false, models: unavailable };
   }
   const entries = Array.isArray(payload?.data) ? payload.data : [];
-  const installed = entries.some(entry => entry?.id === model);
-  return { status: installed ? "available" : "missing_model", model, available: installed };
+  const byId = new Map(
+    entries.filter(entry => typeof entry?.id === "string").map(entry => [entry.id, entry])
+  );
+  const checked = models.map(id => ({
+    id,
+    name: typeof byId.get(id)?.name === "string" ? byId.get(id).name : id,
+    available: byId.has(id)
+  }));
+  const ready = checked.filter(model => model.available);
+  if (ready.length === 0) {
+    return { status: "missing_model", model: configuredDefault, available: false, models: checked };
+  }
+  const defaultReady = ready.some(model => model.id === configuredDefault);
+  return {
+    status: "available",
+    model: defaultReady ? configuredDefault : ready[0].id,
+    available: true,
+    models: checked
+  };
 }
 
 export function openRouterProviderForChat() {
