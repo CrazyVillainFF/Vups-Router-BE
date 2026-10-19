@@ -3,10 +3,36 @@ import connectToDatabase from "../db.js";
 import User from "../user.js";
 import { requireAdmin, requireAuth, settingsRateLimiter } from "../middleware.js";
 import { usageForEmail } from "../usage.js";
+import { setSharedModelEnabled, sharedModelStatus } from "../sharedModel.js";
 
 const router = Router();
 
 router.use(requireAuth, requireAdmin, settingsRateLimiter);
+
+router.get("/shared-model", async (req, res, next) => {
+  try {
+    await connectToDatabase();
+    return res.json({ shared: await sharedModelStatus() });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.post("/shared-model", async (req, res, next) => {
+  try {
+    const enabled = req.body?.enabled;
+    if (typeof enabled !== "boolean") return res.status(400).json({ message: "enabled must be true or false." });
+    await connectToDatabase();
+    await setSharedModelEnabled(enabled);
+    const shared = await sharedModelStatus();
+    return res.json({
+      message: enabled ? "The shared AI model is enabled." : "The shared AI model is disabled.",
+      shared
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
 
 router.post("/ai-access", async (req, res, next) => {
   try {

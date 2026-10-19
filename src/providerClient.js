@@ -1,5 +1,10 @@
-const REQUEST_TIMEOUT_MS = 60000;
-const STREAM_TIMEOUT_MS = 300000;
+function envMillis(name, fallback) {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) && value >= 1000 ? Math.floor(value) : fallback;
+}
+
+const REQUEST_TIMEOUT_MS = envMillis("PROVIDER_TIMEOUT_MS", 60000);
+const STREAM_TIMEOUT_MS = envMillis("PROVIDER_STREAM_TIMEOUT_MS", 300000);
 const MAX_ERROR_LENGTH = 400;
 
 export class ProviderError extends Error {
@@ -162,10 +167,11 @@ export async function chatCompletion({ baseUrl, apiKey, model, messages, tempera
   return content;
 }
 
-export async function startChatCompletionStream({ baseUrl, apiKey, model, messages, temperature }, signal) {
+export async function startChatCompletionStream({ baseUrl, apiKey, model, messages, temperature, maxTokens }, signal) {
   const url = `${normalizeBaseUrl(baseUrl)}/chat/completions`;
   const body = { model, messages, stream: true };
   if (typeof temperature === "number" && Number.isFinite(temperature)) body.temperature = temperature;
+  if (typeof maxTokens === "number" && Number.isFinite(maxTokens)) body.max_tokens = maxTokens;
 
   let response;
   try {

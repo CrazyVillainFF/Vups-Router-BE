@@ -16,6 +16,13 @@ const { default: app } = await import("./index.js");
 const { default: mongoose } = await import("mongoose");
 const { startFakeProvider, FAKE_API_KEY, FAKE_MODELS } = await import("./testUtils/fakeProvider.js");
 const fakeProvider = await startFakeProvider();
+const { startFakeOllama, FAKE_OLLAMA_MODEL } = await import("./testUtils/fakeOllama.js");
+const fakeOllama = await startFakeOllama();
+process.env.OLLAMA_BASE_URL = fakeOllama.baseUrl;
+process.env.OLLAMA_MODEL = FAKE_OLLAMA_MODEL;
+delete process.env.OPENROUTER_API_KEY;
+delete process.env.OPENROUTER_BASE_URL;
+delete process.env.OPENROUTER_MODEL;
 
 const server = app.listen(0, "127.0.0.1");
 await new Promise(resolve => server.once("listening", resolve));
@@ -24,6 +31,7 @@ const baseURL = `http://127.0.0.1:${server.address().port}`;
 after(async () => {
   await new Promise((resolve, reject) => server.close(error => (error ? reject(error) : resolve())));
   await fakeProvider.close();
+  await fakeOllama.close();
   await mongoose.disconnect();
   await mongod.stop();
 });
@@ -369,19 +377,23 @@ test("test connection reports unreachable endpoints and bad URLs", async () => {
   assert.match(unreachable.body.message, /Could not reach|connect|fetch failed|ECONNREFUSED/i);
 });
 
-test("model listing requires a saved provider configuration", async () => {
+test("model listing offers the shared model to users with no provider configuration", async () => {
   const { cookie } = await signupUser();
   const response = await api("/api/settings/models", { cookie });
-  assert.equal(response.status, 400);
-  assert.match(response.body.message, /Save a provider configuration first/);
+  assert.equal(response.status, 200);
+  const shared = response.body.models.find(model => model.id === FAKE_OLLAMA_MODEL);
+  assert.ok(shared, "expected the shared Ollama model in the list");
+  assert.equal(shared.shared, true);
+  assert.equal(response.body.shared.status, "available");
 });
 
-test("saved configuration lists models from the provider", async () => {
+test("saved configuration lists provider models plus the shared model", async () => {
   const { cookie } = await signupUser();
   await configureProvider(cookie);
   const response = await api("/api/settings/models", { cookie });
   assert.equal(response.status, 200);
-  assert.deepEqual(response.body.models.map(model => model.id), FAKE_MODELS);
+  assert.deepEqual(response.body.models.filter(model => !model.shared).map(model => model.id), FAKE_MODELS);
+  assert.deepEqual(response.body.models.filter(model => model.shared).map(model => model.id), [FAKE_OLLAMA_MODEL]);
 });
 
 // ─── Chat proxy ─────────────────────────────────────────────────────────────
@@ -422,8 +434,7 @@ test("chat requires a configured provider and a selected model", async () => {
     cookie,
     body: { stream: false, messages: [{ role: "user", content: "hi" }] }
   });
-  assert.equal(unconfigured.status, 400);
-  assert.match(unconfigured.body.message, /Settings/);
+  assert.equal(unconfigured.status, 200, "users without a provider fall back to the shared model");
 
   await configureProvider(cookie, { model: "" });
   const noModel = await api("/api/chat", {
@@ -751,4 +762,412 @@ test("malformed JSON bodies are rejected with a clear 400", async () => {
   assert.equal(response.status, 400);
   const body = await response.json();
   assert.match(body.message, /valid JSON/i);
+});
+
+// ─── Shared Ollama model ────────────────────────────────────────────────────
+
+const { setSharedModelEnabled } = await import("./ollama.js");
+
+test("shared model status is visible to signed-in users and never leaks the private server URL", async () => {
+  const { cookie } = await signupUser();
+  const response = await api("/api/settings/shared-model", { cookie });
+  assert.equal(response.status, 200);
+  assert.equal(response.body.shared.model, FAKE_OLLAMA_MODEL);
+  assert.equal(response.body.shared.enabled, true);
+  assert.equal(response.body.shared.available, true);
+  assert.equal(response.body.shared.status, "available");
+  assert.ok(!JSON.stringify(response.body).includes(fakeOllama.baseUrl), "shared status must not include the Ollama base URL");
+});
+
+test("a brand-new user can chat through the shared model without configuring anything", async () => {
+  const { cookie } = await signupUser();
+  fakeOllama.state.chatRequests.length = 0;
+  const response = await api("/api/chat", {
+    method: "POST",
+    cookie,
+    body: { stream: false, messages: [{ role: "user", content: "hello shared model" }] }
+  });
+  assert.equal(response.status, 200);
+  assert.match(response.body.message.content, /Shared reply from gemma3:4b/);
+  assert.equal(fakeOllama.state.chatRequests.length, 1);
+  assert.equal(fakeOllama.state.chatRequests[0].body.model, FAKE_OLLAMA_MODEL);
+  assert.equal(fakeOllama.state.chatRequests[0].body.max_tokens, 1024);
+  const conversations = await api("/api/conversations", { cookie });
+  assert.equal(conversations.body.conversations.length, 1);
+});
+
+test("new users can stream from the shared model", async () => {
+  const { cookie } = await signupUser();
+  const response = await api("/api/chat", {
+    method: "POST",
+    cookie,
+    body: { stream: true, model: FAKE_OLLAMA_MODEL, messages: [{ role: "user", content: "stream please" }] }
+  });
+  assert.equal(response.status, 200);
+  assert.match(response.text, /"type":"delta"/);
+  assert.match(response.text, /"type":"done"/);
+  assert.match(response.text, /Shared /);
+});
+
+test("users with their own provider keep it, and shared requests never use personal credentials", async () => {
+  const personal = await signupUser();
+  await configureProvider(personal.cookie);
+  fakeProvider.state.reset();
+  const viaPersonal = await api("/api/chat", {
+    method: "POST",
+    cookie: personal.cookie,
+    body: { stream: false, messages: [{ role: "user", content: "personal path" }] }
+  });
+  assert.equal(viaPersonal.status, 200);
+  assert.equal(fakeProvider.state.chatRequests.length, 1);
+
+  const fresh = await signupUser();
+  fakeProvider.state.reset();
+  fakeOllama.state.chatRequests.length = 0;
+  const viaShared = await api("/api/chat", {
+    method: "POST",
+    cookie: fresh.cookie,
+    body: { stream: false, model: FAKE_OLLAMA_MODEL, messages: [{ role: "user", content: "shared path" }] }
+  });
+  assert.equal(viaShared.status, 200);
+  assert.equal(fakeProvider.state.chatRequests.length, 0, "shared requests must not reach the personal provider");
+  assert.equal(fakeOllama.state.chatRequests.length, 1);
+});
+
+test("a user without a provider cannot borrow another user's personal model or credentials", async () => {
+  const owner = await signupUser();
+  await configureProvider(owner.cookie);
+  const stranger = await signupUser();
+  fakeProvider.state.reset();
+  fakeOllama.state.chatRequests.length = 0;
+  const response = await api("/api/chat", {
+    method: "POST",
+    cookie: stranger.cookie,
+    body: { stream: false, model: "fake-model-mini", messages: [{ role: "user", content: "give me the personal model" }] }
+  });
+  assert.equal(response.status, 400);
+  assert.equal(fakeProvider.state.chatRequests.length, 0, "stranger must not reach the owner's provider");
+  assert.equal(fakeOllama.state.chatRequests.length, 1, "request must go to the shared server with the owner's key absent");
+  assert.ok(!fakeOllama.state.chatRequests[0].authorization.includes(FAKE_API_KEY));
+});
+
+test("unauthorized requests cannot use the shared model", async () => {
+  const models = await api("/api/settings/models");
+  assert.equal(models.status, 401);
+  const shared = await api("/api/settings/shared-model");
+  assert.equal(shared.status, 401);
+  const chat = await api("/api/chat", {
+    method: "POST",
+    body: { stream: false, messages: [{ role: "user", content: "no cookie" }] }
+  });
+  assert.equal(chat.status, 401);
+});
+
+test("missing Ollama configuration is reported honestly", async () => {
+  const previous = process.env.OLLAMA_BASE_URL;
+  delete process.env.OLLAMA_BASE_URL;
+  try {
+    const { cookie } = await signupUser();
+    const status = await api("/api/settings/shared-model", { cookie });
+    assert.equal(status.status, 200);
+    assert.equal(status.body.shared.status, "not_configured");
+    assert.equal(status.body.shared.available, false);
+    const models = await api("/api/settings/models", { cookie });
+    assert.equal(models.status, 400);
+    assert.equal(models.body.code, "shared_unavailable");
+    const chat = await api("/api/chat", {
+      method: "POST",
+      cookie,
+      body: { stream: false, messages: [{ role: "user", content: "hi" }] }
+    });
+    assert.equal(chat.status, 503);
+    assert.equal(chat.body.code, "shared_unavailable");
+    assert.match(chat.body.message, /not configured/i);
+  } finally {
+    process.env.OLLAMA_BASE_URL = previous;
+  }
+});
+
+test("an unreachable Ollama server is reported as unreachable", async () => {
+  const previous = process.env.OLLAMA_BASE_URL;
+  process.env.OLLAMA_BASE_URL = "http://127.0.0.1:9";
+  try {
+    const { cookie } = await signupUser();
+    const status = await api("/api/settings/shared-model", { cookie });
+    assert.equal(status.body.shared.status, "unreachable");
+    assert.equal(status.body.shared.available, false);
+    const chat = await api("/api/chat", {
+      method: "POST",
+      cookie,
+      body: { stream: false, messages: [{ role: "user", content: "hi" }] }
+    });
+    assert.equal(chat.status, 503);
+    assert.equal(chat.body.code, "shared_unavailable");
+    assert.match(chat.body.message, /unreachable/i);
+  } finally {
+    process.env.OLLAMA_BASE_URL = previous;
+  }
+});
+
+test("a missing shared model is reported instead of pretending it is available", async () => {
+  fakeOllama.state.installed = ["llama3:8b"];
+  try {
+    const { cookie } = await signupUser();
+    const status = await api("/api/settings/shared-model", { cookie });
+    assert.equal(status.body.shared.status, "missing_model");
+    assert.equal(status.body.shared.available, false);
+    const models = await api("/api/settings/models", { cookie });
+    assert.equal(models.status, 400);
+    assert.equal(models.body.code, "shared_unavailable");
+    assert.equal(models.body.shared.status, "missing_model");
+    const chat = await api("/api/chat", {
+      method: "POST",
+      cookie,
+      body: { stream: false, messages: [{ role: "user", content: "hi" }] }
+    });
+    assert.equal(chat.status, 503);
+    assert.match(chat.body.message, /not installed/i);
+  } finally {
+    fakeOllama.state.installed = [FAKE_OLLAMA_MODEL, "llama3:8b"];
+  }
+});
+
+test("chat requests are rate limited and return a clear 429", async () => {
+  const { spawn } = await import("node:child_process");
+  const script = `
+process.env.NODE_ENV = "test";
+process.env.CHAT_RATE_LIMIT_MAX = "2";
+const express = (await import("express")).default;
+const { chatRateLimiter } = await import("./src/middleware.js");
+const app = express();
+app.post("/api/chat", chatRateLimiter, (_req, res) => res.json({ ok: true }));
+const server = app.listen(0, "127.0.0.1", () => console.log("PORT " + server.address().port));
+`;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", script], { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"] });
+  try {
+    const port = await new Promise((resolve, reject) => {
+      let output = "";
+      const timer = setTimeout(() => reject(new Error("rate-limit helper did not start in time")), 15000);
+      child.stdout.on("data", chunk => {
+        output += chunk;
+        const match = output.match(/PORT (\d+)/);
+        if (match) {
+          clearTimeout(timer);
+          resolve(match[1]);
+        }
+      });
+      child.on("exit", code => {
+        clearTimeout(timer);
+        reject(new Error(`rate-limit helper exited with code ${code}`));
+      });
+    });
+    const post = () => fetch(`http://127.0.0.1:${port}/api/chat`, { method: "POST" });
+    assert.equal((await post()).status, 200);
+    assert.equal((await post()).status, 200);
+    const blocked = await post();
+    assert.equal(blocked.status, 429);
+    const body = await blocked.json();
+    assert.match(body.message, /Too many chat requests/);
+  } finally {
+    child.kill();
+  }
+});
+
+test("administrators can disable and re-enable the shared model for everyone", async () => {
+  const admin = await signupUser();
+  const user = await signupUser();
+  process.env.ADMIN_EMAILS = admin.email;
+  try {
+    const forbidden = await api("/api/admin/shared-model", {
+      method: "POST",
+      cookie: user.cookie,
+      body: { enabled: false }
+    });
+    assert.equal(forbidden.status, 403);
+
+    const disabled = await api("/api/admin/shared-model", {
+      method: "POST",
+      cookie: admin.cookie,
+      body: { enabled: false }
+    });
+    assert.equal(disabled.status, 200);
+    assert.equal(disabled.body.shared.status, "disabled");
+
+    const status = await api("/api/settings/shared-model", { cookie: user.cookie });
+    assert.equal(status.body.shared.status, "disabled");
+
+    const models = await api("/api/settings/models", { cookie: user.cookie });
+    assert.equal(models.status, 400);
+    assert.equal(models.body.code, "shared_disabled");
+
+    const chat = await api("/api/chat", {
+      method: "POST",
+      cookie: user.cookie,
+      body: { stream: false, messages: [{ role: "user", content: "hi" }] }
+    });
+    assert.equal(chat.status, 403);
+    assert.equal(chat.body.code, "shared_disabled");
+
+    const reEnabled = await api("/api/admin/shared-model", {
+      method: "POST",
+      cookie: admin.cookie,
+      body: { enabled: true }
+    });
+    assert.equal(reEnabled.status, 200);
+    assert.equal(reEnabled.body.shared.status, "available");
+    const worksAgain = await api("/api/chat", {
+      method: "POST",
+      cookie: user.cookie,
+      body: { stream: false, messages: [{ role: "user", content: "welcome back" }] }
+    });
+    assert.equal(worksAgain.status, 200);
+  } finally {
+    delete process.env.ADMIN_EMAILS;
+    await setSharedModelEnabled(true);
+  }
+});
+
+// ─── OpenRouter shared model ────────────────────────────────────────────────
+
+async function withOpenRouterEnv(overrides, fn) {
+  const previous = {
+    OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY,
+    OPENROUTER_BASE_URL: process.env.OPENROUTER_BASE_URL,
+    OPENROUTER_MODEL: process.env.OPENROUTER_MODEL
+  };
+  const apply = (name, value) => {
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  };
+  apply("OPENROUTER_API_KEY", overrides.apiKey);
+  apply("OPENROUTER_BASE_URL", overrides.baseUrl);
+  apply("OPENROUTER_MODEL", overrides.model);
+  try {
+    return await fn();
+  } finally {
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    fakeProvider.state.reset();
+  }
+}
+
+test("OpenRouter becomes the shared model when OPENROUTER_API_KEY is configured", async () => {
+  await withOpenRouterEnv({ apiKey: FAKE_API_KEY, baseUrl: fakeProvider.baseUrl, model: "fake-model-pro" }, async () => {
+    const { cookie } = await signupUser();
+
+    const status = await api("/api/settings/shared-model", { cookie });
+    assert.equal(status.status, 200);
+    assert.equal(status.body.shared.provider, "openrouter");
+    assert.equal(status.body.shared.model, "fake-model-pro");
+    assert.equal(status.body.shared.available, true);
+    assert.equal(status.body.shared.status, "available");
+    assert.ok(!JSON.stringify(status.body).includes(fakeProvider.baseUrl), "shared status must not leak the provider base URL");
+
+    const models = await api("/api/settings/models", { cookie });
+    assert.equal(models.status, 200);
+    const shared = models.body.models.find(model => model.shared);
+    assert.equal(shared.id, "fake-model-pro");
+
+    fakeProvider.state.reset();
+    const chat = await api("/api/chat", {
+      method: "POST",
+      cookie,
+      body: { stream: false, messages: [{ role: "user", content: "openrouter hello" }] }
+    });
+    assert.equal(chat.status, 200);
+    assert.match(chat.body.message.content, /Echo from fake-model-pro/);
+    assert.equal(fakeProvider.state.chatRequests.length, 1);
+    assert.equal(fakeProvider.state.chatRequests[0].body.model, "fake-model-pro");
+    assert.equal(fakeProvider.state.chatRequests[0].body.max_tokens, 1024);
+    assert.equal(fakeProvider.state.chatRequests[0].key, FAKE_API_KEY, "server-side key must be attached on the backend");
+  });
+});
+
+test("OpenRouter quota exhaustion is handled safely with a clear 429", async () => {
+  await withOpenRouterEnv({ apiKey: FAKE_API_KEY, baseUrl: fakeProvider.baseUrl, model: "fake-model-pro" }, async () => {
+    const { cookie } = await signupUser();
+    fakeProvider.state.set({ chatStatus: 429 });
+    const rateLimited = await api("/api/chat", {
+      method: "POST",
+      cookie,
+      body: { stream: false, messages: [{ role: "user", content: "quota?" }] }
+    });
+    assert.equal(rateLimited.status, 429);
+    assert.equal(rateLimited.body.code, "shared_quota_exhausted");
+    assert.match(rateLimited.body.message, /capacity/i);
+    assert.ok(!/fake|rate limit reached/i.test(rateLimited.body.message), "raw provider quota text must not leak");
+
+    fakeProvider.state.set({ chatStatus: 402 });
+    const credits = await api("/api/chat", {
+      method: "POST",
+      cookie,
+      body: { stream: false, messages: [{ role: "user", content: "credits?" }] }
+    });
+    assert.equal(credits.status, 429);
+    assert.equal(credits.body.code, "shared_quota_exhausted");
+  });
+});
+
+test("OpenRouter server-side key problems never leak details to users", async () => {
+  await withOpenRouterEnv({ apiKey: FAKE_API_KEY, baseUrl: fakeProvider.baseUrl, model: "fake-model-pro" }, async () => {
+    const { cookie } = await signupUser();
+    fakeProvider.state.set({ invalidKey: true });
+    const chat = await api("/api/chat", {
+      method: "POST",
+      cookie,
+      body: { stream: false, messages: [{ role: "user", content: "key issue" }] }
+    });
+    assert.equal(chat.status, 503);
+    assert.equal(chat.body.code, "shared_unavailable");
+    assert.ok(!/your api key|check the key/i.test(chat.body.message), "shared key failures must not tell users to check a nonexistent personal key");
+  });
+});
+
+test("an unreachable OpenRouter server is reported as unreachable", async () => {
+  await withOpenRouterEnv({ apiKey: FAKE_API_KEY, baseUrl: "http://127.0.0.1:9/v1", model: "fake-model-pro" }, async () => {
+    const { cookie } = await signupUser();
+    const status = await api("/api/settings/shared-model", { cookie });
+    assert.equal(status.body.shared.provider, "openrouter");
+    assert.equal(status.body.shared.status, "unreachable");
+    assert.equal(status.body.shared.available, false);
+    const chat = await api("/api/chat", {
+      method: "POST",
+      cookie,
+      body: { stream: false, messages: [{ role: "user", content: "hi" }] }
+    });
+    assert.equal(chat.status, 503);
+    assert.equal(chat.body.code, "shared_unavailable");
+    assert.match(chat.body.message, /unreachable/i);
+  });
+});
+
+test("a missing OpenRouter model is reported instead of pretending it is available", async () => {
+  await withOpenRouterEnv({ apiKey: FAKE_API_KEY, baseUrl: fakeProvider.baseUrl, model: "fake-model-does-not-exist" }, async () => {
+    const { cookie } = await signupUser();
+    const status = await api("/api/settings/shared-model", { cookie });
+    assert.equal(status.body.shared.status, "missing_model");
+    assert.equal(status.body.shared.available, false);
+    const models = await api("/api/settings/models", { cookie });
+    assert.equal(models.status, 400);
+    assert.equal(models.body.code, "shared_unavailable");
+    assert.equal(models.body.shared.status, "missing_model");
+    const chat = await api("/api/chat", {
+      method: "POST",
+      cookie,
+      body: { stream: false, messages: [{ role: "user", content: "hi" }] }
+    });
+    assert.equal(chat.status, 503);
+    assert.equal(chat.body.code, "shared_unavailable");
+  });
+});
+
+test("OpenRouter without an API key falls back to the Ollama shared model", async () => {
+  await withOpenRouterEnv({ apiKey: undefined, baseUrl: fakeProvider.baseUrl, model: "fake-model-pro" }, async () => {
+    const { cookie } = await signupUser();
+    const status = await api("/api/settings/shared-model", { cookie });
+    assert.equal(status.body.shared.provider, "ollama");
+    assert.equal(status.body.shared.status, "available");
+  });
 });

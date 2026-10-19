@@ -138,6 +138,77 @@ If `/api/health` returns `"reason":"timeout"` from Render, it is almost always A
 
 Security: if a `.env` file was ever committed to this repo (it was, in the initial commit), rotate `JWT_SECRET` and `ENCRYPTION_SECRET` so the exposed values can no longer be used.
 
+## OpenRouter shared model (production)
+
+When `OPENROUTER_API_KEY` is set, every registered user — including brand-new accounts — gets a shared OpenRouter model with no personal key. OpenRouter takes precedence over the Ollama shared model (below); if no OpenRouter key is set, the Ollama shared model is used.
+
+Verified live (2026-10): `nvidia/nemotron-3.5-lightning:free` is available on OpenRouter and answered a streamed chat through this backend. The backend checks `GET /api/v1/models` and only reports `available` when the exact configured model ID is currently listed; otherwise the status is `missing_model` / `unreachable`, and chat is blocked with a clear error instead of pretending to work.
+
+Environment variables (set in the Render dashboard):
+
+| Variable | Value |
+| --- | --- |
+| `OPENROUTER_API_KEY` | your OpenRouter key (`sk-or-v1-...`). Server-side only; never commit it and never send it to the frontend. |
+| `OPENROUTER_MODEL` | `nvidia/nemotron-3.5-lightning:free` (default). Any free chat model ID currently in the OpenRouter list works. |
+| `OPENROUTER_MAX_OUTPUT_TOKENS` | `1024` (default) — maximum output tokens per shared reply. |
+| `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` (default; override only for testing). |
+| `PROVIDER_TIMEOUT_MS` / `PROVIDER_STREAM_TIMEOUT_MS` | `60000` / `300000` (defaults) — upstream timeouts, both personal and shared providers. |
+
+Behavior and safety:
+
+- Chat goes through the existing authenticated `POST /api/chat` proxy; the browser never contacts OpenRouter directly and never sees the key, the base URL, or any provider response headers.
+- Shared requests reuse all existing protections: auth, chat rate limiting, per-user daily quota (`AI_DAILY_QUOTA`), per-user concurrency cap (`AI_MAX_CONCURRENCY`), message validation, and the output-token cap above.
+- OpenRouter quota exhaustion (HTTP 429/402) is handled safely: users get `429 {"code":"shared_quota_exhausted"}` — "The shared AI model is temporarily at capacity. Try again later, or connect your own provider." Upstream key problems (401/403) map to `503 {"code":"shared_unavailable"}` and never instruct users to fix a personal key. No raw provider text or account details leak.
+- Free OpenRouter models are shared across the whole account (roughly 50 free requests/day for accounts with under $10 balance), so the per-user daily quota protects the shared pool.
+- Admins (`ADMIN_EMAILS`) can disable/re-enable the shared model at runtime: `POST /api/admin/shared-model {"enabled": false}`.
+
+For a deploy sanity check, `node scripts/verify-openrouter.mjs` (with `OPENROUTER_API_KEY` in the environment) confirms the model list, the key, and performs a minimal chat completion — it never prints the key.
+
+## Shared Ollama model (optional)
+
+Every authenticated user — including brand-new accounts — gets one shared model without configuring a personal API key. Personal providers keep working unchanged; users simply pick the shared model in the model selector.
+
+How it works:
+
+- The backend proxies shared chat requests to an Ollama server using `POST {OLLAMA_BASE_URL}/v1/chat/completions` and checks availability with `GET {OLLAMA_BASE_URL}/api/tags`.
+- `OLLAMA_BASE_URL` is a private, backend-only value. It is never sent to browsers, never appears in any API response, and must never be baked into frontend code.
+- Availability is honest: if the server is unreachable, the model is missing, or the shared model is disabled, the API reports `unreachable` / `missing_model` / `disabled` instead of pretending it works. If `OLLAMA_BASE_URL` is unset, the status is `not_configured`.
+- Shared requests go through the same authenticated `/api/chat` route as personal ones, so they share the existing auth, rate limiting (`CHAT_RATE_LIMIT_MAX` per minute), per-user daily quota (`AI_DAILY_QUOTA`), per-user concurrency cap (`AI_MAX_CONCURRENCY`), and message validation. Shared output is capped by `OLLAMA_MAX_OUTPUT_TOKENS` (default 1024).
+
+Environment variables (set in the Render dashboard):
+
+| Variable | Value |
+| --- | --- |
+| `OLLAMA_BASE_URL` | private URL of the Ollama server, e.g. `https://ollama-internal.example.com` or `http://10.0.0.5:11434`. Leave unset to disable the shared model entirely. |
+| `OLLAMA_MODEL` | `gemma3:4b` (default). Must be installed on the Ollama server — the backend verifies this via `/api/tags`. |
+| `OLLAMA_MAX_OUTPUT_TOKENS` | `1024` (default) — maximum output tokens per shared reply. |
+
+### Deploying Ollama on a separate, persistent server
+
+Do **not** run Ollama inside the existing Render web service. Render's free/standard web instances have ephemeral disks (the pulled model would vanish on every deploy) and are sized for HTTP workloads, not model inference.
+
+1. Provision a separate machine with a persistent disk (any small VM from any cloud, an on-prem box, or a GPU host; `gemma3:4b` runs on CPU with ~4 GB RAM but is much faster with a GPU). Attach a persistent volume for model storage — models live in `~/.ollama` by default.
+2. Install Ollama on that machine (Linux): `curl -fsSL https://ollama.com/install.sh | sh`, then run it as a service (`systemctl enable --now ollama`). Set `OLLAMA_HOST=0.0.0.0:11434` if the backend must reach it over the network, or keep it on `127.0.0.1:11434` behind a reverse proxy.
+3. Pull the model once, on the Ollama host: `ollama pull gemma3:4b`. Verify: `curl http://127.0.0.1:11434/api/tags` lists `gemma3:4b`. Re-pull after any model change; the disk must persist across restarts.
+4. Expose it **privately** to the backend only: terminate TLS at a reverse proxy (Caddy/nginx) or use a private network/VPN between the Render service and the Ollama host. Restrict inbound traffic to the backend (firewall allowlist, or a proxy that requires a secret header). Never expose the Ollama port publicly without authentication — it has no built-in auth.
+5. Set `OLLAMA_BASE_URL` on Render to the private address, redeploy the backend, and verify:
+   ```
+   curl https://vups-router-be.onrender.com/api/health          # database still connected
+   ```
+   Sign in as any user and open the app — the model selector should show `gemma3:4b` labeled "Shared · no key needed". `GET /api/settings/shared-model` (authenticated) reports `status: "available"` only when the model is actually installed and the server is reachable.
+6. If the Ollama host is unreachable from Render (private network not routable), requests fail cleanly with `shared_unavailable`; users with personal providers are unaffected.
+
+### Admin controls
+
+Administrators (listed in `ADMIN_EMAILS`) can toggle the shared model for all users at runtime — no redeploy needed:
+
+| Method | Path | Notes |
+| --- | --- | --- |
+| `GET` | `/api/admin/shared-model` | current status (enabled/disabled + availability) |
+| `POST` | `/api/admin/shared-model` | `{ "enabled": false }` disables the shared model for everyone; `true` re-enables |
+
+Ordinary users receive `403` on all `/api/admin/*` routes, and the admin toggle is never exposed in the client UI.
+
 ## Security notes
 
 - Provider API keys are encrypted with authenticated AES-256-GCM using `ENCRYPTION_SECRET` and are never returned to the client in full.

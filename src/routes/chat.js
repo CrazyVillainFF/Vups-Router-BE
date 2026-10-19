@@ -13,6 +13,7 @@ import {
 } from "../providerClient.js";
 import { chatRateLimiter, requireAuth } from "../middleware.js";
 import { UsageError, acquireSlot, consumeDailyQuota, releaseSlot } from "../usage.js";
+import { sharedModelStatus, sharedProviderForChat } from "../sharedModel.js";
 
 const router = Router();
 
@@ -42,10 +43,49 @@ function validateMessages(value) {
   return { messages };
 }
 
-async function resolveProvider(userId) {
+const SHARED_UNAVAILABLE_MESSAGES = {
+  not_configured: "The shared AI model is not configured on this server. Configure your own provider in API settings.",
+  unreachable: "The shared AI model server is unreachable right now. Please try again later or use your own provider.",
+  missing_model: "The shared model is not installed on the shared server. Please try again later or use your own provider."
+};
+
+function sharedRoute(shared) {
+  if (!shared.enabled) {
+    throw new ProviderError(
+      "The shared AI model has been disabled by an administrator. Configure your own provider in API settings or try again later.",
+      403,
+      "shared_disabled"
+    );
+  }
+  if (!shared.available) {
+    throw new ProviderError(
+      SHARED_UNAVAILABLE_MESSAGES[shared.status] ?? "The shared AI model is unavailable right now. Please try again later.",
+      503,
+      "shared_unavailable"
+    );
+  }
+  const provider = sharedProviderForChat();
+  if (!provider) {
+    throw new ProviderError("The shared AI model is not configured on this server.", 503, "shared_unavailable");
+  }
+  return {
+    shared: true,
+    provider: provider.provider,
+    baseUrl: provider.baseUrl,
+    apiKey: provider.apiKey,
+    defaultModel: provider.defaultModel,
+    maxTokens: provider.maxTokens
+  };
+}
+
+async function resolveProvider(userId, requestedModel) {
+  const shared = await sharedModelStatus();
   const config = await ProviderConfig.findOne({ userId }).select("+encryptedApiKey");
   if (!config) {
-    throw new ProviderError("Configure your AI provider in Settings first.", 400, "not_configured");
+    return sharedRoute(shared);
+  }
+  if (requestedModel && requestedModel === shared.model) {
+    return sharedRoute(shared);
   }
   let apiKey;
   try {
@@ -54,10 +94,12 @@ async function resolveProvider(userId) {
     throw new ProviderError("The stored API key could not be decrypted. Re-enter and save your key in Settings.", 500, "key_decryption_failed");
   }
   return {
+    shared: false,
     provider: config.provider,
     baseUrl: normalizeBaseUrl(config.baseUrl),
     defaultModel: config.model || "",
-    apiKey
+    apiKey,
+    maxTokens: undefined
   };
 }
 
@@ -98,6 +140,24 @@ function providerFailureStatus(error) {
   return 400;
 }
 
+function providerFailure(provider, error) {
+  if (provider?.shared && (error.code === "rate_limited" || error.code === "insufficient_credits")) {
+    return {
+      status: 429,
+      message: "The shared AI model is temporarily at capacity. Try again later, or connect your own provider in API settings.",
+      code: "shared_quota_exhausted"
+    };
+  }
+  if (provider?.shared && (error.code === "invalid_api_key" || error.code === "forbidden")) {
+    return {
+      status: 503,
+      message: "The shared AI model is unavailable right now. Try again later, or connect your own provider in API settings.",
+      code: "shared_unavailable"
+    };
+  }
+  return { status: providerFailureStatus(error), message: error.message, code: error.code };
+}
+
 router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
   try {
     const body = req.body || {};
@@ -116,17 +176,18 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
       return res.status(403).json({ message: "AI chat has been disabled for your account by an administrator.", code: "ai_disabled" });
     }
 
+    const requestedModel = typeof body.model === "string" ? body.model.trim() : "";
+
     let provider;
     try {
-      provider = await resolveProvider(req.userId);
+      provider = await resolveProvider(req.userId, requestedModel);
     } catch (error) {
       if (error instanceof ProviderError) {
-        return res.status(error.code === "key_decryption_failed" ? 500 : 400).json({ message: error.message, code: error.code });
+        return res.status(error.status ?? (error.code === "key_decryption_failed" ? 500 : 400)).json({ message: error.message, code: error.code });
       }
       throw error;
     }
 
-    const requestedModel = typeof body.model === "string" ? body.model.trim() : "";
     const model = requestedModel || provider.defaultModel;
     if (!model) return res.status(400).json({ message: "Select a model in Settings or choose one from the model picker.", code: "no_model" });
 
@@ -151,12 +212,13 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
       let reply;
       try {
         reply = await chatCompletion(
-          { baseUrl: provider.baseUrl, apiKey: provider.apiKey, model, messages: upstreamMessages, temperature },
+          { baseUrl: provider.baseUrl, apiKey: provider.apiKey, model, messages: upstreamMessages, temperature, maxTokens: provider.maxTokens },
           undefined
         );
       } catch (error) {
         if (error instanceof ProviderError) {
-          return res.status(providerFailureStatus(error)).json({ message: error.message, code: error.code });
+          const failure = providerFailure(provider, error);
+          return res.status(failure.status).json({ message: failure.message, code: failure.code });
         }
         throw error;
       }
@@ -189,12 +251,13 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
     let upstream;
     try {
       upstream = await startChatCompletionStream(
-        { baseUrl: provider.baseUrl, apiKey: provider.apiKey, model, messages: upstreamMessages, temperature },
+        { baseUrl: provider.baseUrl, apiKey: provider.apiKey, model, messages: upstreamMessages, temperature, maxTokens: provider.maxTokens },
         controller.signal
       );
     } catch (error) {
-      const message = error instanceof ProviderError ? error.message : "Could not reach the provider.";
-      if (!controller.signal.aborted) sendEvent(res, { type: "error", message });
+      const failure = error instanceof ProviderError ? providerFailure(provider, error) : null;
+      const message = failure ? failure.message : "Could not reach the provider.";
+      if (!controller.signal.aborted) sendEvent(res, { type: "error", message, ...(failure ? { code: failure.code } : {}) });
       if (!res.writableEnded) res.end();
       return;
     }

@@ -10,6 +10,7 @@ import {
   validateProviderFields
 } from "../providerClient.js";
 import { requireAuth, settingsRateLimiter } from "../middleware.js";
+import { SHARED_OWNER_LABEL, sharedModelStatus } from "../sharedModel.js";
 
 const router = Router();
 
@@ -179,11 +180,35 @@ router.post("/provider/test", async (req, res, next) => {
   }
 });
 
+router.get("/shared-model", async (req, res, next) => {
+  try {
+    await connectToDatabase();
+    return res.json({ shared: await sharedModelStatus() });
+  } catch (error) {
+    return next(error);
+  }
+});
+
 router.get("/models", async (req, res, next) => {
   try {
     await connectToDatabase();
+    const shared = await sharedModelStatus();
+    const sharedEntry = shared.available
+      ? [{ id: shared.model, ownedBy: SHARED_OWNER_LABEL, shared: true }]
+      : [];
     const stored = await loadStoredConfig(req.userId);
-    if (!stored) return res.status(400).json({ message: "Save a provider configuration first." });
+    if (!stored) {
+      if (sharedEntry.length === 0) {
+        return res.status(400).json({
+          message: shared.enabled
+            ? "The shared AI model is unavailable right now. Try again later or save your own provider configuration."
+            : "The shared AI model is disabled. Save your own provider configuration to chat.",
+          code: shared.enabled ? "shared_unavailable" : "shared_disabled",
+          shared
+        });
+      }
+      return res.json({ models: sharedEntry, shared });
+    }
     let apiKey;
     try {
       apiKey = decryptSecret(stored.encryptedApiKey);
@@ -192,10 +217,11 @@ router.get("/models", async (req, res, next) => {
     }
     try {
       const models = await listProviderModels({ baseUrl: stored.baseUrl, apiKey });
-      return res.json({ models });
+      const merged = [...models, ...sharedEntry.filter(entry => !models.some(model => model.id === entry.id))];
+      return res.json({ models: merged, shared });
     } catch (error) {
       if (error instanceof ProviderError) {
-        return res.status(400).json({ message: error.message, code: error.code });
+        return res.status(400).json({ message: error.message, code: error.code, shared });
       }
       throw error;
     }
