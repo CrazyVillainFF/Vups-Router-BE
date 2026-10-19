@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import mongoose from "mongoose";
 
 export function providerIdFromName(name) {
@@ -10,9 +11,17 @@ export function providerIdFromName(name) {
   return slug || "provider";
 }
 
+// A saved configuration is identified by a stable configId — never by the
+// provider name alone. The same provider can be configured multiple times
+// (different keys, different models) without overwriting previous rows.
+export function newConfigId() {
+  return crypto.randomUUID();
+}
+
 const providerConfigSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
-  providerId: { type: String, required: true, trim: true, maxlength: 60 },
+  configId: { type: String, required: true, trim: true, maxlength: 80, index: true },
+  providerId: { type: String, required: true, trim: true, maxlength: 60, index: true },
   provider: { type: String, required: true, trim: true, maxlength: 80 },
   providerType: {
     type: String,
@@ -32,8 +41,27 @@ const providerConfigSchema = new mongoose.Schema({
   lastTestAt: { type: Date, default: null }
 }, { timestamps: true, versionKey: false });
 
-providerConfigSchema.index({ userId: 1, providerId: 1 }, { unique: true });
+// configId is the row identity; providerId is only a descriptive slug and may
+// repeat (two DeepSeek keys are two configurations).
+providerConfigSchema.index({ userId: 1, configId: 1 }, { unique: true });
+providerConfigSchema.index({ userId: 1, providerId: 1 });
 
 const ProviderConfig = mongoose.models.ProviderConfig || mongoose.model("ProviderConfig", providerConfigSchema);
+
+let indexesReady = null;
+
+// Earlier deployments enforced one document per {userId, providerId}. That
+// index must be removed so a user can keep several keys for the same provider.
+// syncIndexes() drops indexes that are no longer in the schema and creates the
+// new configId index. Runs once per process; failures are retried lazily.
+export function ensureProviderIndexes() {
+  if (!indexesReady) {
+    indexesReady = ProviderConfig.syncIndexes()
+      .catch(() => {
+        indexesReady = null;
+      });
+  }
+  return indexesReady;
+}
 
 export default ProviderConfig;

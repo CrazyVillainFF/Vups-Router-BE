@@ -60,17 +60,18 @@ All state-changing requests must use `Content-Type: application/json`; requests 
 
 ### Provider configuration (authenticated)
 
-Each user can save **multiple providers at once** — every provider is an isolated document (`{ userId, providerId }` unique) with its own encrypted key, base URL, enabled flag, and saved model list. Saving, editing, or deleting one provider never touches another. Exactly one provider is `active` per user; `/api/chat` uses it. Legacy single-config users are migrated in place on first read (the old document gains a `providerId` slug derived from its name, and the old `/provider` endpoints keep working).
+Each user can save **multiple configurations at once**, including several keys for the same provider — every configuration is an isolated document with its own server-generated `configId` (unique per user), encrypted key, base URL, enabled flag, and saved model list. Saving, editing, or deleting one configuration never touches another. Exactly one configuration is `active` per user; `/api/chat` uses the requested `configId` (or the active one). Legacy single-config users are migrated in place on first read (the old document gains a `providerId` slug and a `configId` equal to it, and the old `/provider` endpoints keep working).
 
 | Method | Path | Notes |
 | --- | --- | --- |
-| `GET` | `/api/settings/providers` | Lists all saved providers (masked keys only) plus `activeProviderId` |
-| `PUT` | `/api/settings/providers/:providerId` | Upserts one provider: `{ provider, baseUrl, apiKey?, model?, providerType? }`. A brand-new provider becomes active; editing an existing one never steals the active slot. `providerId` must be a lowercase slug (`^[a-z0-9][a-z0-9-]{0,59}$`) |
-| `POST` | `/api/settings/providers/:providerId/activate` | Makes this provider the one chat uses (only this provider's document is written) |
-| `DELETE` | `/api/settings/providers/:providerId` | Deletes this provider only; if it was active, the most recently created remaining provider is promoted |
-| `POST` | `/api/settings/providers/:providerId/test` | Tests the saved provider (or supplied `baseUrl`/`apiKey`/`model` overrides) and records the result |
-| `PUT` | `/api/settings/providers/:providerId/models` | `{ models: string[], defaultModel? }` — validates length/uniqueness; `defaultModel` must be in the list |
-| `GET` | `/api/settings/models?providerId=` | Lists models for that saved provider (`GET {baseUrl}/models`). Without `providerId` it uses the active provider. If live discovery fails, the saved model list is returned with a `warning` instead of being erased |
+| `GET` | `/api/settings/providers` | Lists all saved configurations (masked keys only) plus `activeConfigId` (also returned as `activeProviderId` for older clients) |
+| `POST` | `/api/settings/providers` | Creates a new configuration (server-generated stable `configId`; `providerId` may repeat) and makes it active |
+| `PUT` | `/api/settings/providers/:identifier` | Upserts one configuration: `{ provider, baseUrl, apiKey?, model?, providerType? }`. `identifier` is the `configId` (or legacy `providerId` alias). A brand-new identifier becomes active; editing an existing one never steals the active slot |
+| `POST` | `/api/settings/providers/:identifier/activate` | Makes this configuration the one chat uses (only this document is written) |
+| `DELETE` | `/api/settings/providers/:identifier` | Deletes this configuration only; if it was active, the most recently updated remaining configuration is promoted |
+| `POST` | `/api/settings/providers/:identifier/test` | Tests the saved configuration (or supplied `baseUrl`/`apiKey`/`model` overrides) and records the result |
+| `PUT` | `/api/settings/providers/:identifier/models` | `{ models: string[], defaultModel? }` — validates length/uniqueness; `defaultModel` must be in the list |
+| `GET` | `/api/settings/models?configId=` | Focused discovery for one saved configuration (`GET {baseUrl}/models`); the saved list is returned with a `warning` if discovery fails. Without `configId` (or legacy `providerId`) it returns the free/shared catalogue plus saved rows for **every** configuration, so the chat picker always shows both; a discovery failure only adds a `warning` and never erases rows |
 
 Legacy endpoints (`GET/PUT/DELETE /api/settings/provider`, `POST /api/settings/provider/test`) remain for backward compatibility and operate on the active provider.
 
@@ -101,7 +102,7 @@ All admin routes return `403` unless the signed-in user's email is listed in `AD
 
 | Method | Path | Notes |
 | --- | --- | --- |
-| `POST` | `/api/chat` | `{ conversationId?, messages, model?, temperature?, stream? }`. The final message may carry `images: [{ name?, mimeType, data }]` (base64, PNG/JPEG/WebP/GIF). Proxies to `{baseUrl}/chat/completions`. Streams SSE (`meta`, `delta`, `done`, `error` events) by default |
+| `POST` | `/api/chat` | `{ conversationId?, messages, model?, configId?, temperature?, stream? }`. `configId` selects the exact saved configuration (omit for the free/shared model); an unknown `configId` returns `404 config_not_found`. The final message may carry `images: [{ name?, mimeType, data }]` (base64, PNG/JPEG/WebP/GIF). Proxies to `{baseUrl}/chat/completions`. Streams SSE (`meta`, `delta`, `done`, `error` events) by default |
 | `GET` | `/api/conversations` | Lists the user's conversations |
 | `GET` | `/api/conversations/:id` | Full conversation with messages |
 | `DELETE` | `/api/conversations/:id` | Deletes one conversation |
@@ -232,7 +233,7 @@ Do **not** run Ollama inside the existing Render web service. Render's free/stan
    ```
    curl https://vups-router-be.onrender.com/api/health          # database still connected
    ```
-   Sign in as any user and open the app — the model selector should show `gemma3:4b` labeled "Shared · Free · No API key needed". `GET /api/settings/shared-model` (authenticated) reports `status: "available"` only when the model is actually installed and the server is reachable.
+   Sign in as any user and open the app — the model picker should list `gemma3:4b` under the "FREE MODELS" section (tagged "Free · No API key needed"), alongside any saved keys. `GET /api/settings/shared-model` (authenticated) reports `status: "available"` only when the model is actually installed and the server is reachable.
 6. If the Ollama host is unreachable from Render (private network not routable), requests fail cleanly with `shared_unavailable`; users with personal providers are unaffected.
 
 ### Admin controls
@@ -337,3 +338,4 @@ sending.
 - Auth endpoints are rate-limited (30 requests / 15 min / IP); chat is limited to 30 requests / min.
 - Requests are size-limited (512 kB JSON globally; `/api/chat` allows the image-attachment budget described above). Conversation history is capped server-side. Image bytes are validated by magic bytes and never persisted.
 - The proxy never substitutes a different model when the requested model fails; it returns the provider's error instead.
+

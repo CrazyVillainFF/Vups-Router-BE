@@ -129,14 +129,35 @@ function sharedRoute(shared, requestedModel = "") {
   };
 }
 
-async function resolveProvider(userId, requestedModel) {
+async function resolveProvider(userId, requestedModel, requestedConfigId) {
   const shared = await sharedModelStatusSafely();
-  const config =
-    (await ProviderConfig.findOne({ userId, active: true }).select("+encryptedApiKey")) ||
-    (await ProviderConfig.findOne({ userId }).sort({ updatedAt: -1 }).select("+encryptedApiKey"));
+  let config = null;
+
+  // An explicit configuration reference identifies the exact saved row, so
+  // duplicate model names in different configurations can never cross keys.
+  if (requestedConfigId) {
+    config =
+      (await ProviderConfig.findOne({ userId, configId: requestedConfigId }).select("+encryptedApiKey")) ||
+      (await ProviderConfig.findOne({ userId, providerId: requestedConfigId })
+        .sort({ active: -1, updatedAt: -1 })
+        .select("+encryptedApiKey"));
+    if (!config) {
+      throw new ProviderError(
+        "That saved configuration was removed. Pick another model from the model menu.",
+        404,
+        "config_not_found"
+      );
+    }
+  }
+
   const sharedIds = new Set(sharedModelsOf(shared).map(model => model.id));
-  if (requestedModel && sharedIds.has(requestedModel)) {
-    return sharedRoute(shared, requestedModel);
+  if (!requestedConfigId) {
+    if (requestedModel && sharedIds.has(requestedModel)) {
+      return sharedRoute(shared, requestedModel);
+    }
+    config =
+      (await ProviderConfig.findOne({ userId, active: true }).select("+encryptedApiKey")) ||
+      (await ProviderConfig.findOne({ userId }).sort({ updatedAt: -1 }).select("+encryptedApiKey"));
   }
   if (!config) {
     return sharedRoute(shared, requestedModel);
@@ -167,6 +188,7 @@ async function resolveProvider(userId, requestedModel) {
   return {
     shared: false,
     provider: config.provider,
+    configId: config.configId,
     providerId: config.providerId,
     baseUrl,
     defaultModel: config.defaultModel || config.model || "",
@@ -322,10 +344,11 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
     }
 
     const requestedModel = typeof body.model === "string" ? body.model.trim() : "";
+    const requestedConfigId = typeof body.configId === "string" ? body.configId.trim() : "";
 
     let provider;
     try {
-      provider = await resolveProvider(req.userId, requestedModel);
+      provider = await resolveProvider(req.userId, requestedModel, requestedConfigId);
     } catch (error) {
       if (error instanceof ProviderError) {
         return res.status(error.status ?? (error.code === "key_decryption_failed" ? 500 : 400)).json({ message: error.message, code: error.code });
