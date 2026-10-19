@@ -244,9 +244,9 @@ Endpoints (all rate-limited per IP):
 
 | Method | Path | Body | Response |
 | --- | --- | --- | --- |
-| `POST` | `/api/forgot-password` | `{ "email": "user@example.com" }` | Always `{ "message": "If that email exists, we sent a 6-digit code." }` — identical for existing and nonexistent accounts (no enumeration). `503` if email delivery is not configured; `400` for an invalid email. |
+| `POST` | `/api/forgot-password` | `{ "email": "user@example.com" }` | Always `{ "message": "If that email exists, we sent a 6-digit code.", "remaining": 3, "limit": 4 }` — identical for existing and nonexistent accounts (no enumeration). `503` if email delivery is not configured; `400` for an invalid email; `429` with `code: "reset_send_limit"` after `PASSWORD_RESET_SEND_LIMIT_MAX` (default 4) sends in the rolling 24 hours. |
 | `POST` | `/api/verify-code` | `{ "email": "user@example.com", "code": "012345" }` | `{ "success": true, "message": "Code verified successfully.", "resetAuthorization": "<single-use token>" }`; `400` with a generic message for invalid, expired, or exhausted codes. |
-| `POST` | `/api/reset-password` | `{ "email": "...", "code": "012345", "resetAuthorization": "...", "newPassword": "...", "confirmPassword": "..." }` | `{ "success": true, "message": "Password updated successfully." }`; `400` with a generic message for invalid credentials, weak passwords, or mismatches. The email + code pair also works without a prior verify call. |
+| `POST` | `/api/reset-password` | `{ "email": "...", "code": "012345", "newPassword": "..." }` | `{ "success": true, "message": "Password updated successfully." }`; `400` with a generic message for invalid credentials, weak passwords, or mismatches. The client sends exactly `email` + `code` + `newPassword`; the optional `resetAuthorization` (from verify-code) and `confirmPassword` are still accepted for older clients. |
 
 How it works:
 
@@ -258,6 +258,7 @@ How it works:
 - A successful reset sets `passwordChangedAt`, which invalidates sessions issued before the reset (JWT `iat` check in `requireAuth`).
 - Passwords are hashed with the existing bcrypt mechanism (cost 12).
 - If Brevo rejects the email (bad key, unverified sender, rate limit, network error), the HTTP status and the provider's response body are logged on the server, the just-issued code is invalidated, and the API still returns the generic response. The OTP itself is never logged.
+- Resend limit: at most `PASSWORD_RESET_SEND_LIMIT_MAX` (default 4) codes are sent per email address in a rolling 24-hour window. The counter lives in MongoDB (`resetsendlogs`, keyed by a sha256 hash of the normalized address — no plaintext email), so it survives restarts, works across instances, and cannot be bypassed by refreshing the page. It applies identically to unknown addresses (no enumeration oracle), records the attempt before delivery (failed sends still count), and the check-and-record step is a single atomic conditional update, so concurrent requests cannot overshoot. Exceeding it returns `429 { "code": "reset_send_limit" }` with a `Retry-After` header.
 
 ### Brevo setup
 
@@ -266,7 +267,7 @@ How it works:
 3. Set `SENDER_EMAIL=vupriseoffical@gmail.com` in the Render dashboard.
 4. Redeploy and verify: `POST /api/forgot-password` with a real account email; the email arrives with a large six-digit code valid for 10 minutes.
 
-Frontend flow (all inside `/forgot-password`): step 1 collects the email, step 2 renders the six animated code boxes (React Bits `CodeSlots`) for the six-digit code, step 3 collects the new password and submits it with the reset authorization. `/reset-password` redirects to `/forgot-password` for compatibility with old links. The sign-in form links to `/forgot-password`.
+Frontend flow (all inside `/forgot-password`): step 1 collects the email, step 2 renders the six animated code boxes (React Bits `CodeSlots`) for the six-digit code (with the remaining resend allowance and a plain-text-masked password toggle in the next step), step 3 collects the new password — reveal/hide toggles per field, an "At least 8 characters" hint, a "Passwords do not match" hint, and an Update button that is only disabled while submitting or while the inputs are too short/mismatched. The form submits exactly `{ email, code, newPassword }` and, on success, clears the recovery state and redirects to `/signin`. Mid-flow email and code survive a page refresh via `sessionStorage` (cleared on success or when the 10-minute code expiry passes). `/reset-password` redirects to `/forgot-password` for compatibility with old links. The sign-in form links to `/forgot-password`.
 
 ## Image attachments (vision chats)
 

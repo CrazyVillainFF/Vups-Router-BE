@@ -9,6 +9,7 @@ process.env.CHAT_RATE_LIMIT_MAX = "10000";
 process.env.PASSWORD_RESET_RATE_LIMIT_MAX = "10000";
 process.env.VERIFY_CODE_RATE_LIMIT_MAX = "10000";
 process.env.PASSWORD_RESET_ATTEMPT_LIMIT_MAX = "10000";
+process.env.PASSWORD_RESET_SEND_LIMIT_MAX = "10000";
 process.env.SENDER_EMAIL = "vupriseoffical@gmail.com";
 delete process.env.MONGODB_URI;
 delete process.env.BREVO_API_KEY;

@@ -4,6 +4,7 @@ import connectToDatabase from "../db.js";
 import User from "../user.js";
 import { brevoConfigError, sendOtpEmail } from "../email.js";
 import { forgotPasswordRateLimiter, resetPasswordRateLimiter, verifyCodeRateLimiter } from "../middleware.js";
+import { RESET_SEND_LIMIT, recordResetSend } from "../resetThrottle.js";
 import {
   RESET_AUTH_TTL_MS,
   RESET_CODE_TTL_MS,
@@ -63,6 +64,20 @@ router.post("/forgot-password", forgotPasswordRateLimiter, async (req, res, next
     }
 
     await connectToDatabase();
+
+    // Rolling 24-hour send limit, keyed by the normalized email itself — not
+    // by an existing account — so known and unknown addresses behave
+    // identically (no enumeration oracle) and failed deliveries still count.
+    const throttle = await recordResetSend(email);
+    if (!throttle.allowed) {
+      const minutes = Math.max(1, Math.ceil((throttle.retryAfterMs || 0) / 60000));
+      res.setHeader("Retry-After", String(Math.ceil((throttle.retryAfterMs || 0) / 1000)));
+      return res.status(429).json({
+        message: `Too many reset codes were requested for this email. For security, we send at most ${RESET_SEND_LIMIT} codes per 24 hours — try again in about ${minutes} minute${minutes === 1 ? "" : "s"}.`,
+        code: "reset_send_limit"
+      });
+    }
+
     const user = await User.findOne({ email }).select("_id email");
     if (user) {
       const code = generateOtp();
@@ -85,7 +100,7 @@ router.post("/forgot-password", forgotPasswordRateLimiter, async (req, res, next
       }
     }
 
-    return res.json({ message: SENT_RESPONSE });
+    return res.json({ message: SENT_RESPONSE, remaining: throttle.remaining, limit: RESET_SEND_LIMIT });
   } catch (error) {
     return next(error);
   }
