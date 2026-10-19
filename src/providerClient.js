@@ -18,10 +18,18 @@ export class ProviderError extends Error {
   }
 }
 
+const ENDPOINT_SUFFIX = /\/(chat\/completions|responses|messages|completions|models|embeddings)$/i;
+const AGENTROUTER_HOSTS = new Set(["agentrouter.org", "www.agentrouter.org"]);
+
+function isAgentRouterHost(hostname) {
+  return AGENTROUTER_HOSTS.has(String(hostname || "").toLowerCase());
+}
+
 // Strips accidental endpoint suffixes so request URLs never end up doubled
 // (e.g. ".../v1/chat/completions/chat/completions"). The "/v1" (or any other
 // version) path segment is preserved; only the concrete operation paths are
-// removed, since the client appends those itself.
+// removed, since the client appends those itself. AgentRouter's documented
+// base URL always ends in /v1, so pasting only the origin is normalized too.
 export function normalizeBaseUrl(value) {
   if (typeof value !== "string") throw new ProviderError("API base URL is required.", 400, "invalid_base_url");
   const trimmed = value.trim().replace(/\/+$/, "");
@@ -38,10 +46,32 @@ export function normalizeBaseUrl(value) {
   if (parsed.username || parsed.password) {
     throw new ProviderError("API base URL must not contain embedded credentials.", 400, "invalid_base_url");
   }
-  const cleanedPath = parsed.pathname
-    .replace(/\/+$/, "")
-    .replace(/\/(chat\/completions|completions|models)$/, "");
+  let cleanedPath = parsed.pathname.replace(/\/+$/, "");
+  while (ENDPOINT_SUFFIX.test(cleanedPath)) {
+    cleanedPath = cleanedPath.replace(ENDPOINT_SUFFIX, "");
+  }
+  if (isAgentRouterHost(parsed.hostname) && (cleanedPath === "" || /^(\/v\d+)+$/i.test(cleanedPath))) {
+    cleanedPath = "/v1";
+  }
   return parsed.origin + cleanedPath + parsed.search;
+}
+
+// AgentRouter requires its GPT models on the OpenAI Responses endpoint. Other
+// models and every other provider stay on the OpenAI chat-completions path.
+export function usesResponsesApi(baseUrl, model) {
+  const normalized = normalizeBaseUrl(baseUrl);
+  let host;
+  try {
+    host = new URL(normalized).hostname;
+  } catch {
+    return false;
+  }
+  return isAgentRouterHost(host) && /^gpt-/i.test(String(model ?? "").trim());
+}
+
+export function resolveChatEndpoint(baseUrl, model) {
+  const normalized = normalizeBaseUrl(baseUrl);
+  return `${normalized}${usesResponsesApi(normalized, model) ? "/responses" : "/chat/completions"}`;
 }
 
 // Classifies the host of a provider base URL so we can warn about endpoints
@@ -148,16 +178,23 @@ function truncate(value) {
   return clean.length > MAX_ERROR_LENGTH ? `${clean.slice(0, MAX_ERROR_LENGTH)}…` : clean;
 }
 
+export function redactSecrets(value) {
+  return value
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [redacted]")
+    .replace(/\bsk-[A-Za-z0-9_-]{6,}/g, "sk-[redacted]");
+}
+
 export function describeProviderError(status, payload) {
-  const detail = truncate(
+  const detail = redactSecrets(truncate(
     payload?.error?.message || payload?.message || (typeof payload === "string" ? payload : "")
-  );
+  ));
   const suffix = detail ? ` Provider said: ${detail}` : "";
   if (status === 400) return new ProviderError(`The provider rejected the request (HTTP 400). Check the model ID and parameters.${suffix}`, status, "bad_request");
   if (status === 401) return new ProviderError(`The provider rejected your API key (HTTP 401). Check the key in Settings.${suffix}`, status, "invalid_api_key");
   if (status === 402) return new ProviderError(`Your provider account has insufficient credits (HTTP 402).${suffix}`, status, "insufficient_credits");
   if (status === 403) return new ProviderError(`The provider denied access (HTTP 403). Your key may lack permission for this model.${suffix}`, status, "forbidden");
   if (status === 404) return new ProviderError(`The provider returned HTTP 404. The API base URL or model ID is likely wrong.${suffix}`, status, "not_found");
+  if (status === 405) return new ProviderError(`The provider rejected the request method or endpoint (HTTP 405). The base URL may point at the wrong API path, or the model may require a different endpoint.${suffix}`, status, "method_not_allowed");
   if (status === 408) return new ProviderError(`The provider timed out (HTTP 408).${suffix}`, status, "timeout");
   if (status === 413) return new ProviderError(`The conversation is too large for this provider (HTTP 413).${suffix}`, status, "too_large");
   if (status === 422) return new ProviderError(`The provider could not process the request (HTTP 422). Check the model ID.${suffix}`, status, "unprocessable");
@@ -239,11 +276,64 @@ export function serializeMessages(messages) {
   });
 }
 
-export async function chatCompletion({ baseUrl, apiKey, model, messages, temperature, maxTokens }, signal) {
-  const url = `${normalizeBaseUrl(baseUrl)}/chat/completions`;
-  const body = { model, messages: serializeMessages(messages), stream: false };
+function serializeResponsesMessages(messages) {
+  return serializeMessages(messages).map(message => {
+    if (typeof message.content === "string") return message;
+    return {
+      role: message.role,
+      content: message.content.map(part => (
+        part.type === "image_url"
+          ? { type: "input_image", image_url: part.image_url?.url ?? "" }
+          : { type: "input_text", text: part.text ?? "" }
+      ))
+    };
+  });
+}
+
+export function buildChatRequestBody({ model, messages, temperature, maxTokens, stream, responses = false }) {
+  if (responses) {
+    const instructions = messages
+      .filter(message => message.role === "system" && typeof message.content === "string")
+      .map(message => message.content)
+      .filter(Boolean)
+      .join("\n\n");
+    const input = serializeResponsesMessages(messages.filter(message => message.role !== "system"));
+    const body = { model, input, stream };
+    if (instructions) body.instructions = instructions;
+    if (typeof maxTokens === "number" && Number.isFinite(maxTokens)) body.max_output_tokens = maxTokens;
+    return body;
+  }
+  const body = { model, messages: serializeMessages(messages), stream };
   if (typeof temperature === "number" && Number.isFinite(temperature)) body.temperature = temperature;
   if (typeof maxTokens === "number" && Number.isFinite(maxTokens)) body.max_tokens = maxTokens;
+  return body;
+}
+
+export function extractResponseText(payload) {
+  if (typeof payload?.output_text === "string" && payload.output_text.length > 0) return payload.output_text;
+  if (Array.isArray(payload?.output)) {
+    const text = payload.output
+      .flatMap(item => (Array.isArray(item?.content) ? item.content : []))
+      .filter(part => typeof part?.text === "string" && (part.type === "output_text" || part.type === "text"))
+      .map(part => part.text)
+      .join("");
+    if (text.length > 0) return text;
+  }
+  const content = payload?.choices?.[0]?.message?.content;
+  return typeof content === "string" ? content : "";
+}
+
+function responsesFinishReason(payload) {
+  if (typeof payload?.incomplete_details?.reason === "string") {
+    return payload.incomplete_details.reason === "max_output_tokens" ? "length" : payload.incomplete_details.reason;
+  }
+  return payload?.status === "completed" ? "stop" : null;
+}
+
+export async function chatCompletion({ baseUrl, apiKey, model, messages, temperature, maxTokens }, signal) {
+  const responses = usesResponsesApi(baseUrl, model);
+  const url = resolveChatEndpoint(baseUrl, model);
+  const body = buildChatRequestBody({ model, messages, temperature, maxTokens, stream: false, responses });
 
   let response;
   try {
@@ -263,22 +353,20 @@ export async function chatCompletion({ baseUrl, apiKey, model, messages, tempera
     throw describeProviderError(response.status, await readJsonSafely(response));
   }
   const payload = await readJsonSafely(response);
-  const choice = payload?.choices?.[0];
-  const content = choice?.message?.content;
-  if (typeof content !== "string" || content.length === 0) {
+  const content = extractResponseText(payload);
+  if (content.length === 0) {
     throw new ProviderError("The provider returned an empty or unexpected response.", response.status, "empty_response");
   }
   return {
     content,
-    finishReason: typeof choice?.finish_reason === "string" ? choice.finish_reason : null
+    finishReason: responses ? responsesFinishReason(payload) : (typeof payload?.choices?.[0]?.finish_reason === "string" ? payload.choices[0].finish_reason : null)
   };
 }
 
 export async function startChatCompletionStream({ baseUrl, apiKey, model, messages, temperature, maxTokens }, signal) {
-  const url = `${normalizeBaseUrl(baseUrl)}/chat/completions`;
-  const body = { model, messages: serializeMessages(messages), stream: true };
-  if (typeof temperature === "number" && Number.isFinite(temperature)) body.temperature = temperature;
-  if (typeof maxTokens === "number" && Number.isFinite(maxTokens)) body.max_tokens = maxTokens;
+  const responses = usesResponsesApi(baseUrl, model);
+  const url = resolveChatEndpoint(baseUrl, model);
+  const body = buildChatRequestBody({ model, messages, temperature, maxTokens, stream: true, responses });
 
   let response;
   try {
@@ -305,6 +393,7 @@ export async function startChatCompletionStream({ baseUrl, apiKey, model, messag
 }
 
 export function extractStreamText(payload) {
+  if (payload?.type === "response.output_text.delta" && typeof payload.delta === "string") return payload.delta;
   const choice = payload?.choices?.[0];
   if (!choice) return typeof payload?.content === "string" ? payload.content : "";
   const delta = choice.delta ?? choice.message ?? {};
@@ -336,7 +425,7 @@ export async function testProviderConnection({ baseUrl, apiKey, model }, signal)
       throw new ProviderError(`The provider does not list a model named "${model}". Refresh the model list and choose an available model.`, null, "model_unavailable");
     }
     const result = await chatCompletion(
-      { baseUrl, apiKey, model, messages: [{ role: "user", content: "Reply with OK." }], maxTokens: 8 },
+      { baseUrl, apiKey, model, messages: [{ role: "user", content: "Reply with OK." }], maxTokens: 64 },
       signal
     );
     return { availableModels, modelChecked: true, sample: result.content.slice(0, 40) };

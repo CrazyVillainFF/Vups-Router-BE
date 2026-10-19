@@ -10,6 +10,7 @@ import {
   chatCompletion,
   extractStreamText,
   normalizeBaseUrl,
+  redactSecrets,
   startChatCompletionStream
 } from "../providerClient.js";
 import { chatRateLimiter, requireAuth } from "../middleware.js";
@@ -261,6 +262,7 @@ function sendEvent(res, payload) {
 const PROVIDER_STATUS_BY_CODE = {
   bad_request: 400,
   not_found: 404,
+  method_not_allowed: 502,
   invalid_api_key: 401,
   insufficient_credits: 402,
   forbidden: 403,
@@ -474,7 +476,18 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
           if (parsed?.error) {
             failure = new ProviderError(
               typeof parsed.error?.message === "string"
-                ? `The provider reported an error during streaming: ${parsed.error.message}`
+                ? `The provider reported an error during streaming: ${redactSecrets(parsed.error.message)}`
+                : "The provider reported an error during streaming.",
+              null,
+              "stream_error"
+            );
+            break;
+          }
+          if (parsed?.type === "response.failed") {
+            const detail = parsed.response?.error?.message;
+            failure = new ProviderError(
+              typeof detail === "string"
+                ? `The provider reported an error during streaming: ${redactSecrets(detail)}`
                 : "The provider reported an error during streaming.",
               null,
               "stream_error"
@@ -487,6 +500,15 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
           }
           if (parsed?.usage && typeof parsed.usage === "object") {
             usage = parsed.usage;
+          }
+          if ((parsed?.type === "response.completed" || parsed?.type === "response.incomplete") && parsed.response) {
+            if (parsed.response.usage && typeof parsed.response.usage === "object") usage = parsed.response.usage;
+            const incomplete = parsed.response.incomplete_details?.reason;
+            if (typeof incomplete === "string" && incomplete) {
+              finishReason = incomplete === "max_output_tokens" ? "length" : incomplete;
+            } else if (parsed.response.status === "completed") {
+              finishReason = finishReason ?? "stop";
+            }
           }
           const text = extractStreamText(parsed);
           if (text) {

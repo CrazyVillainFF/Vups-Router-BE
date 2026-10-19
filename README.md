@@ -80,12 +80,12 @@ Legacy endpoints (`GET/PUT/DELETE /api/settings/provider`, `POST /api/settings/p
 1. Sign in and open **Provider settings**. Any real provider with an OpenAI-compatible API works with no code changes per provider: OpenRouter, DeepSeek, Groq, Google Gemini (OpenAI-compat path), Mistral, Cohere, Together, Fireworks, Cerebras, NVIDIA NIM, xAI, SambaNova, Novita, plus self-hosted gateways (Ollama, vLLM, LocalAI, LM Studio, LiteLLM, FlagshipRouter) and custom endpoints.
 2. Pick a provider card (or Add provider), paste your key, save. Repeat for as many providers as you want — each keeps its own key and models.
 3. **Load models** to fetch the live list, select the ones to keep, choose a default, then **Test connection**.
-4. **Use for chat** switches the active provider; chat requests go to `POST {baseUrl}/chat/completions` through the backend and the model is never silently substituted.
+4. **Use for chat** switches the active provider; chat requests go to `POST {baseUrl}/chat/completions` through the backend and the model is never silently substituted. AgentRouter GPT models (`gpt-*`) use its documented OpenAI Responses endpoint instead: the backend sends `POST https://agentrouter.org/v1/responses` and converts the Responses payload/stream back to VupsRouter's SSE format. Other AgentRouter models and every other provider keep using `/chat/completions`.
 
 Notes:
 
 - **Localhost / private-network URLs**: a deployed backend (Render, Railway, …) cannot reach `http://localhost:...` on your computer — for example a FlagshipRouter or Ollama instance. On production, such URLs are rejected with `400 local_endpoint` / `private_endpoint` and an explanation (use a public HTTPS tunnel like ngrok/Cloudflare Tunnel, or run VupsRouter locally). During development and tests the guard is off; `ALLOW_PRIVATE_PROVIDER_URLS=true` re-enables private URLs for self-hosted backends that share the network.
-- **URL normalization**: trailing `/chat/completions`, `/completions`, or `/models` suffixes are stripped from the base URL automatically, so pasting a full endpoint URL does not produce a doubled path.
+- **URL normalization**: trailing `/chat/completions`, `/responses`, `/messages`, `/completions`, `/models`, or `/embeddings` suffixes are stripped from the base URL automatically, so pasting a full endpoint URL does not produce a doubled path. `agentrouter.org` base URLs normalize to `/v1` even when only the origin was saved.
 - **Network errors are specific**: `dns_error`, `connection_refused`, `network_error`, and `timeout` are reported with the target hostname — never as an "invalid API key".
 - The settings page shows a status badge per provider (Connected, Invalid key, Insufficient balance, Unreachable, Not tested). Model listings drive validation: if a provider later removes a model, chat returns an actionable `invalid_model` error instead of a mystery failure.
 
@@ -102,7 +102,7 @@ All admin routes return `403` unless the signed-in user's email is listed in `AD
 
 | Method | Path | Notes |
 | --- | --- | --- |
-| `POST` | `/api/chat` | `{ conversationId?, messages, model?, configId?, temperature?, stream? }`. `configId` selects the exact saved configuration (omit for the free/shared model); an unknown `configId` returns `404 config_not_found`. The final message may carry `images: [{ name?, mimeType, data }]` (base64, PNG/JPEG/WebP/GIF). Proxies to `{baseUrl}/chat/completions`. Streams SSE (`meta`, `delta`, `done`, `error` events) by default |
+| `POST` | `/api/chat` | `{ conversationId?, messages, model?, configId?, temperature?, stream? }`. `configId` selects the exact saved configuration (omit for the free/shared model); an unknown `configId` returns `404 config_not_found`. The final message may carry `images: [{ name?, mimeType, data }]` (base64, PNG/JPEG/WebP/GIF). Proxies to `{baseUrl}/chat/completions` (AgentRouter `gpt-*` models: `{baseUrl}/responses`). Streams SSE (`meta`, `delta`, `done`, `error` events) by default |
 | `GET` | `/api/conversations` | Lists the user's conversations |
 | `GET` | `/api/conversations/:id` | Full conversation with messages |
 | `DELETE` | `/api/conversations/:id` | Deletes one conversation |
@@ -200,7 +200,7 @@ For a deploy sanity check, `node scripts/verify-openrouter.mjs` (with `OPENROUTE
 
 **Long responses & truncation.** The shared output limit defaults to `4096` tokens (`OPENROUTER_MAX_OUTPUT_TOKENS`, clamped server-side to `8192`). Every streaming reply forwards the provider's `finish_reason` in the final `done` SSE event (`stop`, `length`, …), plus token `usage` when the provider sends it. When a reply is cut off by the limit, the client keeps the partial answer, shows “Response reached its length limit”, and offers “Continue generating” — which asks the model to continue without repeating previous text. Code-generation prompts are instructed to split large projects into files and generate them in manageable stages.
 
-**Error taxonomy.** Provider/model failures return safe, specific codes and are never labeled as database failures: `400` invalid request/model (`bad_request`, `not_found`, `invalid_model`), `401` bad credentials (`invalid_api_key`), `402` insufficient credits, `429` rate limits (`rate_limited`, `shared_model_rate_limited`, `shared_quota_exhausted`), `502` provider outage (`provider_unavailable`, `network_error`), `503` shared model unavailable (`shared_unavailable`, `shared_model_unavailable`), `504` timeout. Mid-stream provider errors arrive as `{ "type": "error" }` SSE events even though the HTTP status is already `200`. The database-unavailable message is only used for confirmed MongoDB connection/query failures.
+**Error taxonomy.** Provider/model failures return safe, specific codes and are never labeled as database failures: `400` invalid request/model (`bad_request`, `not_found`, `invalid_model`), `401` bad credentials (`invalid_api_key`), `402` insufficient credits, `429` rate limits (`rate_limited`, `shared_model_rate_limited`, `shared_quota_exhausted`), `502` provider outage/endpoint rejection (`provider_unavailable`, `network_error`, `method_not_allowed` for upstream HTTP 405), `503` shared model unavailable (`shared_unavailable`, `shared_model_unavailable`), `504` timeout. Mid-stream provider errors arrive as `{ "type": "error" }` SSE events even though the HTTP status is already `200`. The database-unavailable message is only used for confirmed MongoDB connection/query failures.
 
 ## Shared Ollama model (optional)
 
