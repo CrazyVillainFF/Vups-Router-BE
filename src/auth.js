@@ -1,11 +1,13 @@
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 
+const TOKEN_TTL = "7d";
+
 export function validateSignup({ name, email, password }) {
   if (typeof name !== "string" || name.trim().length < 2 || name.trim().length > 80) {
     return "Name must be between 2 and 80 characters.";
   }
-  if (typeof email !== "string" || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+  if (typeof email !== "string" || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim()) || email.trim().length > 254) {
     return "Enter a valid email address.";
   }
   if (typeof password !== "string" || password.length < 8 || password.length > 128) {
@@ -15,7 +17,7 @@ export function validateSignup({ name, email, password }) {
 }
 
 export function validateSignin({ email, password }) {
-  if (typeof email !== "string" || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+  if (typeof email !== "string" || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim()) || email.trim().length > 254) {
     return "Enter a valid email address.";
   }
   if (typeof password !== "string" || password.length < 8 || password.length > 128) {
@@ -33,5 +35,5 @@ export async function passwordMatches(password, hash) {
 }
 
 export function createToken(user, secret) {
-  return jwt.sign({ sub: user.id, email: user.email }, secret, { expiresIn: "2h" });
+  return jwt.sign({ sub: String(user._id ?? user.id), email: user.email }, secret, { expiresIn: TOKEN_TTL });
 }
