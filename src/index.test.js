@@ -1171,3 +1171,42 @@ test("OpenRouter without an API key falls back to the Ollama shared model", asyn
     assert.equal(status.body.shared.status, "available");
   });
 });
+
+// ─── Frontend connectivity / CORS origins ───────────────────────────────────
+
+test("GET /api returns an informative index instead of a bare 404", async () => {
+  const response = await api("/api");
+  assert.equal(response.status, 200);
+  assert.equal(response.body.success, true);
+  assert.equal(response.body.health, "/api/health");
+  assert.ok(Array.isArray(response.body.routes) && response.body.routes.includes("/api/chat"));
+});
+
+test("CORS allows Vite preview origins and pattern-configured Vercel aliases", async () => {
+  const preview = await api("/api/auth/me", { headers: { Origin: "http://localhost:4173" } });
+  assert.equal(preview.headers.get("access-control-allow-origin"), "http://localhost:4173");
+  assert.equal(preview.headers.get("access-control-allow-credentials"), "true");
+
+  process.env.CLIENT_ORIGIN_PATTERNS = "https://vups-router-*-vishnu-4571.vercel.app";
+  try {
+    const branch = await api("/api/auth/me", { headers: { Origin: "https://vups-router-git-main-vishnu-4571.vercel.app" } });
+    assert.equal(branch.status, 401);
+    assert.equal(branch.headers.get("access-control-allow-origin"), "https://vups-router-git-main-vishnu-4571.vercel.app");
+
+    const deployment = await api("/api/auth/me", { headers: { Origin: "https://vups-router-k0e1x6r4y-vishnu-4571.vercel.app" } });
+    assert.equal(deployment.headers.get("access-control-allow-origin"), "https://vups-router-k0e1x6r4y-vishnu-4571.vercel.app");
+
+    const nearMiss = await api("/", { headers: { Origin: "https://vups-router-evil.vercel.app" } });
+    assert.equal(nearMiss.status, 403);
+    assert.equal(nearMiss.headers.get("access-control-allow-origin"), null);
+
+    const blockedPost = await api("/api/auth/signin", {
+      method: "POST",
+      headers: { Origin: "https://evil.example.com" },
+      body: { email: "a@example.com", password: "correct-horse-battery" }
+    });
+    assert.equal(blockedPost.status, 403);
+  } finally {
+    delete process.env.CLIENT_ORIGIN_PATTERNS;
+  }
+});

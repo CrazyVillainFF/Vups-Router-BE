@@ -81,12 +81,15 @@ export function requireAdmin(req, res, next) {
   return next();
 }
 
-export function verifyOrigin(allowedOrigins) {
+export function verifyOrigin(allowed) {
+  const isAllowed = typeof allowed === "function"
+    ? allowed
+    : origin => allowed.has(String(origin || "").replace(/\/+$/, ""));
   return function originGuard(req, res, next) {
     if (["GET", "HEAD", "OPTIONS"].includes(req.method)) return next();
     const origin = req.get("origin");
     if (!origin) return next();
-    if (allowedOrigins.has(origin)) return next();
+    if (isAllowed(origin)) return next();
     return res.status(403).json({ message: "Request blocked: origin not allowed." });
   };
 }

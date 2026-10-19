@@ -9,7 +9,7 @@ const vercelOrigin = "https://vups-router-three.vercel.app";
 const mongo = await MongoMemoryServer.create();
 const mongoUri = mongo.getUri("vupsrouter");
 
-function startServer({ port, nodeEnv }) {
+function startServer({ port, nodeEnv, extraEnv = {} }) {
   const logs = [];
   const child = spawn(process.execPath, ["src/index.js"], {
     cwd: serverRoot,
@@ -19,7 +19,8 @@ function startServer({ port, nodeEnv }) {
       PORT: String(port),
       MONGODB_URI: mongoUri,
       JWT_SECRET: process.env.JWT_SECRET || "verify-jwt-secret-with-at-least-32-characters",
-      ENCRYPTION_SECRET: process.env.ENCRYPTION_SECRET || "verify-encryption-secret-with-32-chars-min"
+      ENCRYPTION_SECRET: process.env.ENCRYPTION_SECRET || "verify-encryption-secret-with-32-chars-min",
+      ...extraEnv
     },
     stdio: ["ignore", "pipe", "pipe"]
   });
@@ -118,7 +119,12 @@ async function verifyDevelopmentFlow() {
 }
 
 async function verifyProductionFlow() {
-  const { child, logs } = startServer({ port: 4322, nodeEnv: "production" });
+  const branchOrigin = "https://vups-router-git-main-vishnu-4571.vercel.app";
+  const { child, logs } = startServer({
+    port: 4322,
+    nodeEnv: "production",
+    extraEnv: { CLIENT_ORIGIN_PATTERNS: "https://vups-router-*-vishnu-4571.vercel.app" }
+  });
   const request = makeClient("http://127.0.0.1:4322", vercelOrigin);
   try {
     const health = await waitForHealth("http://127.0.0.1:4322");
@@ -138,6 +144,24 @@ async function verifyProductionFlow() {
     assert.equal(preflight.headers.get("access-control-allow-origin"), vercelOrigin);
     assert.equal(preflight.headers.get("access-control-allow-credentials"), "true");
     console.log(`[ok] prod: OPTIONS preflight allows ${vercelOrigin} with credentials`);
+
+    const branchPreflight = await fetch("http://127.0.0.1:4322/api/auth/signin", {
+      method: "OPTIONS",
+      headers: {
+        Origin: branchOrigin,
+        "Access-Control-Request-Method": "POST",
+        "Access-Control-Request-Headers": "content-type"
+      }
+    });
+    assert.equal(branchPreflight.status, 204);
+    assert.equal(branchPreflight.headers.get("access-control-allow-origin"), branchOrigin);
+    assert.equal(branchPreflight.headers.get("access-control-allow-credentials"), "true");
+    console.log(`[ok] prod: OPTIONS preflight allows pattern-matched alias ${branchOrigin} with credentials`);
+
+    const index = await request("/api");
+    assert.equal(index.response.status, 200);
+    assert.equal(index.body.health, "/api/health");
+    console.log("[ok] prod: GET  /api → 200 API index (no misleading 404)");
 
     const signup = await request("/api/auth/signup", {
       method: "POST",

@@ -26,17 +26,39 @@ if (process.env.NODE_ENV !== "test") {
   }
 }
 
-const configuredOrigins = [process.env.CLIENT_ORIGIN, process.env.CLIENT_ORIGINS]
-  .filter(Boolean)
-  .flatMap(value => value.split(","))
-  .map(origin => origin.trim().replace(/\/+$/, ""))
-  .filter(Boolean);
-const allowedOrigins = new Set([
+const DEFAULT_ALLOWED_ORIGINS = [
   "http://localhost:5173",
   "http://127.0.0.1:5173",
-  "https://vups-router-three.vercel.app",
-  ...configuredOrigins
-]);
+  "http://localhost:4173",
+  "http://127.0.0.1:4173",
+  "https://vups-router-three.vercel.app"
+];
+
+function originPatternToRegExp(pattern) {
+  const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, "[a-z0-9-]+");
+  return new RegExp(`^${escaped}$`, "i");
+}
+
+function currentOriginPolicy() {
+  const configured = [process.env.CLIENT_ORIGIN, process.env.CLIENT_ORIGINS]
+    .filter(Boolean)
+    .flatMap(value => value.split(","))
+    .map(origin => origin.trim().replace(/\/+$/, ""))
+    .filter(Boolean);
+  const patterns = (process.env.CLIENT_ORIGIN_PATTERNS || "")
+    .split(",")
+    .map(value => value.trim().replace(/\/+$/, ""))
+    .filter(value => value.includes("*"))
+    .map(originPatternToRegExp);
+  return { exact: new Set([...DEFAULT_ALLOWED_ORIGINS, ...configured]), patterns };
+}
+
+function originAllowed(origin) {
+  const normalized = String(origin || "").trim().replace(/\/+$/, "");
+  if (!normalized) return false;
+  const { exact, patterns } = currentOriginPolicy();
+  return exact.has(normalized) || patterns.some(pattern => pattern.test(normalized));
+}
 
 if (process.env.NODE_ENV === "production") app.set("trust proxy", 1);
 
@@ -44,7 +66,7 @@ app.disable("x-powered-by");
 app.use(helmet());
 app.use(cors({
   origin(origin, callback) {
-    if (!origin || allowedOrigins.has(origin.replace(/\/+$/, ""))) return callback(null, true);
+    if (!origin || originAllowed(origin)) return callback(null, true);
     return callback(new Error("Origin not allowed by CORS."));
   },
   credentials: true
@@ -52,7 +74,7 @@ app.use(cors({
 app.use(cookieParser());
 app.use(express.json({ limit: "512kb" }));
 app.use(requireJsonBody);
-app.use(verifyOrigin(allowedOrigins));
+app.use(verifyOrigin(originAllowed));
 
 app.get("/", (_req, res) => res.json({
   success: true,
@@ -85,6 +107,14 @@ app.get("/api/health", async (_req, res) => {
     });
   }
 });
+
+app.get("/api", (_req, res) => res.json({
+  success: true,
+  service: "VupsRouter",
+  message: "VupsRouter API index. All application routes are served under /api/*.",
+  health: "/api/health",
+  routes: ["/api/auth", "/api/settings", "/api/conversations", "/api/chat", "/api/admin"]
+}));
 
 app.use("/api/auth", authRoutes);
 app.use("/api/settings", settingsRoutes);

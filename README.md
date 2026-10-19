@@ -122,6 +122,25 @@ Do **not** set `PORT`; Render provides it automatically. `SERVER` is not needed 
 
 MongoDB Atlas: under **Network Access**, allow `0.0.0.0/0` (Render's free tier does not publish static outbound IPs), and make sure the database user can read/write the `vupsrouter` database.
 
+### Frontend connectivity and CORS origins
+
+The backend serves every application route under `/api/*` (`/api/auth`, `/api/settings`, `/api/conversations`, `/api/chat`, `/api/admin`) and `GET /api` now returns a small JSON index with all route paths — a bare `/api` no longer looks like a broken backend. The frontend's `VITE_API_BASE_URL` must therefore end in `/api` (it already does: `https://vups-router-be.onrender.com/api`).
+
+If the browser shows "Could not reach the VupsRouter backend at https://vups-router-be.onrender.com/api" **while `curl` to the same backend works**, the cause is almost always CORS: `curl` sends no `Origin` header, browsers do. When the frontend's origin is not in the allowlist, the backend rejects the request without CORS headers and the browser hides the response, so the frontend can only report a generic network error. The Render logs show `Origin not allowed by CORS` or `Request blocked: origin not allowed`.
+
+Every Vercel URL of the project counts as a different origin: the production alias (`vups-router-three.vercel.app`), the branch URL (e.g. `vups-router-git-main-<team>.vercel.app`), and the per-deployment URL (e.g. `vups-router-<hash>-<team>.vercel.app`). Opening the app via the Vercel dashboard's deployment link uses the deployment URL.
+
+Origin variables (Render → Environment; the server re-reads them on every request, but changing env vars restarts the service anyway):
+
+| Variable | Meaning |
+| --- | --- |
+| `CLIENT_ORIGIN`, `CLIENT_ORIGINS` | exact origins, comma-separated, no trailing slash |
+| `CLIENT_ORIGIN_PATTERNS` | wildcard origins, comma-separated; `*` matches one hostname label (`a-z`, `0-9`, `-`), e.g. `https://vups-router-*-vishnu-4571.vercel.app` covers both the branch and deployment URLs of that project |
+
+Built-in defaults already include `http://localhost:5173`, `http://127.0.0.1:5173` (dev), `http://localhost:4173`, `http://127.0.0.1:4173` (vite preview), and `https://vups-router-three.vercel.app`.
+
+Verify from anywhere (replace the origin): `curl -s -D - -o NUL https://vups-router-be.onrender.com/api/auth/me -H "Origin: https://your-origin"` must return an `access-control-allow-origin` header equal to that origin. `npm run verify` checks the same behavior locally, including a pattern-matched Vercel alias.
+
 Verify after deploy: `curl https://vups-router-be.onrender.com/api/health` should return `"database":"connected"`. When it is down, the response includes a safe `reason` and `hint` (never credentials), and the Render logs contain the redacted underlying error:
 
 | `reason` | Meaning | Fix |
