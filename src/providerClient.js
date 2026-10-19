@@ -18,6 +18,10 @@ export class ProviderError extends Error {
   }
 }
 
+// Strips accidental endpoint suffixes so request URLs never end up doubled
+// (e.g. ".../v1/chat/completions/chat/completions"). The "/v1" (or any other
+// version) path segment is preserved; only the concrete operation paths are
+// removed, since the client appends those itself.
 export function normalizeBaseUrl(value) {
   if (typeof value !== "string") throw new ProviderError("API base URL is required.", 400, "invalid_base_url");
   const trimmed = value.trim().replace(/\/+$/, "");
@@ -34,7 +38,84 @@ export function normalizeBaseUrl(value) {
   if (parsed.username || parsed.password) {
     throw new ProviderError("API base URL must not contain embedded credentials.", 400, "invalid_base_url");
   }
-  return parsed.origin + parsed.pathname.replace(/\/+$/, "") + parsed.search;
+  const cleanedPath = parsed.pathname
+    .replace(/\/+$/, "")
+    .replace(/\/(chat\/completions|completions|models)$/, "");
+  return parsed.origin + cleanedPath + parsed.search;
+}
+
+// Classifies the host of a provider base URL so we can warn about endpoints
+// the deployed backend can never reach (localhost, private ranges, metadata).
+export function classifyProviderHost(hostname) {
+  const host = String(hostname || "").toLowerCase().replace(/^\[|\]$/g, "");
+  if (!host) return "public";
+  if (host === "localhost" || host.endsWith(".localhost")) return "local";
+  if (host === "::1" || host === "0.0.0.0" || host === "::") return "local";
+  const v4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (v4) {
+    const first = Number(v4[1]);
+    const second = Number(v4[2]);
+    if (first === 127 || first === 0) return "local";
+    if (first === 10) return "private";
+    if (first === 172 && second >= 16 && second <= 31) return "private";
+    if (first === 192 && second === 168) return "private";
+    if (first === 169 && second === 254) return "private";
+    if (first === 100 && second >= 64 && second <= 127) return "private";
+  }
+  if (host.startsWith("fc") || host.startsWith("fd")) return "private";
+  if (host.startsWith("fe80:")) return "private";
+  if (host.endsWith(".internal")) return "private";
+  return "public";
+}
+
+export function privateProviderUrlsAllowed() {
+  return process.env.ALLOW_PRIVATE_PROVIDER_URLS === "true" || process.env.NODE_ENV !== "production";
+}
+
+// SSRF guard for user-supplied endpoints: in production, loopback/private/
+// metadata destinations are only allowed when the operator explicitly opts in
+// (ALLOW_PRIVATE_PROVIDER_URLS=true) for a trusted private deployment.
+export function assertAllowedProviderUrl(normalizedBaseUrl) {
+  let host;
+  try {
+    host = new URL(normalizedBaseUrl).hostname;
+  } catch {
+    return;
+  }
+  const kind = classifyProviderHost(host);
+  if (kind === "public" || privateProviderUrlsAllowed()) return;
+  const reachability =
+    kind === "local"
+      ? `"${host}" is a local address, so a deployed VupsRouter backend points at the machine the server runs on — not at your computer.`
+      : `"${host}" is a private network address that a deployed VupsRouter backend cannot route to.`;
+  throw new ProviderError(
+    `This base URL cannot be reached from the VupsRouter server. ${reachability} Fix it by: (1) exposing the gateway on a publicly reachable HTTPS URL (for example a secure tunnel such as ngrok or Cloudflare Tunnel) and using that URL, (2) running VupsRouter locally next to the gateway, or (3) setting ALLOW_PRIVATE_PROVIDER_URLS=true on the server only if this is a deliberately trusted private deployment.`,
+    400,
+    kind === "local" ? "local_endpoint" : "private_endpoint"
+  );
+}
+
+function safeHost(url) {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return "the provider";
+  }
+}
+
+function networkError(error, url) {
+  const host = safeHost(url);
+  const causeCode = error?.cause?.code || error?.code || "";
+  if (causeCode === "ENOTFOUND" || causeCode === "EAI_AGAIN") {
+    return new ProviderError(`DNS lookup failed for "${host}". Check the API base URL hostname and that the provider is online.`, null, "dns_error");
+  }
+  if (causeCode === "ECONNREFUSED") {
+    return new ProviderError(`Connection refused by "${host}". The endpoint may be offline, the port closed, or the URL wrong.`, null, "connection_refused");
+  }
+  if (causeCode === "ECONNRESET" || causeCode === "EPIPE") {
+    return new ProviderError(`The connection to "${host}" was reset before a response arrived. Try again.`, null, "network_error");
+  }
+  return new ProviderError(`Could not reach "${host}". Check the API base URL and your network.`, null, "network_error");
 }
 
 export function validateProviderFields({ provider, baseUrl, apiKey, model }, { requireKey = true } = {}) {
@@ -118,7 +199,7 @@ export async function listProviderModels({ baseUrl, apiKey }, signal) {
     if (error?.name === "TimeoutError" || error?.name === "AbortError") {
       throw new ProviderError("Timed out while contacting the provider's model list endpoint.", null, "timeout");
     }
-    throw new ProviderError("Could not reach the provider's model list endpoint. Check the API base URL and your network.", null, "network_error");
+    throw networkError(error, url);
   }
   if (!response.ok) {
     const payload = await readJsonSafely(response);
@@ -176,7 +257,7 @@ export async function chatCompletion({ baseUrl, apiKey, model, messages, tempera
     if (error?.name === "TimeoutError" || error?.name === "AbortError") {
       throw new ProviderError("Timed out while waiting for the provider.", null, "timeout");
     }
-    throw new ProviderError("Could not reach the provider. Check the API base URL and your network.", null, "network_error");
+    throw networkError(error, url);
   }
   if (!response.ok) {
     throw describeProviderError(response.status, await readJsonSafely(response));
@@ -212,7 +293,7 @@ export async function startChatCompletionStream({ baseUrl, apiKey, model, messag
       if (signal?.aborted) throw new ProviderError("Request cancelled.", null, "cancelled");
       throw new ProviderError("Timed out while waiting for the provider's stream.", null, "timeout");
     }
-    throw new ProviderError("Could not reach the provider. Check the API base URL and your network.", null, "network_error");
+    throw networkError(error, url);
   }
   if (!response.ok) {
     throw describeProviderError(response.status, await readJsonSafely(response));

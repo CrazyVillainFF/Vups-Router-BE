@@ -25,6 +25,7 @@ Create `server/.env` from `.env.example` and fill in the real values:
 | `AI_DAILY_QUOTA` | no (default 100) | Per-user daily AI request quota (resets midnight UTC) |
 | `AI_MAX_CONCURRENCY` | no (default 3) | Max simultaneous AI requests per user |
 | `ADMIN_EMAILS` | no | Comma-separated account emails allowed to call `/api/admin/*` |
+| `ALLOW_PRIVATE_PROVIDER_URLS` | no (default off in production) | Allows personal provider base URLs pointing at localhost/private networks. Leave unset on public deployments: a hosted backend cannot reach your computer, so those URLs are rejected with an actionable message instead of failing as "invalid key" |
 
 Generate both secrets with:
 
@@ -59,23 +60,33 @@ All state-changing requests must use `Content-Type: application/json`; requests 
 
 ### Provider configuration (authenticated)
 
+Each user can save **multiple providers at once** — every provider is an isolated document (`{ userId, providerId }` unique) with its own encrypted key, base URL, enabled flag, and saved model list. Saving, editing, or deleting one provider never touches another. Exactly one provider is `active` per user; `/api/chat` uses it. Legacy single-config users are migrated in place on first read (the old document gains a `providerId` slug derived from its name, and the old `/provider` endpoints keep working).
+
 | Method | Path | Notes |
 | --- | --- | --- |
-| `GET` | `/api/settings/provider` | Returns config with a masked API key only |
-| `PUT` | `/api/settings/provider` | `{ provider, baseUrl, apiKey?, model? }`. `apiKey` optional if one is already saved. Encrypts the key with AES-256-GCM |
-| `DELETE` | `/api/settings/provider` | Deletes the configuration |
-| `POST` | `/api/settings/provider/test` | Tests draft or saved config: lists models and optionally sends one minimal completion for the selected model |
-| `GET` | `/api/settings/models` | Lists models from the saved provider (`GET {baseUrl}/models`) |
+| `GET` | `/api/settings/providers` | Lists all saved providers (masked keys only) plus `activeProviderId` |
+| `PUT` | `/api/settings/providers/:providerId` | Upserts one provider: `{ provider, baseUrl, apiKey?, model?, providerType? }`. A brand-new provider becomes active; editing an existing one never steals the active slot. `providerId` must be a lowercase slug (`^[a-z0-9][a-z0-9-]{0,59}$`) |
+| `POST` | `/api/settings/providers/:providerId/activate` | Makes this provider the one chat uses (only this provider's document is written) |
+| `DELETE` | `/api/settings/providers/:providerId` | Deletes this provider only; if it was active, the most recently created remaining provider is promoted |
+| `POST` | `/api/settings/providers/:providerId/test` | Tests the saved provider (or supplied `baseUrl`/`apiKey`/`model` overrides) and records the result |
+| `PUT` | `/api/settings/providers/:providerId/models` | `{ models: string[], defaultModel? }` — validates length/uniqueness; `defaultModel` must be in the list |
+| `GET` | `/api/settings/models?providerId=` | Lists models for that saved provider (`GET {baseUrl}/models`). Without `providerId` it uses the active provider. If live discovery fails, the saved model list is returned with a `warning` instead of being erased |
 
-### DeepSeek quick start
+Legacy endpoints (`GET/PUT/DELETE /api/settings/provider`, `POST /api/settings/provider/test`) remain for backward compatibility and operate on the active provider.
 
-DeepSeek is supported through the existing encrypted OpenAI-compatible provider flow — no code changes per provider:
+### Provider quick start (any OpenAI-compatible service)
 
-1. Sign in, open **API settings**, click the **DeepSeek** quick-start chip (fills provider `DeepSeek`, base URL `https://api.deepseek.com`, model `deepseek-chat`).
-2. Paste your DeepSeek API key (from platform.deepseek.com), **Save configuration**.
-3. **Load models** to fetch the live model list from `GET /models`, pick a model, then **Test connection**.
+1. Sign in and open **Provider settings**. Any real provider with an OpenAI-compatible API works with no code changes per provider: OpenRouter, DeepSeek, Groq, Google Gemini (OpenAI-compat path), Mistral, Cohere, Together, Fireworks, Cerebras, NVIDIA NIM, xAI, SambaNova, Novita, plus self-hosted gateways (Ollama, vLLM, LocalAI, LM Studio, LiteLLM, FlagshipRouter) and custom endpoints.
+2. Pick a provider card (or Add provider), paste your key, save. Repeat for as many providers as you want — each keeps its own key and models.
+3. **Load models** to fetch the live list, select the ones to keep, choose a default, then **Test connection**.
+4. **Use for chat** switches the active provider; chat requests go to `POST {baseUrl}/chat/completions` through the backend and the model is never silently substituted.
 
-The settings page shows a status badge: Configuration Required, Connected, Insufficient Balance, Model Unavailable, or Connection Failed. Chat requests go to `POST {baseUrl}/chat/completions` through the backend; the model is never silently substituted. Model listings also drive validation, so a model that was removed by the provider produces an actionable error instead of a mystery failure.
+Notes:
+
+- **Localhost / private-network URLs**: a deployed backend (Render, Railway, …) cannot reach `http://localhost:...` on your computer — for example a FlagshipRouter or Ollama instance. On production, such URLs are rejected with `400 local_endpoint` / `private_endpoint` and an explanation (use a public HTTPS tunnel like ngrok/Cloudflare Tunnel, or run VupsRouter locally). During development and tests the guard is off; `ALLOW_PRIVATE_PROVIDER_URLS=true` re-enables private URLs for self-hosted backends that share the network.
+- **URL normalization**: trailing `/chat/completions`, `/completions`, or `/models` suffixes are stripped from the base URL automatically, so pasting a full endpoint URL does not produce a doubled path.
+- **Network errors are specific**: `dns_error`, `connection_refused`, `network_error`, and `timeout` are reported with the target hostname — never as an "invalid API key".
+- The settings page shows a status badge per provider (Connected, Invalid key, Insufficient balance, Unreachable, Not tested). Model listings drive validation: if a provider later removes a model, chat returns an actionable `invalid_model` error instead of a mystery failure.
 
 ### Administration (requires `ADMIN_EMAILS`)
 

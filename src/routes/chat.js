@@ -6,6 +6,7 @@ import Conversation from "../conversation.js";
 import { decryptSecret } from "../encryption.js";
 import {
   ProviderError,
+  assertAllowedProviderUrl,
   chatCompletion,
   extractStreamText,
   normalizeBaseUrl,
@@ -130,7 +131,9 @@ function sharedRoute(shared, requestedModel = "") {
 
 async function resolveProvider(userId, requestedModel) {
   const shared = await sharedModelStatusSafely();
-  const config = await ProviderConfig.findOne({ userId }).select("+encryptedApiKey");
+  const config =
+    (await ProviderConfig.findOne({ userId, active: true }).select("+encryptedApiKey")) ||
+    (await ProviderConfig.findOne({ userId }).sort({ updatedAt: -1 }).select("+encryptedApiKey"));
   const sharedIds = new Set(sharedModelsOf(shared).map(model => model.id));
   if (requestedModel && sharedIds.has(requestedModel)) {
     return sharedRoute(shared, requestedModel);
@@ -138,17 +141,35 @@ async function resolveProvider(userId, requestedModel) {
   if (!config) {
     return sharedRoute(shared, requestedModel);
   }
+  if (config.enabled === false) {
+    throw new ProviderError(
+      `Your saved provider "${config.provider}" is disabled. Enable it in Providers settings or select another provider.`,
+      403,
+      "provider_disabled"
+    );
+  }
+  const savedModelIds = Array.isArray(config.models) ? config.models : [];
+  if (requestedModel && savedModelIds.length > 0 && !savedModelIds.includes(requestedModel) && requestedModel !== config.model) {
+    throw new ProviderError(
+      `"${requestedModel.slice(0, 80)}" is not one of your saved models for ${config.provider}. Add it in Models settings or choose a saved model.`,
+      400,
+      "invalid_model"
+    );
+  }
   let apiKey;
   try {
     apiKey = decryptSecret(config.encryptedApiKey);
   } catch {
     throw new ProviderError("The stored API key could not be decrypted. Re-enter and save your key in Settings.", 500, "key_decryption_failed");
   }
+  const baseUrl = normalizeBaseUrl(config.baseUrl);
+  assertAllowedProviderUrl(baseUrl);
   return {
     shared: false,
     provider: config.provider,
-    baseUrl: normalizeBaseUrl(config.baseUrl),
-    defaultModel: config.model || "",
+    providerId: config.providerId,
+    baseUrl,
+    defaultModel: config.defaultModel || config.model || "",
     apiKey,
     maxTokens: undefined
   };
@@ -223,6 +244,12 @@ const PROVIDER_STATUS_BY_CODE = {
   forbidden: 403,
   too_large: 413,
   unprocessable: 422,
+  local_endpoint: 400,
+  private_endpoint: 400,
+  dns_error: 502,
+  connection_refused: 502,
+  provider_disabled: 403,
+  invalid_model: 400,
   rate_limited: 429,
   timeout: 504,
   provider_unavailable: 502,
