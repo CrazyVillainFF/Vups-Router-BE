@@ -235,6 +235,35 @@ Administrators (listed in `ADMIN_EMAILS`) can toggle the shared model for all us
 
 Ordinary users receive `403` on all `/api/admin/*` routes, and the admin toggle is never exposed in the client UI.
 
+## Password recovery (Brevo email)
+
+Email-based password reset with single-use, hashed tokens.
+
+Endpoints (both rate-limited per IP):
+
+| Method | Path | Body | Response |
+| --- | --- | --- | --- |
+| `POST` | `/api/forgot-password` | `{ "email": "user@example.com" }` | Always `{ "message": "If that email exists, we sent a reset link." }` — identical for existing and nonexistent accounts (no enumeration). `503` if recovery is not configured; `400` for an invalid email. |
+| `POST` | `/api/reset-password` | `{ "token": "...", "newPassword": "...", "confirmPassword": "..." }` | `{ "message": "Your password has been reset. You can now sign in with your new password." }`; `400` with a generic message for invalid, expired, or already-used tokens, weak passwords, or mismatches. |
+
+How it works:
+
+- Reset tokens are 32 random bytes (base64url) generated with `crypto`; the database stores only an HMAC-SHA256 digest keyed by `PASSWORD_RESET_PEPPER` — never the raw token.
+- Tokens expire after exactly 30 minutes and are single-use. Consumption + password update happen in one atomic `findOneAndUpdate`, so concurrent requests cannot both succeed, and a failed update never burns the token.
+- A successful reset sets `passwordChangedAt`, which invalidates sessions issued before the reset (JWT `iat` check in `requireAuth`).
+- Passwords are hashed with the existing bcrypt mechanism (cost 12) — the new password is hashed before the token is consumed.
+- If Brevo rejects the email (bad key, rate limit, network error), the pending token is invalidated immediately and the API still returns the generic response; only a sanitized error code is logged (never keys, tokens, or links).
+
+### Brevo setup
+
+1. Create a free Brevo account and verify the sender address `vupriseoffical@gmail.com` under **Senders, Domains & Dedicated IPs → Senders** (Brevo sends a confirmation email to it).
+2. Create an API key under **SMTP & API → API Keys** and set `BREVO_API_KEY` in the Render dashboard (never commit it).
+3. Generate a separate pepper for token hashing: `node -e "console.log(require('crypto').randomBytes(48).toString('base64url'))"` → `PASSWORD_RESET_PEPPER`.
+4. Set `SENDER_EMAIL=vupriseoffical@gmail.com` and `CLIENT_URL` to the deployed frontend origin (e.g. `https://vups-router-three.vercel.app`) so reset links point at the live site. Local dev: `CLIENT_URL=http://localhost:5173`.
+5. Redeploy and verify: `POST /api/forgot-password` with a real account email; the email arrives with a **Reset Password** button valid for 30 minutes.
+
+Frontend routes: the reset link opens `CLIENT_URL/reset-password?token=…`; the client captures and immediately strips the token from the visible URL, submits it with the new password, and links back to sign-in. The sign-in form links to `/forgot-password`.
+
 ## Security notes
 
 - Provider API keys are encrypted with authenticated AES-256-GCM using `ENCRYPTION_SECRET` and are never returned to the client in full.

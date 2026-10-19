@@ -3,11 +3,17 @@ import jwt from "jsonwebtoken";
 
 const TOKEN_TTL = "7d";
 
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+export function isValidEmail(email) {
+  return typeof email === "string" && EMAIL_PATTERN.test(email.trim()) && email.trim().length <= 254;
+}
+
 export function validateSignup({ name, email, password }) {
   if (typeof name !== "string" || name.trim().length < 2 || name.trim().length > 80) {
     return "Name must be between 2 and 80 characters.";
   }
-  if (typeof email !== "string" || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim()) || email.trim().length > 254) {
+  if (!isValidEmail(email)) {
     return "Enter a valid email address.";
   }
   if (typeof password !== "string" || password.length < 8 || password.length > 128) {
@@ -17,7 +23,7 @@ export function validateSignup({ name, email, password }) {
 }
 
 export function validateSignin({ email, password }) {
-  if (typeof email !== "string" || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim()) || email.trim().length > 254) {
+  if (!isValidEmail(email)) {
     return "Enter a valid email address.";
   }
   if (typeof password !== "string" || password.length < 8 || password.length > 128) {

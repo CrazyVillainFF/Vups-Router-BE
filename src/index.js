@@ -6,6 +6,7 @@ import helmet from "helmet";
 import mongoose from "mongoose";
 import connectToDatabase, { describeDatabaseError, isDatabaseFailure, safeDatabaseErrorText } from "./db.js";
 import authRoutes from "./routes/auth.js";
+import passwordResetRoutes from "./routes/passwordReset.js";
 import settingsRoutes from "./routes/settings.js";
 import conversationsRoutes from "./routes/conversations.js";
 import chatRoutes from "./routes/chat.js";
@@ -113,10 +114,11 @@ app.get("/api", (_req, res) => res.json({
   service: "VupsRouter",
   message: "VupsRouter API index. All application routes are served under /api/*.",
   health: "/api/health",
-  routes: ["/api/auth", "/api/settings", "/api/conversations", "/api/chat", "/api/admin"]
+  routes: ["/api/auth", "/api/forgot-password", "/api/reset-password", "/api/settings", "/api/conversations", "/api/chat", "/api/admin"]
 }));
 
 app.use("/api/auth", authRoutes);
+app.use("/api", passwordResetRoutes);
 app.use("/api/settings", settingsRoutes);
 app.use("/api/conversations", conversationsRoutes);
 app.use("/api/chat", chatRoutes);

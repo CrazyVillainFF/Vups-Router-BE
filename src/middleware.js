@@ -56,10 +56,14 @@ export async function requireAuth(req, res, next) {
     return res.status(401).json({ message: "Your session expired. Please sign in again." });
   }
   try {
-    const user = await User.findById(payload.sub).select("name email aiEnabled");
+    const user = await User.findById(payload.sub).select("name email aiEnabled passwordChangedAt");
     if (!user) {
       clearSessionCookie(res);
       return res.status(401).json({ message: "Your account no longer exists. Please sign up again." });
+    }
+    if (user.passwordChangedAt && payload.iat && payload.iat * 1000 < user.passwordChangedAt.getTime()) {
+      clearSessionCookie(res);
+      return res.status(401).json({ message: "Your password was changed. Please sign in again." });
     }
     req.user = user;
     req.userId = user.id;
@@ -129,3 +133,19 @@ export const chatRateLimiter = rateLimit({
 export const settingsRateLimiter = rateLimit(
   rateLimitOptions(60, "Too many settings requests. Please wait and try again.")
 );
+
+export const forgotPasswordRateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: Number(process.env.PASSWORD_RESET_RATE_LIMIT_MAX || 10),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: "Too many password reset requests. Please wait 15 minutes and try again." }
+});
+
+export const resetPasswordRateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: Number(process.env.PASSWORD_RESET_ATTEMPT_LIMIT_MAX || 20),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: "Too many password reset attempts. Please wait 15 minutes and try again." }
+});
