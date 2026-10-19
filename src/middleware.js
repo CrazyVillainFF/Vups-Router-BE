@@ -142,6 +142,14 @@ export const forgotPasswordRateLimiter = rateLimit({
   message: { message: "Too many password reset requests. Please wait 15 minutes and try again." }
 });
 
+export const verifyCodeRateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: Number(process.env.VERIFY_CODE_RATE_LIMIT_MAX || 20),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: "Too many code verification attempts. Please wait 15 minutes and try again." }
+});
+
 export const resetPasswordRateLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   limit: Number(process.env.PASSWORD_RESET_ATTEMPT_LIMIT_MAX || 20),

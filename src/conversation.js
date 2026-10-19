@@ -1,8 +1,16 @@
 import mongoose from "mongoose";
 
+// Attachment metadata only (name/type/size) — image bytes are never stored.
+const attachmentSchema = new mongoose.Schema({
+  name: { type: String, default: "", maxlength: 200 },
+  mimeType: { type: String, required: true, maxlength: 80 },
+  bytes: { type: Number, min: 0, default: 0 }
+}, { _id: false });
+
 const messageSchema = new mongoose.Schema({
   role: { type: String, enum: ["user", "assistant"], required: true },
-  content: { type: String, required: true, maxlength: 32000 },
+  content: { type: String, default: "", maxlength: 32000 },
+  attachments: { type: [attachmentSchema], default: undefined },
   createdAt: { type: Date, default: Date.now }
 }, { _id: false });
 

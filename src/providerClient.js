@@ -1,3 +1,5 @@
+import { imageDataUrl } from "./chatImages.js";
+
 function envMillis(name, fallback) {
   const value = Number(process.env[name]);
   return Number.isFinite(value) && value >= 1000 ? Math.floor(value) : fallback;
@@ -136,9 +138,29 @@ export async function listProviderModels({ baseUrl, apiKey }, signal) {
     .slice(0, 1000);
 }
 
+// Converts normalized messages into the OpenAI chat format used by every
+// provider we support (OpenRouter, personal OpenAI-compatible APIs, and the
+// shared Ollama server's /v1 compatibility layer). Messages carrying images
+// become content-parts arrays with base64 data URLs; everything else is
+// passed through untouched.
+export function serializeMessages(messages) {
+  return messages.map(message => {
+    const images = Array.isArray(message?.images) ? message.images : [];
+    if (images.length === 0) return { role: message.role, content: message.content };
+    const parts = [];
+    if (typeof message.content === "string" && message.content.trim().length > 0) {
+      parts.push({ type: "text", text: message.content });
+    }
+    for (const image of images) {
+      parts.push({ type: "image_url", image_url: { url: imageDataUrl(image) } });
+    }
+    return { role: message.role, content: parts };
+  });
+}
+
 export async function chatCompletion({ baseUrl, apiKey, model, messages, temperature, maxTokens }, signal) {
   const url = `${normalizeBaseUrl(baseUrl)}/chat/completions`;
-  const body = { model, messages, stream: false };
+  const body = { model, messages: serializeMessages(messages), stream: false };
   if (typeof temperature === "number" && Number.isFinite(temperature)) body.temperature = temperature;
   if (typeof maxTokens === "number" && Number.isFinite(maxTokens)) body.max_tokens = maxTokens;
 
@@ -173,7 +195,7 @@ export async function chatCompletion({ baseUrl, apiKey, model, messages, tempera
 
 export async function startChatCompletionStream({ baseUrl, apiKey, model, messages, temperature, maxTokens }, signal) {
   const url = `${normalizeBaseUrl(baseUrl)}/chat/completions`;
-  const body = { model, messages, stream: true };
+  const body = { model, messages: serializeMessages(messages), stream: true };
   if (typeof temperature === "number" && Number.isFinite(temperature)) body.temperature = temperature;
   if (typeof maxTokens === "number" && Number.isFinite(maxTokens)) body.max_tokens = maxTokens;
 

@@ -47,6 +47,9 @@ router.get("/:id", async (req, res, next) => {
         messages: conversation.messages.map(message => ({
           role: message.role,
           content: message.content,
+          ...(Array.isArray(message.attachments) && message.attachments.length > 0
+            ? { attachments: message.attachments.map(attachment => ({ name: attachment.name, mimeType: attachment.mimeType, bytes: attachment.bytes })) }
+            : {}),
           createdAt: message.createdAt
         }))
       }

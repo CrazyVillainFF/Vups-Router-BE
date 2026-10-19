@@ -48,6 +48,23 @@ export function openRouterModels() {
   return [...new Set(ordered)];
 }
 
+// Optional comma-separated override for models whose /models metadata does
+// not advertise input modalities. Only used when the metadata is missing.
+export function openRouterVisionModels() {
+  return new Set(
+    (process.env.OPENROUTER_VISION_MODELS || "")
+      .split(",")
+      .map(value => value.trim())
+      .filter(Boolean)
+  );
+}
+
+function modelSupportsImages(entry, id, overrides) {
+  const modalities = entry?.architecture?.input_modalities;
+  if (Array.isArray(modalities)) return modalities.includes("image");
+  return overrides.has(id);
+}
+
 export function openRouterMaxOutputTokens() {
   const value = Number(process.env.OPENROUTER_MAX_OUTPUT_TOKENS);
   if (!Number.isFinite(value) || value <= 0) return OPENROUTER_MAX_OUTPUT_TOKENS_DEFAULT;
@@ -57,7 +74,8 @@ export function openRouterMaxOutputTokens() {
 export async function checkOpenRouter() {
   const models = openRouterModels();
   const configuredDefault = openRouterModel();
-  const unavailable = models.map(id => ({ id, name: id, available: false }));
+  const visionOverrides = openRouterVisionModels();
+  const unavailable = models.map(id => ({ id, name: id, available: false, vision: visionOverrides.has(id) }));
   const key = openRouterApiKey();
   const baseUrl = openRouterBaseUrl();
   if (!key || !baseUrl) return { status: "not_configured", model: configuredDefault, available: false, models: unavailable };
@@ -86,7 +104,8 @@ export async function checkOpenRouter() {
   const checked = models.map(id => ({
     id,
     name: typeof byId.get(id)?.name === "string" ? byId.get(id).name : id,
-    available: byId.has(id)
+    available: byId.has(id),
+    vision: modelSupportsImages(byId.get(id), id, visionOverrides)
   }));
   const ready = checked.filter(model => model.available);
   if (ready.length === 0) {

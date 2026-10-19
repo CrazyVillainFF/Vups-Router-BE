@@ -90,7 +90,7 @@ All admin routes return `403` unless the signed-in user's email is listed in `AD
 
 | Method | Path | Notes |
 | --- | --- | --- |
-| `POST` | `/api/chat` | `{ conversationId?, messages, model?, temperature?, stream? }`. Proxies to `{baseUrl}/chat/completions`. Streams SSE (`meta`, `delta`, `done`, `error` events) by default |
+| `POST` | `/api/chat` | `{ conversationId?, messages, model?, temperature?, stream? }`. The final message may carry `images: [{ name?, mimeType, data }]` (base64, PNG/JPEG/WebP/GIF). Proxies to `{baseUrl}/chat/completions`. Streams SSE (`meta`, `delta`, `done`, `error` events) by default |
 | `GET` | `/api/conversations` | Lists the user's conversations |
 | `GET` | `/api/conversations/:id` | Full conversation with messages |
 | `DELETE` | `/api/conversations/:id` | Deletes one conversation |
@@ -235,39 +235,93 @@ Administrators (listed in `ADMIN_EMAILS`) can toggle the shared model for all us
 
 Ordinary users receive `403` on all `/api/admin/*` routes, and the admin toggle is never exposed in the client UI.
 
-## Password recovery (Brevo email)
+## Password recovery (Brevo email, six-digit code)
 
-Email-based password reset with single-use, hashed tokens.
+Email-based password reset with a six-digit one-time code and a short-lived,
+single-use reset authorization.
 
-Endpoints (both rate-limited per IP):
+Endpoints (all rate-limited per IP):
 
 | Method | Path | Body | Response |
 | --- | --- | --- | --- |
-| `POST` | `/api/forgot-password` | `{ "email": "user@example.com" }` | Always `{ "message": "If that email exists, we sent a reset link." }` — identical for existing and nonexistent accounts (no enumeration). `503` if recovery is not configured; `400` for an invalid email. |
-| `POST` | `/api/reset-password` | `{ "token": "...", "newPassword": "...", "confirmPassword": "..." }` | `{ "message": "Your password has been reset. You can now sign in with your new password." }`; `400` with a generic message for invalid, expired, or already-used tokens, weak passwords, or mismatches. |
+| `POST` | `/api/forgot-password` | `{ "email": "user@example.com" }` | Always `{ "message": "If that email exists, we sent a 6-digit code." }` — identical for existing and nonexistent accounts (no enumeration). `503` if email delivery is not configured; `400` for an invalid email. |
+| `POST` | `/api/verify-code` | `{ "email": "user@example.com", "code": "012345" }` | `{ "success": true, "message": "Code verified successfully.", "resetAuthorization": "<single-use token>" }`; `400` with a generic message for invalid, expired, or exhausted codes. |
+| `POST` | `/api/reset-password` | `{ "email": "...", "code": "012345", "resetAuthorization": "...", "newPassword": "...", "confirmPassword": "..." }` | `{ "success": true, "message": "Password updated successfully." }`; `400` with a generic message for invalid credentials, weak passwords, or mismatches. The email + code pair also works without a prior verify call. |
 
 How it works:
 
-- Reset tokens are 32 random bytes (base64url) generated with `crypto`; the database stores only an HMAC-SHA256 digest keyed by `PASSWORD_RESET_PEPPER` — never the raw token.
-- Tokens expire after exactly 30 minutes and are single-use. Consumption + password update happen in one atomic `findOneAndUpdate`, so concurrent requests cannot both succeed, and a failed update never burns the token.
+- The six-digit code is generated with `crypto.randomInt(0, 1000000)` and padded to six characters, so codes like `004213` keep their leading zeroes.
+- The database stores only a bcrypt hash of the code plus its expiry (10 minutes) — never the raw code.
+- Verification issues a 256-bit random reset authorization (URL-safe) whose SHA-256 digest is stored on the account with its own 10-minute expiry. It is bound to that account, single-use, replaced whenever a new code is requested, and cleared on any successful reset.
+- Wrong codes increment `resetAttempts` atomically; after 5 failed attempts the code is locked (a new code resets the counter).
+- Code/authorization consumption + password update happen in one atomic `findOneAndUpdate`, so concurrent requests can never both succeed and a failed update never burns the credential.
 - A successful reset sets `passwordChangedAt`, which invalidates sessions issued before the reset (JWT `iat` check in `requireAuth`).
-- Passwords are hashed with the existing bcrypt mechanism (cost 12) — the new password is hashed before the token is consumed.
-- If Brevo rejects the email (bad key, rate limit, network error), the pending token is invalidated immediately and the API still returns the generic response; only a sanitized error code is logged (never keys, tokens, or links).
+- Passwords are hashed with the existing bcrypt mechanism (cost 12).
+- If Brevo rejects the email (bad key, unverified sender, rate limit, network error), the HTTP status and the provider's response body are logged on the server, the just-issued code is invalidated, and the API still returns the generic response. The OTP itself is never logged.
 
 ### Brevo setup
 
 1. Create a free Brevo account and verify the sender address `vupriseoffical@gmail.com` under **Senders, Domains & Dedicated IPs → Senders** (Brevo sends a confirmation email to it).
-2. Create an API key under **SMTP & API → API Keys** and set `BREVO_API_KEY` in the Render dashboard (never commit it).
-3. Generate a separate pepper for token hashing: `node -e "console.log(require('crypto').randomBytes(48).toString('base64url'))"` → `PASSWORD_RESET_PEPPER`.
-4. Set `SENDER_EMAIL=vupriseoffical@gmail.com` and `CLIENT_URL` to the deployed frontend origin (e.g. `https://vups-router-three.vercel.app`) so reset links point at the live site. Local dev: `CLIENT_URL=http://localhost:5173`.
-5. Redeploy and verify: `POST /api/forgot-password` with a real account email; the email arrives with a **Reset Password** button valid for 30 minutes.
+2. Create an API key under **SMTP & API → API Keys** and set `BREVO_API_KEY` in the Render dashboard (never commit it). If the key was rotated, update it here too and redeploy.
+3. Set `SENDER_EMAIL=vupriseoffical@gmail.com` in the Render dashboard.
+4. Redeploy and verify: `POST /api/forgot-password` with a real account email; the email arrives with a large six-digit code valid for 10 minutes.
 
-Frontend routes: the reset link opens `CLIENT_URL/reset-password?token=…`; the client captures and immediately strips the token from the visible URL, submits it with the new password, and links back to sign-in. The sign-in form links to `/forgot-password`.
+Frontend flow (all inside `/forgot-password`): step 1 collects the email, step 2 renders the six animated code boxes (React Bits `CodeSlots`) for the six-digit code, step 3 collects the new password and submits it with the reset authorization. `/reset-password` redirects to `/forgot-password` for compatibility with old links. The sign-in form links to `/forgot-password`.
+
+## Image attachments (vision chats)
+
+Users can attach images (attach button, drag & drop, or paste) to the current
+message. Attachments are converted to OpenAI-compatible content parts for the
+provider and are **never stored in the database** — history keeps only
+`{ name, mimeType, bytes }` metadata per image.
+
+How a request flows:
+
+1. The client validates type and size, reads each file to a base64 data URL,
+   and sends `images` **on the final message only**: `{ name, mimeType, data }`
+   (no data-URL prefix). Earlier messages must stay text-only (`400` otherwise).
+2. The server re-validates everything: allowed types, base64 charset, per-image
+   and total size limits, and the decoded bytes must match a real image
+   signature (magic-byte sniffing — the declared MIME type is never trusted).
+3. Validated messages are serialized once in `providerClient.js` as
+   `[{ type: "text" }, { type: "image_url", image_url: { url: "data:…" } }]`,
+   which works for OpenRouter, personal OpenAI-compatible providers, and the
+   shared Ollama server's `/v1` compatibility endpoint.
+4. Message content may be empty when at least one image is attached
+   (image-only messages are supported).
+
+Limits (defaults; configurable via env shown in `.env.example`):
+
+| Env | Default | Meaning |
+| --- | --- | --- |
+| `CHAT_IMAGE_MAX_COUNT` | `4` | Images per message |
+| `CHAT_IMAGE_MAX_BYTES` | `4194304` (4 MB) | Per image, decoded |
+| `CHAT_IMAGE_MAX_TOTAL_BYTES` | `8388608` (8 MB) | Per message, decoded |
+
+The global JSON limit stays at 512 kB; `POST /api/chat` uses its own parser
+sized from the image limits (base64 inflates decoded bytes by ~4/3, plus text
+headroom).
+
+Vision capability is enforced server-side:
+
+- **OpenRouter shared models**: read automatically from the model metadata
+  (`architecture.input_modalities`). `OPENROUTER_VISION_MODELS` can force-enable
+  specific IDs when metadata is missing.
+- **Ollama shared model**: treated as text-only unless the ID is listed in
+  `OLLAMA_VISION_MODELS` (Ollama does not report vision support).
+- **Personal providers**: unknown, so requests are allowed and no capability
+  claim is made; the provider's own error surfaces if it rejects the image.
+- Requesting images from a shared model without vision support returns `400`
+  `model_no_vision` with the list of vision-capable shared models.
+
+`GET /api/settings/models` includes a `vision` flag per model (`true`/`false`
+for shared models, `null` for personal ones) so the client can warn before
+sending.
 
 ## Security notes
 
 - Provider API keys are encrypted with authenticated AES-256-GCM using `ENCRYPTION_SECRET` and are never returned to the client in full.
 - Sessions are HTTP-only cookies; tokens are not stored in `localStorage` by the shipped client.
 - Auth endpoints are rate-limited (30 requests / 15 min / IP); chat is limited to 30 requests / min.
-- Requests are size-limited (512 kB JSON) and avatar of conversations capped server-side.
+- Requests are size-limited (512 kB JSON globally; `/api/chat` allows the image-attachment budget described above). Conversation history is capped server-side. Image bytes are validated by magic bytes and never persisted.
 - The proxy never substitutes a different model when the requested model fails; it returns the provider's error instead.

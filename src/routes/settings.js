@@ -197,7 +197,7 @@ router.get("/models", async (req, res, next) => {
     const sharedEntries = shared.available
       ? sharedModels
           .filter(model => model.available !== false)
-          .map(model => ({ id: model.id, name: model.name || model.id, ownedBy: SHARED_OWNER_LABEL, shared: true }))
+          .map(model => ({ id: model.id, name: model.name || model.id, ownedBy: SHARED_OWNER_LABEL, shared: true, vision: model.vision === true }))
       : [];
     const stored = await loadStoredConfig(req.userId);
     if (!stored) {
@@ -220,7 +220,8 @@ router.get("/models", async (req, res, next) => {
     }
     try {
       const models = await listProviderModels({ baseUrl: stored.baseUrl, apiKey });
-      const merged = [...sharedEntries, ...models.filter(model => !sharedEntries.some(entry => entry.id === model.id))];
+      const personal = models.map(model => ({ ...model, shared: false, vision: null }));
+      const merged = [...sharedEntries, ...personal.filter(model => !sharedEntries.some(entry => entry.id === model.id))];
       return res.json({ models: merged, shared });
     } catch (error) {
       if (error instanceof ProviderError) {

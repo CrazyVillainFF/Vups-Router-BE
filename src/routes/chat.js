@@ -14,6 +14,7 @@ import {
 import { chatRateLimiter, requireAuth } from "../middleware.js";
 import { UsageError, acquireSlot, consumeDailyQuota, releaseSlot } from "../usage.js";
 import { sharedModelStatus, sharedProviderForChat } from "../sharedModel.js";
+import { attachmentMetadata, validateImages } from "../chatImages.js";
 
 const router = Router();
 
@@ -29,15 +30,26 @@ function validateMessages(value) {
   if (value.length > MAX_MESSAGES) return `A request can contain at most ${MAX_MESSAGES} messages.`;
   const messages = [];
   let total = 0;
-  for (const entry of value) {
+  for (let index = 0; index < value.length; index += 1) {
+    const entry = value[index];
     const role = entry?.role;
     const content = typeof entry?.content === "string" ? entry.content : "";
     if (role !== "user" && role !== "assistant") return "Every message needs a role of user or assistant.";
-    if (content.trim().length === 0) return "Message content cannot be empty.";
     if (content.length > 32000) return "A single message cannot exceed 32000 characters.";
+    const images = validateImages(entry?.images);
+    if (images.error) return images.error;
+    if (images.images.length > 0) {
+      if (index !== value.length - 1) return "Images can only be attached to the current message.";
+      if (role !== "user") return "Images can only be attached to your own messages.";
+    }
+    if (content.trim().length === 0 && images.images.length === 0) return "Message content cannot be empty.";
     total += content.length;
     if (total > MAX_TOTAL_CHARS) return "The conversation is too large. Start a new chat or shorten your messages.";
-    messages.push({ role, content });
+    if (images.images.length > 0) {
+      messages.push({ role, content, images: images.images, attachmentMeta: attachmentMetadata(images.images) });
+    } else {
+      messages.push({ role, content });
+    }
   }
   if (messages[messages.length - 1].role !== "user") return "The last message must come from the user.";
   return { messages };
@@ -102,13 +114,17 @@ function sharedRoute(shared, requestedModel = "") {
   } else {
     model = readyIds[0];
   }
+  const visionModelIds = enabledModels
+    .filter(entry => entry.available !== false && entry.vision === true)
+    .map(entry => entry.id);
   return {
     shared: true,
     provider: provider.provider,
     baseUrl: provider.baseUrl,
     apiKey: provider.apiKey,
     defaultModel: model,
-    maxTokens: provider.maxTokens
+    maxTokens: provider.maxTokens,
+    visionModelIds
   };
 }
 
@@ -156,10 +172,20 @@ async function sharedModelStatusSafely() {
   }
 }
 
+// Chat history keeps attachment metadata only — image bytes are never stored.
+function storedMessage(message) {
+  if (Array.isArray(message.attachmentMeta) && message.attachmentMeta.length > 0) {
+    return { role: message.role, content: message.content, attachments: message.attachmentMeta };
+  }
+  return { role: message.role, content: message.content };
+}
+
 async function persistConversation(userId, conversationId, messages, assistantText) {
-  const storedMessages = [...messages, { role: "assistant", content: assistantText }].slice(-MAX_STORED_MESSAGES);
+  const storedMessages = [...messages.map(storedMessage), { role: "assistant", content: assistantText }].slice(-MAX_STORED_MESSAGES);
   const firstUser = storedMessages.find(message => message.role === "user");
-  const title = (firstUser?.content ?? "New chat").replace(/\s+/g, " ").trim().slice(0, 60) || "New chat";
+  const titleSource = (firstUser?.content ?? "").replace(/\s+/g, " ").trim();
+  const fallbackTitle = Array.isArray(firstUser?.attachments) && firstUser.attachments.length > 0 ? "Image attachment" : "New chat";
+  const title = (titleSource || fallbackTitle).slice(0, 60);
   let conversation = null;
   if (conversationId && mongoose.isValidObjectId(conversationId)) {
     conversation = await Conversation.findOne({ _id: conversationId, userId });
@@ -282,6 +308,18 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
 
     const model = requestedModel || provider.defaultModel;
     if (!model) return res.status(400).json({ message: "Select a model in Settings or choose one from the model picker.", code: "no_model" });
+
+    const lastMessage = validated.messages[validated.messages.length - 1];
+    if (lastMessage.images?.length > 0 && provider.shared && !provider.visionModelIds.includes(model)) {
+      const alternatives = provider.visionModelIds;
+      const suggestion = alternatives.length > 0
+        ? `Vision-capable shared models you can use instead: ${alternatives.join(", ")}.`
+        : "Connect your own vision-capable provider in API settings.";
+      return res.status(400).json({
+        message: `The selected model (${model}) does not accept image inputs. ${suggestion}`,
+        code: "model_no_vision"
+      });
+    }
 
     if (!acquireSlot(req.userId)) {
       return res.status(429).json({

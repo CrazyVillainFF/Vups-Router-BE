@@ -1,5 +1,6 @@
 import {
   checkOllama,
+  ollamaVisionModels,
   sharedModelEnabled,
   sharedModelName,
   sharedProviderForChat as ollamaProviderForChat
@@ -30,7 +31,7 @@ export async function sharedModelStatus() {
     model: check.model,
     available: enabled && check.available,
     status: enabled ? check.status : "disabled",
-    models: [{ id: check.model, name: check.model, available: check.available }]
+    models: [{ id: check.model, name: check.model, available: check.available, vision: ollamaVisionModels().has(check.model) }]
   };
 }
 

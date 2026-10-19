@@ -1,69 +1,148 @@
 import { Router } from "express";
-import { hashPassword, isValidEmail } from "../auth.js";
+import { hashPassword, isValidEmail, passwordMatches } from "../auth.js";
 import connectToDatabase from "../db.js";
 import User from "../user.js";
-import { brevoConfigError, sendResetEmail } from "../email.js";
-import { forgotPasswordRateLimiter, resetPasswordRateLimiter } from "../middleware.js";
+import { brevoConfigError, sendOtpEmail } from "../email.js";
+import { forgotPasswordRateLimiter, resetPasswordRateLimiter, verifyCodeRateLimiter } from "../middleware.js";
 import {
-  RESET_TOKEN_TTL_MS,
-  generateResetToken,
-  hashResetToken,
-  isValidResetTokenFormat,
-  passwordResetPepper
-} from "../resetToken.js";
+  RESET_AUTH_TTL_MS,
+  RESET_CODE_TTL_MS,
+  RESET_MAX_ATTEMPTS,
+  generateOtp,
+  generateResetAuthToken,
+  hashResetAuthToken,
+  isResetAuthTokenFormat,
+  isSixDigitCode
+} from "../resetCode.js";
 
 const router = Router();
 
-const GENERIC_RESPONSE = "If that email exists, we sent a reset link.";
-const INVALID_TOKEN_RESPONSE = "This password reset link is invalid or has expired.";
+const SENT_RESPONSE = "If that email exists, we sent a 6-digit code.";
+const INVALID_CODE_RESPONSE = "That code is invalid or has expired.";
 
-function recoveryConfigError() {
-  if (!passwordResetPepper()) return "Password recovery is not configured on the server.";
-  return brevoConfigError();
+// Fields hidden by `select: false` must be requested explicitly.
+const RESET_FIELDS = "+resetCodeHash +resetCodeExpires +resetAttempts +resetAuthHash +resetAuthExpires";
+
+function normalizeEmail(value) {
+  return typeof value === "string" ? value.trim().toLowerCase() : "";
 }
 
-// The reset link always targets a fixed frontend path on the configured origin.
-function clientOrigin() {
-  const raw = (process.env.CLIENT_URL || "").trim();
-  try {
-    const url = new URL(raw);
-    if (url.protocol === "http:" || url.protocol === "https:") return url.origin;
-  } catch {
-    // fall through to the development default
+function passwordValidationError(newPassword) {
+  if (typeof newPassword !== "string" || newPassword.length < 8 || newPassword.length > 128) {
+    return "Password must be between 8 and 128 characters.";
   }
-  return "http://localhost:5173";
+  return null;
+}
+
+// Hashes the new password, then performs the single-use consume atomically in
+// one document operation. Concurrent requests can never both match the same
+// code or authorization, and a hashing failure cannot burn the credential.
+async function consumeResetAndSetPassword(filter, newPassword) {
+  const passwordHash = await hashPassword(newPassword);
+  return User.findOneAndUpdate(
+    filter,
+    {
+      $set: { passwordHash, passwordChangedAt: new Date(), resetAttempts: 0 },
+      $unset: { resetCodeHash: 1, resetCodeExpires: 1, resetAuthHash: 1, resetAuthExpires: 1 }
+    },
+    { returnDocument: "before" }
+  );
 }
 
 router.post("/forgot-password", forgotPasswordRateLimiter, async (req, res, next) => {
   try {
-    const email = typeof req.body?.email === "string" ? req.body.email.trim().toLowerCase() : "";
+    const email = normalizeEmail(req.body?.email);
     if (!isValidEmail(email)) return res.status(400).json({ message: "Enter a valid email address." });
 
-    const configError = recoveryConfigError();
-    if (configError) return res.status(503).json({ message: configError });
+    // Never report a fake success for unconfigured delivery: fail loudly here
+    // and record the configuration problem on the server.
+    const configError = brevoConfigError();
+    if (configError) {
+      console.error("Password reset code email is not configured:", configError);
+      return res.status(503).json({ message: "Email delivery is not configured on the server." });
+    }
 
     await connectToDatabase();
     const user = await User.findOne({ email }).select("_id email");
     if (user) {
-      const rawToken = generateResetToken();
-      user.passwordResetTokenHash = hashResetToken(rawToken);
-      user.passwordResetExpiresAt = new Date(Date.now() + RESET_TOKEN_TTL_MS);
-      await user.save();
-
-      const resetLink = `${clientOrigin()}/reset-password?token=${encodeURIComponent(rawToken)}`;
+      const code = generateOtp();
+      const codeHash = await hashPassword(code);
+      // A fresh code invalidates any previously issued reset authorization.
+      await User.updateOne(
+        { _id: user._id },
+        {
+          $set: { resetCodeHash: codeHash, resetCodeExpires: new Date(Date.now() + RESET_CODE_TTL_MS), resetAttempts: 0 },
+          $unset: { resetAuthHash: 1, resetAuthExpires: 1 }
+        }
+      );
       try {
-        await sendResetEmail(user.email, resetLink);
+        await sendOtpEmail(email, code);
       } catch (error) {
-        // Do not leave a usable token behind when the email never went out.
-        await User.updateOne(
-          { _id: user._id },
-          { $set: { passwordResetTokenHash: null, passwordResetExpiresAt: null } }
-        );
-        console.error("Password reset email delivery failed:", error?.code || "unknown");
+        // The code never reached the user: invalidate it so it cannot be
+        // used, and log only the safe error code (never the OTP).
+        await User.updateOne({ _id: user._id }, { $unset: { resetCodeHash: 1, resetCodeExpires: 1 } });
+        console.error("Password reset code email delivery failed:", error?.code || "unknown");
       }
     }
 
-    return res.json({ message: GENERIC_RESPONSE });
+    return res.json({ message: SENT_RESPONSE });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.post("/verify-code", verifyCodeRateLimiter, async (req, res, next) => {
+  try {
+    const email = normalizeEmail(req.body?.email);
+    const code = typeof req.body?.code === "string" ? req.body.code.trim() : "";
+    if (!isValidEmail(email) || !isSixDigitCode(code)) {
+      return res.status(400).json({ message: INVALID_CODE_RESPONSE });
+    }
+
+    await connectToDatabase();
+    const user = await User.findOne({ email }).select(RESET_FIELDS);
+    if (!user || !user.resetCodeHash || !user.resetCodeExpires || user.resetCodeExpires.getTime() <= Date.now()) {
+      return res.status(400).json({ message: INVALID_CODE_RESPONSE });
+    }
+    if ((user.resetAttempts || 0) >= RESET_MAX_ATTEMPTS) {
+      return res.status(400).json({ message: INVALID_CODE_RESPONSE });
+    }
+
+    const matches = await passwordMatches(code, user.resetCodeHash);
+    if (!matches) {
+      // Atomic increment so concurrent wrong guesses are all counted.
+      await User.updateOne({ _id: user._id }, { $inc: { resetAttempts: 1 } });
+      return res.status(400).json({ message: INVALID_CODE_RESPONSE });
+    }
+
+    const rawAuth = generateResetAuthToken();
+    // Issue a single-use, short-lived authorization bound to this account.
+    // Issuing a new authorization revokes the previous one; the guarded
+    // update cannot succeed for a concurrently invalidated code.
+    const updated = await User.findOneAndUpdate(
+      {
+        _id: user._id,
+        resetCodeHash: user.resetCodeHash,
+        resetCodeExpires: { $gt: new Date() },
+        resetAttempts: { $lt: RESET_MAX_ATTEMPTS }
+      },
+      {
+        $set: {
+          resetAuthHash: hashResetAuthToken(rawAuth),
+          resetAuthExpires: new Date(Date.now() + RESET_AUTH_TTL_MS),
+          resetAttempts: 0
+        }
+      },
+      { returnDocument: "after" }
+    );
+    if (!updated) return res.status(400).json({ message: INVALID_CODE_RESPONSE });
+
+    return res.json({
+      success: true,
+      message: "Code verified successfully.",
+      resetAuthorization: rawAuth,
+      expiresInSeconds: Math.floor(RESET_AUTH_TTL_MS / 1000)
+    });
   } catch (error) {
     return next(error);
   }
@@ -71,43 +150,60 @@ router.post("/forgot-password", forgotPasswordRateLimiter, async (req, res, next
 
 router.post("/reset-password", resetPasswordRateLimiter, async (req, res, next) => {
   try {
-    const token = typeof req.body?.token === "string" ? req.body.token.trim() : "";
+    const email = normalizeEmail(req.body?.email);
+    const code = typeof req.body?.code === "string" ? req.body.code.trim() : "";
+    const rawAuth = typeof req.body?.resetAuthorization === "string" ? req.body.resetAuthorization.trim() : "";
     const newPassword = req.body?.newPassword;
     const confirmPassword = req.body?.confirmPassword;
 
-    if (!isValidResetTokenFormat(token)) {
-      return res.status(400).json({ message: INVALID_TOKEN_RESPONSE });
+    if (!isValidEmail(email)) return res.status(400).json({ message: "Enter a valid email address." });
+    const hasAuth = isResetAuthTokenFormat(rawAuth);
+    if (!hasAuth && !isSixDigitCode(code)) {
+      return res.status(400).json({ message: INVALID_CODE_RESPONSE });
     }
-    if (typeof newPassword !== "string" || newPassword.length < 8 || newPassword.length > 128) {
-      return res.status(400).json({ message: "Password must be between 8 and 128 characters." });
-    }
-    if (newPassword !== confirmPassword) {
+    const passwordError = passwordValidationError(newPassword);
+    if (passwordError) return res.status(400).json({ message: passwordError });
+    if (confirmPassword !== undefined && newPassword !== confirmPassword) {
       return res.status(400).json({ message: "Passwords do not match." });
     }
 
-    const configError = recoveryConfigError();
-    if (configError) return res.status(503).json({ message: configError });
-
-    const tokenHash = hashResetToken(token);
-    // Hash before consuming the token so a hashing failure cannot burn it.
-    const passwordHash = await hashPassword(newPassword);
-
     await connectToDatabase();
 
-    // Atomic single-use consume + password update in one document operation:
-    // concurrent requests can never both match, and a failure here leaves the
-    // token intact so the user can retry.
-    const user = await User.findOneAndUpdate(
-      { passwordResetTokenHash: tokenHash, passwordResetExpiresAt: { $gt: new Date() } },
-      {
-        $set: { passwordHash, passwordChangedAt: new Date() },
-        $unset: { passwordResetTokenHash: 1, passwordResetExpiresAt: 1 }
-      },
-      { returnDocument: "before" }
-    );
-    if (!user) return res.status(400).json({ message: INVALID_TOKEN_RESPONSE });
+    if (hasAuth) {
+      // The authorization is bound to the account and consumed atomically,
+      // so it cannot be replayed or used for a different email.
+      const consumed = await consumeResetAndSetPassword(
+        { email, resetAuthHash: hashResetAuthToken(rawAuth), resetAuthExpires: { $gt: new Date() } },
+        newPassword
+      );
+      if (!consumed) return res.status(400).json({ message: INVALID_CODE_RESPONSE });
+      return res.json({ success: true, message: "Password updated successfully." });
+    }
 
-    return res.json({ message: "Your password has been reset. You can now sign in with your new password." });
+    const user = await User.findOne({ email }).select(RESET_FIELDS);
+    if (
+      !user ||
+      !user.resetCodeHash ||
+      !user.resetCodeExpires ||
+      user.resetCodeExpires.getTime() <= Date.now() ||
+      (user.resetAttempts || 0) >= RESET_MAX_ATTEMPTS
+    ) {
+      return res.status(400).json({ message: INVALID_CODE_RESPONSE });
+    }
+
+    const matches = await passwordMatches(code, user.resetCodeHash);
+    if (!matches) {
+      await User.updateOne({ _id: user._id }, { $inc: { resetAttempts: 1 } });
+      return res.status(400).json({ message: INVALID_CODE_RESPONSE });
+    }
+
+    const consumed = await consumeResetAndSetPassword(
+      { _id: user._id, resetCodeHash: user.resetCodeHash, resetCodeExpires: { $gt: new Date() } },
+      newPassword
+    );
+    if (!consumed) return res.status(400).json({ message: INVALID_CODE_RESPONSE });
+
+    return res.json({ success: true, message: "Password updated successfully." });
   } catch (error) {
     return next(error);
   }

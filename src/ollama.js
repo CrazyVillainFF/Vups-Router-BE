@@ -45,6 +45,19 @@ export async function setSharedModelEnabled(enabled) {
   return Boolean(enabled);
 }
 
+// Optional comma-separated allowlist of locally installed models that accept
+// image inputs (for example "llava:7b,gemma3:4b"). Empty by default: Ollama
+// cannot report vision support through /api/tags, so we assume text-only
+// unless an administrator explicitly lists a model here.
+export function ollamaVisionModels() {
+  return new Set(
+    (process.env.OLLAMA_VISION_MODELS || "")
+      .split(",")
+      .map(value => value.trim())
+      .filter(Boolean)
+  );
+}
+
 export async function checkOllama() {
   const baseUrl = sharedOllamaBaseUrl();
   const model = sharedModelName();
@@ -81,7 +94,8 @@ export async function sharedModelStatus() {
     enabled,
     model: check.model,
     available: enabled && check.available,
-    status: enabled ? check.status : "disabled"
+    status: enabled ? check.status : "disabled",
+    models: [{ id: check.model, name: check.model, available: check.available, vision: ollamaVisionModels().has(check.model) }]
   };
 }
 

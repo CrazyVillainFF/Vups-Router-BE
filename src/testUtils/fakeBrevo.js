@@ -59,14 +59,10 @@ export async function startFakeBrevo() {
   };
 }
 
-export function extractResetLink(request) {
+export function extractOtpCode(request) {
   const html = String(request?.body?.htmlContent || "");
-  const match = html.match(/https?:\/\/[^"<\s]+reset-password\?token=[A-Za-z0-9_%-]+/);
-  return match ? match[0] : null;
-}
-
-export function extractRawToken(request) {
-  const link = extractResetLink(request);
-  if (!link) return null;
-  return new URL(link).searchParams.get("token");
+  // The code is the only span whose entire content is six digits, so hex
+  // colors like #111416 elsewhere in the document cannot be mistaken for it.
+  const match = html.match(/<span[^>]*>(\d{6})<\/span>/);
+  return match ? match[1] : null;
 }

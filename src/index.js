@@ -12,6 +12,7 @@ import conversationsRoutes from "./routes/conversations.js";
 import chatRoutes from "./routes/chat.js";
 import adminRoutes from "./routes/admin.js";
 import { requireJsonBody, verifyOrigin } from "./middleware.js";
+import { chatJsonBodyLimit } from "./chatImages.js";
 
 const app = express();
 const port = Number(process.env.PORT || 4000);
@@ -73,7 +74,15 @@ app.use(cors({
   credentials: true
 }));
 app.use(cookieParser());
-app.use(express.json({ limit: "512kb" }));
+// Chat requests can carry base64 image attachments; every other route keeps
+// the small JSON limit. The chat limit is derived from the image limits in
+// chatImages.js (base64 inflates decoded bytes by ~4/3).
+const defaultJsonParser = express.json({ limit: "512kb" });
+const chatJsonParser = express.json({ limit: chatJsonBodyLimit() });
+app.use((req, res, next) => {
+  const isChatRoute = req.path === "/api/chat" || req.path.startsWith("/api/chat/");
+  return (isChatRoute ? chatJsonParser : defaultJsonParser)(req, res, next);
+});
 app.use(requireJsonBody);
 app.use(verifyOrigin(originAllowed));
 
@@ -114,7 +123,7 @@ app.get("/api", (_req, res) => res.json({
   service: "VupsRouter",
   message: "VupsRouter API index. All application routes are served under /api/*.",
   health: "/api/health",
-  routes: ["/api/auth", "/api/forgot-password", "/api/reset-password", "/api/settings", "/api/conversations", "/api/chat", "/api/admin"]
+  routes: ["/api/auth", "/api/forgot-password", "/api/verify-code", "/api/reset-password", "/api/settings", "/api/conversations", "/api/chat", "/api/admin"]
 }));
 
 app.use("/api/auth", authRoutes);
