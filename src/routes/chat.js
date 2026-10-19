@@ -16,6 +16,7 @@ import {
 import { chatRateLimiter, requireAuth } from "../middleware.js";
 import { UsageError, acquireSlot, consumeDailyQuota, releaseSlot } from "../usage.js";
 import { sharedModelStatus, sharedProviderForChat } from "../sharedModel.js";
+import { resolveOmniRouteChat } from "../omniroute.js";
 import { attachmentMetadata, validateImages } from "../chatImages.js";
 
 const router = Router();
@@ -130,7 +131,19 @@ function sharedRoute(shared, requestedModel = "") {
   };
 }
 
-async function resolveProvider(userId, requestedModel, requestedConfigId) {
+async function resolveProvider(userId, requestedModel, requestedConfigId, requestedSource = "") {
+  // A gateway source is an explicit, whitelisted selection from the model
+  // picker. Client input can never choose an upstream URL.
+  if (requestedSource) {
+    if (requestedSource !== "omniroute") {
+      throw new ProviderError("Unknown model source. Pick a model from the model menu.", 400, "invalid_source");
+    }
+    if (requestedConfigId) {
+      throw new ProviderError("A gateway model cannot be combined with a saved configuration.", 400, "invalid_source");
+    }
+    return resolveOmniRouteChat(requestedModel);
+  }
+
   const shared = await sharedModelStatusSafely();
   let config = null;
 
@@ -289,6 +302,55 @@ function providerFailureStatus(error) {
 }
 
 function providerFailure(provider, error) {
+  if (provider?.gateway) {
+    if (error.code === "invalid_api_key" || error.code === "forbidden") {
+      return {
+        status: 503,
+        message: "OmniRoute rejected the API key configured on this server. Ask the administrator to verify OMNIROUTE_API_KEY.",
+        code: "omniroute_auth_failed"
+      };
+    }
+    if (error.code === "insufficient_credits") {
+      return {
+        status: 402,
+        message: "OmniRoute reports insufficient credits for this request. Try again later or pick another model.",
+        code: "omniroute_insufficient_credits"
+      };
+    }
+    if (error.code === "rate_limited") {
+      return {
+        status: 429,
+        message: "OmniRoute or its upstream provider is rate-limiting requests. Try again shortly or pick another model.",
+        code: "omniroute_rate_limited"
+      };
+    }
+    if (error.code === "timeout") {
+      return {
+        status: 504,
+        message: "Timed out while waiting for OmniRoute. Try again shortly or pick another model.",
+        code: "omniroute_timeout"
+      };
+    }
+    if (["network_error", "dns_error", "connection_refused"].includes(error.code)) {
+      return {
+        status: 502,
+        message: "OmniRoute could not be reached right now. Try again shortly or pick another model.",
+        code: "omniroute_unreachable"
+      };
+    }
+    if (error.code === "invalid_model" || error.code === "not_found") {
+      return {
+        status: 400,
+        message: "OmniRoute could not use the selected model. Refresh the model menu and pick another one.",
+        code: "omniroute_model_unavailable"
+      };
+    }
+    return {
+      status: 502,
+      message: "OmniRoute or one of its upstream providers failed. Try again shortly or pick another model.",
+      code: "omniroute_upstream_error"
+    };
+  }
   if (provider?.shared) {
     if (error.code === "rate_limited" || error.code === "insufficient_credits") {
       const accountWide =
@@ -321,7 +383,7 @@ function providerFailure(provider, error) {
 function logProviderFailure(provider, error) {
   console.error(
     "Chat provider failure:",
-    provider?.shared ? "shared" : "personal",
+    provider?.gateway ? "gateway" : provider?.shared ? "shared" : "personal",
     error?.code || "provider_error",
     typeof error?.status === "number" ? `HTTP ${error.status}` : "-"
   );
@@ -347,10 +409,11 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
 
     const requestedModel = typeof body.model === "string" ? body.model.trim() : "";
     const requestedConfigId = typeof body.configId === "string" ? body.configId.trim() : "";
+    const requestedSource = typeof body.source === "string" ? body.source.trim().toLowerCase() : "";
 
     let provider;
     try {
-      provider = await resolveProvider(req.userId, requestedModel, requestedConfigId);
+      provider = await resolveProvider(req.userId, requestedModel, requestedConfigId, requestedSource);
     } catch (error) {
       if (error instanceof ProviderError) {
         return res.status(error.status ?? (error.code === "key_decryption_failed" ? 500 : 400)).json({ message: error.message, code: error.code });

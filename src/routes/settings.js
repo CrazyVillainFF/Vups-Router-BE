@@ -12,6 +12,7 @@ import {
 } from "../providerClient.js";
 import { requireAuth, settingsRateLimiter } from "../middleware.js";
 import { SHARED_OWNER_LABEL, sharedModelStatus } from "../sharedModel.js";
+import { checkOmniRoute, omnirouteModelRows, publicOmniRouteStatus } from "../omniroute.js";
 
 const router = Router();
 
@@ -600,16 +601,32 @@ router.get("/shared-model", async (req, res, next) => {
   }
 });
 
+// Safe connectivity check for the operator-configured OmniRoute gateway.
+// Returns availability and counts only: never the base URL, API key, or
+// upstream provider configuration.
+router.get("/omniroute/status", async (req, res, next) => {
+  try {
+    await connectToDatabase();
+    const omniroute = await checkOmniRoute();
+    return res.json({ omniroute: publicOmniRouteStatus(omniroute) });
+  } catch (error) {
+    return next(error);
+  }
+});
+
 router.get("/models", async (req, res, next) => {
   try {
     await connectToDatabase();
-    const shared = await sharedModelStatus();
+    const [shared, omniroute] = await Promise.all([sharedModelStatus(), checkOmniRoute()]);
     const sharedModels = Array.isArray(shared.models) ? shared.models : [];
     const sharedEntries = shared.available
       ? sharedModels
           .filter(model => model.available !== false)
           .map(model => ({ id: model.id, name: model.name || model.id, ownedBy: SHARED_OWNER_LABEL, shared: true, vision: model.vision === true }))
       : [];
+    const sharedIds = new Set(sharedEntries.map(entry => entry.id));
+    const omnirouteEntries = omnirouteModelRows(omniroute).filter(entry => !sharedIds.has(entry.id));
+    const omniroutePublic = publicOmniRouteStatus(omniroute);
 
     await ensureProviderIds(req.userId);
     const requestedIdentifier = String(req.query.configId || req.query.providerId || "").trim().toLowerCase();
@@ -670,13 +687,14 @@ router.get("/models", async (req, res, next) => {
     // configuration may additionally be refreshed live, but a discovery
     // failure only adds a warning — saved rows and free models stay visible.
     const configs = await ensureProviderIds(req.userId);
-    if (configs.length === 0 && sharedEntries.length === 0) {
+    if (configs.length === 0 && sharedEntries.length === 0 && omnirouteEntries.length === 0) {
       return res.status(400).json({
         message: shared.enabled
           ? "The shared AI model is unavailable right now. Try again later or save your own provider configuration."
           : "The shared AI model is disabled. Save your own provider configuration to chat.",
         code: shared.enabled ? "shared_unavailable" : "shared_disabled",
-        shared
+        shared,
+        omniroute: omniroutePublic
       });
     }
 
@@ -724,8 +742,9 @@ router.get("/models", async (req, res, next) => {
     }
 
     return res.json({
-      models: [...sharedEntries, ...personalRows],
+      models: [...sharedEntries, ...omnirouteEntries, ...personalRows],
       shared,
+      omniroute: omniroutePublic,
       ...(warning ? { warning } : {})
     });
   } catch (error) {

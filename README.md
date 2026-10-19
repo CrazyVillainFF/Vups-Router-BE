@@ -247,6 +247,53 @@ Administrators (listed in `ADMIN_EMAILS`) can toggle the shared model for all us
 
 Ordinary users receive `403` on all `/api/admin/*` routes, and the admin toggle is never exposed in the client UI.
 
+## OmniRoute gateway (optional)
+
+When enabled, the backend exposes a server-configured [OmniRoute](https://github.com/zorojean/omniroute) instance as an extra model group ("OMNIROUTE GATEWAY") in the in-chat model menu. Everything else — personal keys, the shared OpenRouter/Ollama model, auth, quotas, streaming — keeps working exactly as before. OmniRoute is additive: it is never required.
+
+How it works:
+
+- The backend discovers models with `GET {OMNIROUTE_BASE_URL}/v1/models` (Bearer key) and chats with `POST {OMNIROUTE_BASE_URL}/v1/chat/completions`. OmniRoute translates to whatever upstream providers it is configured with, so the backend only ever speaks the OpenAI-compatible schema.
+- `OMNIROUTE_BASE_URL` and `OMNIROUTE_API_KEY` are backend-only values. They are never sent to browsers, never appear in any API response (not even masked), and are never logged. Clients can only send the fixed source marker `"omniroute"` — the backend whitelists it, and every request is resolved server-side. A client can never point the server at an arbitrary URL.
+- Model discovery is cached for 30 seconds. A gateway outage never hides saved or free models: the picker shows them as usual and only the gateway section reports the problem. When the gateway is enabled but unavailable, the picker shows one disabled informational row ("Server API key rejected", "Unreachable right now", …) instead of silently hiding it.
+- Gateway requests go through the same authenticated `/api/chat` route, so they share auth, rate limiting (`CHAT_RATE_LIMIT_MAX`), per-user daily quota (`AI_DAILY_QUOTA`), per-user concurrency cap (`AI_MAX_CONCURRENCY`), and message validation. Streaming (SSE) and non-streaming both work.
+- Failures are honest and actionable: `omniroute_disabled`, `omniroute_not_configured`, `omniroute_auth_failed`, `omniroute_rate_limited`, `omniroute_timeout`, `omniroute_unreachable`, `omniroute_model_unavailable`, `omniroute_upstream_error`, `omniroute_no_models`. A model that is no longer present upstream is rejected with `400 invalid_model` before any upstream call.
+
+Environment variables:
+
+| Variable | Value |
+| --- | --- |
+| `OMNIROUTE_BASE_URL` | Base URL of the OmniRoute instance, e.g. `http://localhost:20128`. Trailing `/v1`, endpoint paths, credentials, and query strings are rejected/reduced safely. |
+| `OMNIROUTE_API_KEY` | API key OmniRoute expects as `Authorization: Bearer ...`. Server-side only — never commit it. |
+| `OMNIROUTE_ENABLED` | Optional. `true`/`1`/`yes` force-enables, `false`/`0`/`no` force-disables (even when URL and key are set). Unset: the gateway is enabled automatically when both `OMNIROUTE_BASE_URL` and `OMNIROUTE_API_KEY` are present. |
+
+Verify a deployment:
+
+```
+curl -H "Authorization: Bearer $OMNIROUTE_API_KEY" "$OMNIROUTE_BASE_URL/v1/models"
+# then, authenticated as any user:
+curl -H "Cookie: vr_session=..." https://your-backend/api/settings/omniroute/status
+```
+
+`GET /api/settings/omniroute/status` reports `provider`, `enabled`, `configured`, `available`, `status`, and `modelCount` — never the URL or key.
+
+### Running OmniRoute locally
+
+1. Start OmniRoute on its default port and configure at least one upstream provider inside it, then create/read its API key:
+   ```
+   omniroute --port 20128
+   curl http://localhost:20128/v1/models -H "Authorization: Bearer <your-omniroute-key>"
+   ```
+2. Point the backend at it:
+   ```
+   OMNIROUTE_BASE_URL=http://localhost:20128
+   OMNIROUTE_API_KEY=<your-omniroute-key>
+   npm run dev
+   ```
+3. Sign in, open the model menu, and pick a model under "OMNIROUTE GATEWAY". The footer shows "OmniRoute gateway" while a gateway model is active.
+
+**Production caveat:** a Render-hosted backend cannot reach `http://localhost:20128` (that is the Render container itself). For public deployments, either run the backend on the same machine/network as OmniRoute, expose OmniRoute at a reachable HTTPS URL with authentication, or leave the integration disabled. If the URL is unreachable, the gateway simply reports `unreachable` and nothing else breaks.
+
 ## Password recovery (Brevo email, six-digit code)
 
 Email-based password reset with a six-digit one-time code and a short-lived,
