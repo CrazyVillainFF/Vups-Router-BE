@@ -4,6 +4,7 @@ import http from "node:http";
 import {
   ProviderError,
   buildChatRequestBody,
+  buildProviderFailureLog,
   chatCompletion,
   extractResponseText,
   extractStreamText,
@@ -194,6 +195,36 @@ test("AgentRouter GPT requests are POSTed to /v1/responses for both modes", asyn
   }
 });
 
+test("provider failure diagnostics include only safe request context and a truncated body", () => {
+  const payload = `Gateway challenge ${"x".repeat(2200)} sk-live-secret-123456 Bearer abc.def.secret`;
+  const log = buildProviderFailureLog({
+    url: "https://agentrouter.org/v1/responses?key=sk-query-secret-123456",
+    method: "POST",
+    status: 405,
+    contentType: "text/html; charset=utf-8",
+    payload
+  });
+  assert.match(log, /^Provider request failed: POST https:\/\/agentrouter\.org\/v1\/responses -> HTTP 405; content-type=text\/html; charset=utf-8; body=/);
+  assert.ok(!log.includes("?key="), "query strings must not be logged");
+  assert.ok(!log.includes("sk-live-secret-123456"));
+  assert.ok(!log.includes("sk-query-secret-123456"));
+  assert.ok(!log.includes("abc.def.secret"));
+  const loggedBody = log.slice(log.indexOf("body=") + 5);
+  assert.ok(loggedBody.length <= 2000, "upstream bodies must be truncated to 2000 characters");
+});
+
+test("provider failure diagnostics serialize JSON and redact credential fields", () => {
+  const log = buildProviderFailureLog({
+    url: "https://agentrouter.org/v1/chat/completions",
+    status: 401,
+    contentType: "application/json; charset=utf-8",
+    payload: { error: { message: "denied" }, apiKey: "secret-value", token: "another-secret" }
+  });
+  assert.match(log, /body=\{"error":\{"message":"denied"\},"apiKey":"\[redacted\]","token":"\[redacted\]"\}/);
+  assert.ok(!log.includes("secret-value"));
+  assert.ok(!log.includes("another-secret"));
+});
+
 test("propagates HTTP 405 with safe diagnostics for both request modes", async () => {
   const requests = [];
   const { server, port } = await listen(async (req, res) => {
@@ -241,6 +272,7 @@ test("propagates HTTP 405 with safe diagnostics for both request modes", async (
     assert.equal(warnings.length, 2);
     for (const warning of warnings) {
       assert.match(warning, /POST http:\/\/127\.0\.0\.1:\d+\/v1\/chat\/completions -> HTTP 405/);
+      assert.match(warning, /content-type=application\/json/);
       assert.match(warning, /GPT models must use \/v1\/responses/);
       assert.ok(!warning.includes("sk-test-secret-123456"));
       assert.ok(!warning.includes("abc.def.secret"));

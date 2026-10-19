@@ -172,19 +172,20 @@ export function validateProviderFields({ provider, baseUrl, apiKey, model }, { r
   return null;
 }
 
-function truncate(value) {
+function truncate(value, limit = MAX_ERROR_LENGTH) {
   if (typeof value !== "string") return "";
   const clean = value.replace(/\s+/g, " ").trim();
-  return clean.length > MAX_ERROR_LENGTH ? `${clean.slice(0, MAX_ERROR_LENGTH)}…` : clean;
+  return clean.length > limit ? `${clean.slice(0, limit)}…` : clean;
 }
 
 export function redactSecrets(value) {
   return value
     .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [redacted]")
-    .replace(/\bsk-[A-Za-z0-9_-]{6,}/g, "sk-[redacted]");
+    .replace(/\b(?:sk|ak)-[A-Za-z0-9_-]{6,}/g, "[redacted]")
+    .replace(/("?(?:api[_-]?key|token|authorization|secret)"?\s*[:=]\s*)"[^"]*"/gi, '$1"[redacted]"');
 }
 
-function logProviderFailure(url, status, payload) {
+export function buildProviderFailureLog({ url, method = "POST", status, contentType, payload, maxBodyLength = 2000 }) {
   let target = "unresolved";
   try {
     const parsed = new URL(url);
@@ -192,10 +193,28 @@ function logProviderFailure(url, status, payload) {
   } catch {
     target = String(url).replace(/[?#].*$/, "");
   }
-  const detail = redactSecrets(truncate(
-    payload?.error?.message || payload?.message || (typeof payload === "string" ? payload : "")
-  ));
-  console.warn(`Provider request failed: POST ${target} -> HTTP ${status}${detail ? `. ${detail}` : ""}`);
+  let body = "";
+  if (typeof payload === "string") {
+    body = payload;
+  } else if (payload !== null && payload !== undefined) {
+    try {
+      body = JSON.stringify(payload);
+    } catch {
+      body = String(payload);
+    }
+  }
+  body = redactSecrets(body).replace(/\s+/g, " ").trim().slice(0, maxBodyLength);
+  return `Provider request failed: ${method} ${target} -> HTTP ${status}; content-type=${contentType || "unknown"}; body=${body || "(empty)"}`;
+}
+
+function logProviderFailure(url, response, payload) {
+  console.warn(buildProviderFailureLog({
+    url,
+    method: "POST",
+    status: response.status,
+    contentType: response.headers.get("content-type"),
+    payload
+  }));
 }
 
 export function describeProviderError(status, payload) {
@@ -365,7 +384,7 @@ export async function chatCompletion({ baseUrl, apiKey, model, messages, tempera
   }
   if (!response.ok) {
     const failure = await readJsonSafely(response);
-    logProviderFailure(url, response.status, failure);
+    logProviderFailure(url, response, failure);
     throw describeProviderError(response.status, failure);
   }
   const payload = await readJsonSafely(response);
@@ -401,7 +420,7 @@ export async function startChatCompletionStream({ baseUrl, apiKey, model, messag
   }
   if (!response.ok) {
     const failure = await readJsonSafely(response);
-    logProviderFailure(url, response.status, failure);
+    logProviderFailure(url, response, failure);
     throw describeProviderError(response.status, failure);
   }
   if (!response.body) {
