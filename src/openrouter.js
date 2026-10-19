@@ -3,9 +3,11 @@ export const DEFAULT_OPENROUTER_MODELS = [
   "nvidia/nemotron-3.5-lightning:free",
   "nvidia/nemotron-3-super-120b-a12b:free",
   "cohere/north-mini-code:free",
-  "nvidia/nemotron-3-ultra-550b-a55b:free"
+  "google/gemma-4-31b-it:free"
 ];
 export const OPENROUTER_API_BASE = "https://openrouter.ai/api/v1";
+export const OPENROUTER_MAX_OUTPUT_TOKENS_DEFAULT = 4096;
+export const OPENROUTER_MAX_OUTPUT_TOKENS_LIMIT = 8192;
 
 const MODELS_TIMEOUT_MS = 10000;
 
@@ -48,7 +50,8 @@ export function openRouterModels() {
 
 export function openRouterMaxOutputTokens() {
   const value = Number(process.env.OPENROUTER_MAX_OUTPUT_TOKENS);
-  return Number.isFinite(value) && value > 0 ? Math.floor(value) : 1024;
+  if (!Number.isFinite(value) || value <= 0) return OPENROUTER_MAX_OUTPUT_TOKENS_DEFAULT;
+  return Math.min(Math.floor(value), OPENROUTER_MAX_OUTPUT_TOKENS_LIMIT);
 }
 
 export async function checkOpenRouter() {

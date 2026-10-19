@@ -160,11 +160,15 @@ export async function chatCompletion({ baseUrl, apiKey, model, messages, tempera
     throw describeProviderError(response.status, await readJsonSafely(response));
   }
   const payload = await readJsonSafely(response);
-  const content = payload?.choices?.[0]?.message?.content;
+  const choice = payload?.choices?.[0];
+  const content = choice?.message?.content;
   if (typeof content !== "string" || content.length === 0) {
     throw new ProviderError("The provider returned an empty or unexpected response.", response.status, "empty_response");
   }
-  return content;
+  return {
+    content,
+    finishReason: typeof choice?.finish_reason === "string" ? choice.finish_reason : null
+  };
 }
 
 export async function startChatCompletionStream({ baseUrl, apiKey, model, messages, temperature, maxTokens }, signal) {
@@ -228,11 +232,11 @@ export async function testProviderConnection({ baseUrl, apiKey, model }, signal)
     if (availableModels.length > 0 && !availableModels.some(entry => entry.id === model)) {
       throw new ProviderError(`The provider does not list a model named "${model}". Refresh the model list and choose an available model.`, null, "model_unavailable");
     }
-    const reply = await chatCompletion(
+    const result = await chatCompletion(
       { baseUrl, apiKey, model, messages: [{ role: "user", content: "Reply with OK." }], maxTokens: 8 },
       signal
     );
-    return { availableModels, modelChecked: true, sample: reply.slice(0, 40) };
+    return { availableModels, modelChecked: true, sample: result.content.slice(0, 40) };
   }
 
   if (availableModels.length === 0 && listError) throw listError;

@@ -163,16 +163,16 @@ When `OPENROUTER_API_KEY` is set, every registered user — including brand-new 
 
 Verified live: the enabled free models answer real chat completions through this backend. The backend checks `GET /api/v1/models` and only lists models that are currently available; if the configured default is missing, status is `missing_model` / `unreachable`, and chat is blocked with a clear error instead of pretending to work. Enabled-but-unavailable models are rejected with `shared_model_unavailable` and the error names an available alternative.
 
-Note (live-testing history): `google/gemma-4-31b-it:free` was dropped from the default set because its upstream provider (Google AI Studio) repeatedly returned `429 temporarily rate-limited upstream` on chat probes while the rest of the catalog stayed healthy — a provider-side throttle, not an invalid model ID. `nvidia/nemotron-3-ultra-550b-a55b:free` was probed live (`finish_reason: stop`) and replaced it. Re-run `scripts/verify-openrouter.mjs` after any model-list change.
+Note (live-testing history): `google/gemma-4-31b-it:free` is kept in the default set. Its upstream provider (Google AI Studio) has intermittently returned `429 temporarily rate-limited upstream` on chat probes while the rest of the catalog stayed healthy — that is a provider-side throttle reported honestly to users (`shared_model_rate_limited` with retry guidance), not an invalid model ID and not a reason to disable the model. `nvidia/nemotron-3-ultra-550b-a55b:free` remains available for operators to add via `OPENROUTER_MODELS`. Re-run `scripts/verify-openrouter.mjs` after any model-list change.
 
 Environment variables (set in the Render dashboard):
 
 | Variable | Value |
 | --- | --- |
 | `OPENROUTER_API_KEY` | your OpenRouter key (`sk-or-v1-...`). Server-side only; never commit it and never send it to the frontend. |
-| `OPENROUTER_MODELS` | comma-separated list of enabled shared model IDs. Defaults to `nvidia/nemotron-3.5-lightning:free,nvidia/nemotron-3-super-120b-a12b:free,cohere/north-mini-code:free,nvidia/nemotron-3-ultra-550b-a55b:free`. Only these IDs are accepted from clients — anything else is rejected with `400 invalid_model` before any upstream call. |
+| `OPENROUTER_MODELS` | comma-separated list of enabled shared model IDs. Defaults to `nvidia/nemotron-3.5-lightning:free,nvidia/nemotron-3-super-120b-a12b:free,cohere/north-mini-code:free,google/gemma-4-31b-it:free`. Only these IDs are accepted from clients — anything else is rejected with `400 invalid_model` before any upstream call. |
 | `OPENROUTER_MODEL` | `nvidia/nemotron-3.5-lightning:free` (default). Sets which enabled model is the default; it is automatically included in the enabled list. |
-| `OPENROUTER_MAX_OUTPUT_TOKENS` | `1024` (default) — maximum output tokens per shared reply. |
+| `OPENROUTER_MAX_OUTPUT_TOKENS` | `4096` (default) — maximum output tokens per shared reply. Clamped server-side to 8192. |
 | `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` (default; override only for testing). |
 | `PROVIDER_TIMEOUT_MS` / `PROVIDER_STREAM_TIMEOUT_MS` | `60000` / `300000` (defaults) — upstream timeouts, both personal and shared providers. |
 
@@ -185,6 +185,10 @@ Behavior and safety:
 - Admins (`ADMIN_EMAILS`) can disable/re-enable the shared model at runtime: `POST /api/admin/shared-model {"enabled": false}`.
 
 For a deploy sanity check, `node scripts/verify-openrouter.mjs` (with `OPENROUTER_API_KEY` in the environment) checks every enabled model against the live catalog and performs a minimal chat completion with each — it never prints the key and exits non-zero if any model is missing or not responding.
+
+**Long responses & truncation.** The shared output limit defaults to `4096` tokens (`OPENROUTER_MAX_OUTPUT_TOKENS`, clamped server-side to `8192`). Every streaming reply forwards the provider's `finish_reason` in the final `done` SSE event (`stop`, `length`, …), plus token `usage` when the provider sends it. When a reply is cut off by the limit, the client keeps the partial answer, shows “Response reached its length limit”, and offers “Continue generating” — which asks the model to continue without repeating previous text. Code-generation prompts are instructed to split large projects into files and generate them in manageable stages.
+
+**Error taxonomy.** Provider/model failures return safe, specific codes and are never labeled as database failures: `400` invalid request/model (`bad_request`, `not_found`, `invalid_model`), `401` bad credentials (`invalid_api_key`), `402` insufficient credits, `429` rate limits (`rate_limited`, `shared_model_rate_limited`, `shared_quota_exhausted`), `502` provider outage (`provider_unavailable`, `network_error`), `503` shared model unavailable (`shared_unavailable`, `shared_model_unavailable`), `504` timeout. Mid-stream provider errors arrive as `{ "type": "error" }` SSE events even though the HTTP status is already `200`. The database-unavailable message is only used for confirmed MongoDB connection/query failures.
 
 ## Shared Ollama model (optional)
 

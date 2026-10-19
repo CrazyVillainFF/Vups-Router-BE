@@ -1,6 +1,6 @@
 import { Router } from "express";
 import mongoose from "mongoose";
-import connectToDatabase from "../db.js";
+import connectToDatabase, { isDatabaseFailure } from "../db.js";
 import ProviderConfig from "../providerConfig.js";
 import Conversation from "../conversation.js";
 import { decryptSecret } from "../encryption.js";
@@ -18,7 +18,7 @@ import { sharedModelStatus, sharedProviderForChat } from "../sharedModel.js";
 const router = Router();
 
 const SYSTEM_PROMPT =
-  "You are the VupsRouter AI assistant. VupsRouter helps developers and users explore AI models — hosted providers, OpenAI-compatible APIs, and locally-run open-weight models. Be concise, helpful, and honest about model limitations. Use markdown when it improves clarity. Do not pretend to know real-time facts you do not have.";
+  "You are the VupsRouter AI assistant. VupsRouter helps developers and users explore AI models — hosted providers, OpenAI-compatible APIs, and locally-run open-weight models. Be concise, helpful, and honest about model limitations. Use markdown when it improves clarity. Do not pretend to know real-time facts you do not have. For large projects or multi-file code (for example a full marketplace app), organize the answer into named files/modules and generate them in manageable stages instead of promising an entire complex project in one reply. When the output limit is near, stop at a natural boundary and tell the user which files remain so they can continue.";
 
 const MAX_MESSAGES = 60;
 const MAX_TOTAL_CHARS = 120000;
@@ -113,7 +113,7 @@ function sharedRoute(shared, requestedModel = "") {
 }
 
 async function resolveProvider(userId, requestedModel) {
-  const shared = await sharedModelStatus();
+  const shared = await sharedModelStatusSafely();
   const config = await ProviderConfig.findOne({ userId }).select("+encryptedApiKey");
   const sharedIds = new Set(sharedModelsOf(shared).map(model => model.id));
   if (requestedModel && sharedIds.has(requestedModel)) {
@@ -136,6 +136,24 @@ async function resolveProvider(userId, requestedModel) {
     apiKey,
     maxTokens: undefined
   };
+}
+
+async function sharedModelStatusSafely() {
+  const fallback = {
+    enabled: true,
+    provider: "unavailable",
+    model: "",
+    available: false,
+    status: "unreachable",
+    models: []
+  };
+  try {
+    return await sharedModelStatus();
+  } catch (error) {
+    if (isDatabaseFailure(error)) throw error;
+    console.error("Shared model status check failed:", error?.name || "UnknownError");
+    return fallback;
+  }
 }
 
 async function persistConversation(userId, conversationId, messages, assistantText) {
@@ -171,38 +189,65 @@ function sendEvent(res, payload) {
   res.write(`data: ${JSON.stringify(payload)}\n\n`);
 }
 
+const PROVIDER_STATUS_BY_CODE = {
+  bad_request: 400,
+  not_found: 404,
+  invalid_api_key: 401,
+  insufficient_credits: 402,
+  forbidden: 403,
+  too_large: 413,
+  unprocessable: 422,
+  rate_limited: 429,
+  timeout: 504,
+  provider_unavailable: 502,
+  network_error: 502,
+  empty_response: 502,
+  stream_error: 502
+};
+
 function providerFailureStatus(error) {
-  return 400;
+  if (error?.code && PROVIDER_STATUS_BY_CODE[error.code]) return PROVIDER_STATUS_BY_CODE[error.code];
+  if (typeof error?.status === "number" && error.status >= 400 && error.status <= 499) return 400;
+  return 502;
 }
 
 function providerFailure(provider, error) {
-  if (provider?.shared && (error.code === "rate_limited" || error.code === "insufficient_credits")) {
-    const accountWide =
-      error.code === "insufficient_credits" ||
-      /free-models-per-day|per.day|daily|credits|balance/i.test(String(error.message || ""));
-    if (accountWide) {
+  if (provider?.shared) {
+    if (error.code === "rate_limited" || error.code === "insufficient_credits") {
+      const accountWide =
+        error.code === "insufficient_credits" ||
+        /free-models-per-day|per.day|daily|credits|balance/i.test(String(error.message || ""));
+      if (accountWide) {
+        return {
+          status: 429,
+          message:
+            "The shared free-model quota is temporarily exhausted for the whole account. Switching models will not help until it resets — try again later, or connect your own provider in API settings.",
+          code: "shared_quota_exhausted"
+        };
+      }
       return {
         status: 429,
         message:
-          "The shared free-model quota is temporarily exhausted for the whole account. Switching models will not help until it resets — try again later, or connect your own provider in API settings.",
-        code: "shared_quota_exhausted"
+          "This shared model is rate-limited right now. Pick another shared model from the model menu, or try again in a minute.",
+        code: "shared_model_rate_limited"
       };
     }
     return {
-      status: 429,
-      message:
-        "This shared model is rate-limited right now. Pick another shared model from the model menu, or try again in a minute.",
-      code: "shared_model_rate_limited"
-    };
-  }
-  if (provider?.shared && (error.code === "invalid_api_key" || error.code === "forbidden")) {
-    return {
       status: 503,
-      message: "The shared AI model is unavailable right now. Try again later, or connect your own provider in API settings.",
+      message: "The shared AI model is temporarily unavailable. Try again later, or connect your own provider in API settings.",
       code: "shared_unavailable"
     };
   }
   return { status: providerFailureStatus(error), message: error.message, code: error.code };
+}
+
+function logProviderFailure(provider, error) {
+  console.error(
+    "Chat provider failure:",
+    provider?.shared ? "shared" : "personal",
+    error?.code || "provider_error",
+    typeof error?.status === "number" ? `HTTP ${error.status}` : "-"
+  );
 }
 
 router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
@@ -256,23 +301,25 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
     const upstreamMessages = [{ role: "system", content: SYSTEM_PROMPT }, ...validated.messages];
 
     if (!stream) {
-      let reply;
+      let result;
       try {
-        reply = await chatCompletion(
+        result = await chatCompletion(
           { baseUrl: provider.baseUrl, apiKey: provider.apiKey, model, messages: upstreamMessages, temperature, maxTokens: provider.maxTokens },
           undefined
         );
       } catch (error) {
         if (error instanceof ProviderError) {
+          logProviderFailure(provider, error);
           const failure = providerFailure(provider, error);
           return res.status(failure.status).json({ message: failure.message, code: failure.code });
         }
         throw error;
       }
-      const conversation = await persistConversation(req.userId, conversationId, validated.messages, reply);
+      const conversation = await persistConversation(req.userId, conversationId, validated.messages, result.content);
       return res.json({
         conversationId: String(conversation._id),
-        message: { role: "assistant", content: reply }
+        message: { role: "assistant", content: result.content },
+        finishReason: result.finishReason
       });
     }
 
@@ -303,6 +350,7 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
       );
     } catch (error) {
       const failure = error instanceof ProviderError ? providerFailure(provider, error) : null;
+      if (error instanceof ProviderError) logProviderFailure(provider, error);
       const message = failure ? failure.message : "Could not reach the provider.";
       if (!controller.signal.aborted) sendEvent(res, { type: "error", message, ...(failure ? { code: failure.code } : {}) });
       if (!res.writableEnded) res.end();
@@ -314,6 +362,8 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
     let buffer = "";
     let fullText = "";
     let failure = null;
+    let finishReason = null;
+    let usage = null;
 
     try {
       while (!failure) {
@@ -343,6 +393,13 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
             );
             break;
           }
+          const choice = parsed?.choices?.[0];
+          if (typeof choice?.finish_reason === "string" && choice.finish_reason) {
+            finishReason = choice.finish_reason;
+          }
+          if (parsed?.usage && typeof parsed.usage === "object") {
+            usage = parsed.usage;
+          }
           const text = extractStreamText(parsed);
           if (text) {
             fullText += text;
@@ -370,14 +427,22 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
       try {
         const conversation = await persistConversation(req.userId, prospectiveId, validated.messages, fullText);
         if (!failure && !controller.signal.aborted) {
-          sendEvent(res, { type: "done", conversationId: String(conversation._id) });
+          sendEvent(res, {
+            type: "done",
+            conversationId: String(conversation._id),
+            finishReason: finishReason ?? "stop",
+            ...(usage ? { usage } : {})
+          });
         }
       } catch (error) {
         if (!failure) failure = new ProviderError("The response was generated but could not be saved to your history.", null, "persist_failed");
       }
     }
 
-    if (failure && !controller.signal.aborted) sendEvent(res, { type: "error", message: failure.message, code: failure.code });
+    if (failure) {
+      logProviderFailure(provider, failure);
+      if (!controller.signal.aborted) sendEvent(res, { type: "error", message: failure.message, code: failure.code });
+    }
     if (!res.writableEnded) res.end();
   } catch (error) {
     if (res.headersSent) {

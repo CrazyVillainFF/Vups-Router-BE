@@ -7,7 +7,7 @@ const DEFAULT_MODELS = [
   "nvidia/nemotron-3.5-lightning:free",
   "nvidia/nemotron-3-super-120b-a12b:free",
   "cohere/north-mini-code:free",
-  "nvidia/nemotron-3-ultra-550b-a55b:free"
+  "google/gemma-4-31b-it:free"
 ];
 
 const envModels = (process.env.OPENROUTER_MODELS || "")

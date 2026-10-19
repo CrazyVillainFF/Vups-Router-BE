@@ -72,6 +72,30 @@ export function safeDatabaseErrorText(error) {
     .slice(0, 400);
 }
 
+const MONGO_CONNECTION_ERROR_NAMES = new Set([
+  "MongooseServerSelectionError",
+  "MongoServerSelectionError",
+  "MongoNetworkError",
+  "MongoNetworkTimeoutError",
+  "MongoTopologyClosedError",
+  "MongoParseError",
+  "MongoNotConnectedError",
+  "MongoSystemError"
+]);
+
+export function isDatabaseFailure(error) {
+  if (!error) return false;
+  const name = String(error.name || "");
+  const message = String(error.message || "");
+  if (/^database is not configured\.?$/i.test(message.trim())) return true;
+  if (name === "MongoServerError") return true;
+  if (MONGO_CONNECTION_ERROR_NAMES.has(name)) return true;
+  if (name === "MongooseError") {
+    return /buffering timed out|failed to connect|server selection|topology|not connected|ECONNREFUSED|ECONNRESET|ETIMEDOUT|EAI_AGAIN|ENOTFOUND/i.test(message);
+  }
+  return false;
+}
+
 export default async function connectToDatabase() {
   if (cache.connection) return cache.connection;
   if (!process.env.MONGODB_URI) throw new Error("Database is not configured.");

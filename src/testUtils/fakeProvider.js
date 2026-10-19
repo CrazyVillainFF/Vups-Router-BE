@@ -32,7 +32,10 @@ export async function startFakeProvider() {
       chatStatus: 200,
       chatStatusText: "",
       failStreamMidway: false,
-      invalidKey: false
+      invalidKey: false,
+      finishReason: "stop",
+      usageChunk: false,
+      emptyDeltaFirst: false
     },
     set(partial) {
       Object.assign(state.behavior, partial);
@@ -45,6 +48,9 @@ export async function startFakeProvider() {
       state.behavior.chatStatusText = "";
       state.behavior.failStreamMidway = false;
       state.behavior.invalidKey = false;
+      state.behavior.finishReason = "stop";
+      state.behavior.usageChunk = false;
+      state.behavior.emptyDeltaFirst = false;
     }
   };
 
@@ -85,20 +91,36 @@ export async function startFakeProvider() {
         return json(res, 200, {
           id: "chatcmpl-fake",
           model,
-          choices: [{ index: 0, message: { role: "assistant", content: `Echo from ${model}: ${body.messages.at(-1)?.content ?? ""}` }, finish_reason: "stop" }]
+          choices: [{ index: 0, message: { role: "assistant", content: `Echo from ${model}: ${body.messages.at(-1)?.content ?? ""}` }, finish_reason: state.behavior.finishReason }]
         });
       }
 
       res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
       const chunks = ["Hello ", "from ", `${model}`, "!"];
-      for (const chunk of chunks) {
-        res.write(`data: ${JSON.stringify({ id: "chatcmpl-fake", model, choices: [{ delta: { content: chunk } }] })}\n\n`);
+      if (state.behavior.emptyDeltaFirst) {
+        res.write(`data: ${JSON.stringify({ id: "chatcmpl-fake", model, choices: [{ delta: { role: "assistant" }, finish_reason: null }] })}\n\n`);
+      }
+      for (let i = 0; i < chunks.length; i += 1) {
+        const last = i === chunks.length - 1;
+        res.write(`data: ${JSON.stringify({
+          id: "chatcmpl-fake",
+          model,
+          choices: [{ delta: { content: chunks[i] }, ...(last ? { finish_reason: state.behavior.finishReason } : {}) }]
+        })}\n\n`);
         await new Promise(resolve => setTimeout(resolve, 5));
       }
       if (state.behavior.failStreamMidway) {
         res.write(`data: ${JSON.stringify({ error: { message: "Upstream exploded mid-stream." } })}\n\n`);
         res.end();
         return;
+      }
+      if (state.behavior.usageChunk) {
+        res.write(`data: ${JSON.stringify({
+          id: "chatcmpl-fake",
+          model,
+          choices: [],
+          usage: { prompt_tokens: 5, completion_tokens: 9, total_tokens: 14 }
+        })}\n\n`);
       }
       res.write("data: [DONE]\n\n");
       res.end();

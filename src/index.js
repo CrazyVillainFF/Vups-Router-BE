@@ -4,7 +4,7 @@ import cors from "cors";
 import cookieParser from "cookie-parser";
 import helmet from "helmet";
 import mongoose from "mongoose";
-import connectToDatabase, { describeDatabaseError, safeDatabaseErrorText } from "./db.js";
+import connectToDatabase, { describeDatabaseError, isDatabaseFailure, safeDatabaseErrorText } from "./db.js";
 import authRoutes from "./routes/auth.js";
 import settingsRoutes from "./routes/settings.js";
 import conversationsRoutes from "./routes/conversations.js";
@@ -129,16 +129,16 @@ app.use((_req, res) => {
 app.use((error, _req, res, _next) => {
   if (res.headersSent) return;
   const name = error?.name || "UnknownError";
-  if (error?.message === "Database is not configured.") {
-    console.error("Database configuration missing.");
-    return res.status(503).json({
-      message: "The database is not configured on the server. Set MONGODB_URI.",
-      ...describeDatabaseError(error)
-    });
-  }
-  if (/Mongoose|Mongo(Server|Network|Topology|Parse)/i.test(name)) {
+  if (isDatabaseFailure(error)) {
+    if (error?.message === "Database is not configured.") {
+      console.error("Database configuration missing.");
+      return res.status(503).json({
+        message: "The database is not configured on the server. Set MONGODB_URI.",
+        ...describeDatabaseError(error)
+      });
+    }
     const { reason, hint } = describeDatabaseError(error);
-    console.error("Database request failed:", reason, "|", safeDatabaseErrorText(error));
+    console.error("Database request failed:", error?.name || "UnknownError", reason, "|", safeDatabaseErrorText(error));
     return res.status(503).json({
       message: "The database is unavailable right now. Please try again shortly.",
       reason,

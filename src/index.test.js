@@ -475,7 +475,7 @@ test("chat surfaces provider errors clearly (invalid key, rate limit, unavailabl
     cookie,
     body: { stream: false, messages: [{ role: "user", content: "hi" }] }
   });
-  assert.equal(badKey.status, 400);
+  assert.equal(badKey.status, 401);
   assert.match(badKey.body.message, /API key/i);
 
   fakeProvider.state.reset();
@@ -485,7 +485,7 @@ test("chat surfaces provider errors clearly (invalid key, rate limit, unavailabl
     cookie,
     body: { stream: false, messages: [{ role: "user", content: "hi" }] }
   });
-  assert.equal(rateLimited.status, 400);
+  assert.equal(rateLimited.status, 429);
   assert.match(rateLimited.body.message, /Rate limit/i);
 
   fakeProvider.state.reset();
@@ -494,7 +494,8 @@ test("chat surfaces provider errors clearly (invalid key, rate limit, unavailabl
     cookie,
     body: { stream: false, model: "model-that-does-not-exist", messages: [{ role: "user", content: "hi" }] }
   });
-  assert.equal(unavailable.status, 400);
+  assert.equal(unavailable.status, 404);
+  assert.equal(unavailable.body.code, "not_found");
   assert.match(unavailable.body.message, /model/i);
   assert.equal(fakeProvider.state.chatRequests.at(-1).body.model, "model-that-does-not-exist");
 
@@ -550,6 +551,66 @@ test("chat stream reports a mid-stream provider failure without faking success",
   const errorEvent = events.find(event => event.type === "error");
   assert.ok(errorEvent, "mid-stream errors must be reported");
   assert.match(errorEvent.message, /error/i);
+  assert.equal(errorEvent.code, "stream_error");
+  assert.equal(events.some(event => event.type === "done"), false, "a failed stream must not report success");
+
+  const meta = events.find(event => event.type === "meta");
+  const partial = events.filter(event => event.type === "delta").map(event => event.content).join("");
+  assert.equal(partial, "Hello from fake-model-mini!");
+  const conversation = await api(`/api/conversations/${meta.conversationId}`, { cookie });
+  assert.equal(conversation.status, 200);
+  assert.equal(
+    conversation.body.conversation.messages.at(-1).content,
+    "Hello from fake-model-mini!",
+    "the partial answer generated before the failure must not be discarded"
+  );
+
+  fakeProvider.state.reset();
+});
+
+test("streaming preserves finish_reason and final usage chunks without ending early", async () => {
+  const { cookie } = await signupUser();
+  await configureProvider(cookie);
+
+  fakeProvider.state.reset();
+  fakeProvider.state.set({ emptyDeltaFirst: true, usageChunk: true });
+  const complete = await fetch(`${baseURL}/api/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Cookie: cookie },
+    body: JSON.stringify({ stream: true, messages: [{ role: "user", content: "Finish normally" }] })
+  });
+  const completeEvents = (await complete.text())
+    .split("\n")
+    .filter(line => line.startsWith("data: "))
+    .map(line => JSON.parse(line.slice(6)));
+  const completeDeltas = completeEvents.filter(event => event.type === "delta").map(event => event.content).join("");
+  assert.equal(completeDeltas, "Hello from fake-model-mini!", "empty deltas and usage-only chunks must not end the stream");
+  const completeDone = completeEvents.find(event => event.type === "done");
+  assert.ok(completeDone);
+  assert.equal(completeDone.finishReason, "stop");
+  assert.equal(completeDone.usage?.total_tokens, 14, "final usage must be forwarded to the client");
+
+  fakeProvider.state.reset();
+  fakeProvider.state.set({ finishReason: "length" });
+  const truncated = await fetch(`${baseURL}/api/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Cookie: cookie },
+    body: JSON.stringify({ stream: true, messages: [{ role: "user", content: "Long answer please" }] })
+  });
+  const truncatedEvents = (await truncated.text())
+    .split("\n")
+    .filter(line => line.startsWith("data: "))
+    .map(line => JSON.parse(line.slice(6)));
+  const truncatedDeltas = truncatedEvents.filter(event => event.type === "delta").map(event => event.content).join("");
+  assert.equal(truncatedDeltas, "Hello from fake-model-mini!", "a length-limited answer must still stream every generated chunk");
+  const truncatedDone = truncatedEvents.find(event => event.type === "done");
+  assert.ok(truncatedDone);
+  assert.equal(truncatedDone.finishReason, "length", "the client must be able to tell a truncated answer from a complete one");
+
+  const meta = truncatedEvents.find(event => event.type === "meta");
+  const conversation = await api(`/api/conversations/${meta.conversationId}`, { cookie });
+  assert.equal(conversation.status, 200);
+  assert.equal(conversation.body.conversation.messages.at(-1).content, "Hello from fake-model-mini!");
 
   fakeProvider.state.reset();
 });
@@ -641,9 +702,10 @@ test("chat reports insufficient balance (HTTP 402) with a stable code", async ()
       cookie,
       body: { stream: false, messages: [{ role: "user", content: "hello" }] }
     });
-    assert.equal(response.status, 400);
+    assert.equal(response.status, 402);
     assert.equal(response.body.code, "insufficient_credits");
     assert.match(response.body.message, /insufficient credits/i);
+    assert.ok(!/database/i.test(response.body.message), "provider quota errors must never be labeled database failures");
   } finally {
     fakeProvider.state.reset();
   }
@@ -659,9 +721,10 @@ test("chat surfaces provider timeouts and outages with stable codes", async () =
       cookie,
       body: { stream: false, messages: [{ role: "user", content: "hello" }] }
     });
-    assert.equal(response.status, 400);
+    assert.equal(response.status, 502);
     assert.equal(response.body.code, "provider_unavailable");
     assert.match(response.body.message, /temporarily unavailable/i);
+    assert.ok(!/database/i.test(response.body.message), "provider outages must never be labeled database failures");
   } finally {
     fakeProvider.state.reset();
   }
@@ -1083,7 +1146,7 @@ test("OpenRouter becomes the shared model when OPENROUTER_API_KEY is configured"
     assert.match(chat.body.message.content, /Echo from fake-model-pro/);
     assert.equal(fakeProvider.state.chatRequests.length, 1);
     assert.equal(fakeProvider.state.chatRequests[0].body.model, "fake-model-pro");
-    assert.equal(fakeProvider.state.chatRequests[0].body.max_tokens, 1024);
+    assert.equal(fakeProvider.state.chatRequests[0].body.max_tokens, 4096);
     assert.equal(fakeProvider.state.chatRequests[0].key, FAKE_API_KEY, "server-side key must be attached on the backend");
   });
 });
@@ -1261,6 +1324,61 @@ test("a missing OpenRouter model is reported instead of pretending it is availab
     assert.equal(chat.status, 503);
     assert.equal(chat.body.code, "shared_unavailable");
   });
+});
+
+test("the shared output limit defaults to 4096 and is clamped to a safe maximum", async () => {
+  const {
+    openRouterMaxOutputTokens,
+    OPENROUTER_MAX_OUTPUT_TOKENS_DEFAULT,
+    OPENROUTER_MAX_OUTPUT_TOKENS_LIMIT
+  } = await import("./openrouter.js");
+  const previous = process.env.OPENROUTER_MAX_OUTPUT_TOKENS;
+  try {
+    delete process.env.OPENROUTER_MAX_OUTPUT_TOKENS;
+    assert.equal(OPENROUTER_MAX_OUTPUT_TOKENS_DEFAULT, 4096);
+    assert.equal(openRouterMaxOutputTokens(), 4096, "long code answers need more than 1024 tokens by default");
+    process.env.OPENROUTER_MAX_OUTPUT_TOKENS = "1";
+    assert.equal(openRouterMaxOutputTokens(), 1);
+    process.env.OPENROUTER_MAX_OUTPUT_TOKENS = "999999";
+    assert.equal(openRouterMaxOutputTokens(), OPENROUTER_MAX_OUTPUT_TOKENS_LIMIT, "absurd values must be clamped server-side");
+    assert.ok(OPENROUTER_MAX_OUTPUT_TOKENS_LIMIT <= 8192);
+    process.env.OPENROUTER_MAX_OUTPUT_TOKENS = "banana";
+    assert.equal(openRouterMaxOutputTokens(), OPENROUTER_MAX_OUTPUT_TOKENS_DEFAULT);
+  } finally {
+    if (previous === undefined) delete process.env.OPENROUTER_MAX_OUTPUT_TOKENS;
+    else process.env.OPENROUTER_MAX_OUTPUT_TOKENS = previous;
+  }
+});
+
+test("switching between shared and personal models sends exactly the selected model with no database error", async () => {
+  await withOpenRouterEnv(
+    { apiKey: FAKE_API_KEY, baseUrl: fakeProvider.baseUrl, model: "fake-model-mini", models: "fake-model-mini" },
+    async () => {
+      const { cookie } = await signupUser();
+      await configureProvider(cookie, { model: "fake-model-mini" });
+
+      const sequence = ["fake-model-mini", "fake-model-pro", "fake-model-mini"];
+      for (const model of sequence) {
+        fakeProvider.state.reset();
+        const response = await api("/api/chat", {
+          method: "POST",
+          cookie,
+          body: { stream: false, model, messages: [{ role: "user", content: `switch to ${model}` }] }
+        });
+        assert.equal(response.status, 200, `switching to ${model} must succeed`);
+        assert.equal(fakeProvider.state.chatRequests.length, 1, `exactly one upstream call for ${model}`);
+        assert.equal(
+          fakeProvider.state.chatRequests[0].body.model,
+          model,
+          "the selected model must reach the upstream provider, not the default"
+        );
+        assert.ok(
+          !/database/i.test(JSON.stringify(response.body)),
+          "model switching must never surface a database error"
+        );
+      }
+    }
+  );
 });
 
 test("OpenRouter without an API key falls back to the Ollama shared model", async () => {
