@@ -22,6 +22,9 @@ Create `server/.env` from `.env.example` and fill in the real values:
 | `MONGODB_URI` | yes | MongoDB connection string |
 | `JWT_SECRET` | yes | Session token signing secret, >= 32 random characters |
 | `ENCRYPTION_SECRET` | yes | AES-256-GCM key for encrypting user provider API keys, >= 32 random characters |
+| `AI_DAILY_QUOTA` | no (default 100) | Per-user daily AI request quota (resets midnight UTC) |
+| `AI_MAX_CONCURRENCY` | no (default 3) | Max simultaneous AI requests per user |
+| `ADMIN_EMAILS` | no | Comma-separated account emails allowed to call `/api/admin/*` |
 
 Generate both secrets with:
 
@@ -64,6 +67,25 @@ All state-changing requests must use `Content-Type: application/json`; requests 
 | `POST` | `/api/settings/provider/test` | Tests draft or saved config: lists models and optionally sends one minimal completion for the selected model |
 | `GET` | `/api/settings/models` | Lists models from the saved provider (`GET {baseUrl}/models`) |
 
+### DeepSeek quick start
+
+DeepSeek is supported through the existing encrypted OpenAI-compatible provider flow — no code changes per provider:
+
+1. Sign in, open **API settings**, click the **DeepSeek** quick-start chip (fills provider `DeepSeek`, base URL `https://api.deepseek.com`, model `deepseek-chat`).
+2. Paste your DeepSeek API key (from platform.deepseek.com), **Save configuration**.
+3. **Load models** to fetch the live model list from `GET /models`, pick a model, then **Test connection**.
+
+The settings page shows a status badge: Configuration Required, Connected, Insufficient Balance, Model Unavailable, or Connection Failed. Chat requests go to `POST {baseUrl}/chat/completions` through the backend; the model is never silently substituted. Model listings also drive validation, so a model that was removed by the provider produces an actionable error instead of a mystery failure.
+
+### Administration (requires `ADMIN_EMAILS`)
+
+| Method | Path | Notes |
+| --- | --- | --- |
+| `POST` | `/api/admin/ai-access` | `{ email, enabled }` — enable/disable AI chat for a user |
+| `GET` | `/api/admin/user?email=` | Account status plus today's usage |
+
+All admin routes return `403` unless the signed-in user's email is listed in `ADMIN_EMAILS`. Disabled users keep normal accounts but receive `403 ai_disabled` from `/api/chat`. Quota exhaustion returns `429 quota_exceeded`; too many parallel requests return `429 concurrency_limit`.
+
 ### Chat and history (authenticated)
 
 | Method | Path | Notes |
@@ -100,7 +122,19 @@ Do **not** set `PORT`; Render provides it automatically. `SERVER` is not needed 
 
 MongoDB Atlas: under **Network Access**, allow `0.0.0.0/0` (Render's free tier does not publish static outbound IPs), and make sure the database user can read/write the `vupsrouter` database.
 
-Verify after deploy: `curl https://vups-router-be.onrender.com/api/health` should return `"database":"connected"`. If it returns `"reason":"auth_failed"` / `"dns_error"` / `"timeout"`, the `hint` field tells you exactly what to fix in Atlas.
+Verify after deploy: `curl https://vups-router-be.onrender.com/api/health` should return `"database":"connected"`. When it is down, the response includes a safe `reason` and `hint` (never credentials), and the Render logs contain the redacted underlying error:
+
+| `reason` | Meaning | Fix |
+| --- | --- | --- |
+| `not_configured` | `MONGODB_URI` is empty or unset | add it in Render → Environment |
+| `invalid_uri` | connection string is malformed | percent-encode special characters in the password: `@ → %40`, `: → %3A`, `/ → %2F`, `# → %23`, `? → %3F`, `% → %25`, space → `%20` |
+| `auth_failed` | Atlas rejected the database user | Atlas → Database Access: correct username/password and role `Read and write to any database` (or `readWrite` on `vupsrouter`) |
+| `dns_error` | cluster hostname does not resolve | copy the host exactly from Atlas → Connect → Drivers |
+| `timeout` | TCP connection never established | Atlas → Network Access: allow `0.0.0.0/0` (Render's free tier has no static outbound IPs) and ensure the cluster is not paused |
+| `unreachable` | connection refused/reset by the network | same Network Access check, and confirm the cluster is running |
+| `unavailable` | any other driver error | read the Render logs — credentials are redacted automatically |
+
+If `/api/health` returns `"reason":"timeout"` from Render, it is almost always Atlas Network Access, not an application bug.
 
 Security: if a `.env` file was ever committed to this repo (it was, in the initial commit), rotate `JWT_SECRET` and `ENCRYPTION_SECRET` so the exposed values can no longer be used.
 

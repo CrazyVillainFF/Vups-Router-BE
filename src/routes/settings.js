@@ -18,7 +18,7 @@ router.use(settingsRateLimiter);
 
 function publicConfig(config) {
   if (!config) {
-    return { configured: false, provider: "", baseUrl: "", model: "", hasApiKey: false, apiKeyMasked: "" };
+    return { configured: false, provider: "", baseUrl: "", model: "", hasApiKey: false, apiKeyMasked: "", lastTest: null };
   }
   return {
     configured: true,
@@ -27,8 +27,43 @@ function publicConfig(config) {
     model: config.model || "",
     hasApiKey: Boolean(config.encryptedApiKey),
     apiKeyMasked: config.encryptedApiKey ? maskApiKey(decryptSecret(config.encryptedApiKey)) : "",
-    updatedAt: config.updatedAt
+    updatedAt: config.updatedAt,
+    lastTest: config.lastTestAt
+      ? {
+          status: config.lastTestStatus,
+          code: config.lastTestCode,
+          message: config.lastTestMessage,
+          at: config.lastTestAt
+        }
+      : null
   };
+}
+
+function testStatusFor(error) {
+  if (error.code === "invalid_api_key") return "invalid_key";
+  if (error.code === "insufficient_credits") return "insufficient_balance";
+  if (error.code === "model_unavailable") return "model_unavailable";
+  if (error.code === "timeout") return "timeout";
+  if (error.code === "network_error") return "unreachable";
+  return "failed";
+}
+
+async function recordTestResult(userId, status, code, message) {
+  try {
+    await ProviderConfig.updateOne(
+      { userId },
+      {
+        $set: {
+          lastTestStatus: status,
+          lastTestCode: code || "",
+          lastTestMessage: String(message || "").slice(0, 400),
+          lastTestAt: new Date()
+        }
+      }
+    );
+  } catch {
+    // Recording the test outcome is best-effort and must never fail the response.
+  }
 }
 
 async function loadStoredConfig(userId) {
@@ -124,14 +159,17 @@ router.post("/provider/test", async (req, res, next) => {
       const parts = ["Connection succeeded."];
       if (result.modelChecked) parts.push(`Model "${model}" responded correctly.`);
       if (result.availableModels.length > 0) parts.push(`${result.availableModels.length} models available.`);
+      const message = parts.join(" ");
+      await recordTestResult(req.userId, "connected", "", message);
       return res.json({
         ok: true,
-        message: parts.join(" "),
+        message,
         availableModels: result.availableModels,
         modelChecked: result.modelChecked
       });
     } catch (error) {
       if (error instanceof ProviderError) {
+        await recordTestResult(req.userId, testStatusFor(error), error.code, error.message);
         return res.status(400).json({ ok: false, message: error.message, code: error.code });
       }
       throw error;

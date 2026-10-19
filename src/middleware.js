@@ -56,7 +56,7 @@ export async function requireAuth(req, res, next) {
     return res.status(401).json({ message: "Your session expired. Please sign in again." });
   }
   try {
-    const user = await User.findById(payload.sub).select("name email");
+    const user = await User.findById(payload.sub).select("name email aiEnabled");
     if (!user) {
       clearSessionCookie(res);
       return res.status(401).json({ message: "Your account no longer exists. Please sign up again." });
@@ -67,6 +67,18 @@ export async function requireAuth(req, res, next) {
   } catch (error) {
     return next(error);
   }
+}
+
+export function requireAdmin(req, res, next) {
+  const admins = (process.env.ADMIN_EMAILS || "")
+    .split(",")
+    .map(value => value.trim().toLowerCase())
+    .filter(Boolean);
+  const email = String(req.user?.email || "").toLowerCase();
+  if (admins.length === 0 || !admins.includes(email)) {
+    return res.status(403).json({ message: "Administrator access is required." });
+  }
+  return next();
 }
 
 export function verifyOrigin(allowedOrigins) {

@@ -617,3 +617,138 @@ test("users cannot read, delete, or continue each other's conversations or confi
   const aliceConfig = await api("/api/settings/provider", { cookie: alice.cookie });
   assert.equal(aliceConfig.body.config.model, "fake-model-mini");
 });
+
+// ─── DeepSeek-style provider error mapping, quotas, and administration ─────
+
+test("chat reports insufficient balance (HTTP 402) with a stable code", async () => {
+  const { cookie } = await signupUser();
+  await configureProvider(cookie);
+  fakeProvider.state.set({ chatStatus: 402 });
+  try {
+    const response = await api("/api/chat", {
+      method: "POST",
+      cookie,
+      body: { stream: false, messages: [{ role: "user", content: "hello" }] }
+    });
+    assert.equal(response.status, 400);
+    assert.equal(response.body.code, "insufficient_credits");
+    assert.match(response.body.message, /insufficient credits/i);
+  } finally {
+    fakeProvider.state.reset();
+  }
+});
+
+test("chat surfaces provider timeouts and outages with stable codes", async () => {
+  const { cookie } = await signupUser();
+  await configureProvider(cookie);
+  fakeProvider.state.set({ chatStatus: 503 });
+  try {
+    const response = await api("/api/chat", {
+      method: "POST",
+      cookie,
+      body: { stream: false, messages: [{ role: "user", content: "hello" }] }
+    });
+    assert.equal(response.status, 400);
+    assert.equal(response.body.code, "provider_unavailable");
+    assert.match(response.body.message, /temporarily unavailable/i);
+  } finally {
+    fakeProvider.state.reset();
+  }
+});
+
+test("test connection records its status for the settings page without leaking the key", async () => {
+  const { cookie } = await signupUser();
+  await configureProvider(cookie);
+
+  const ok = await api("/api/settings/provider/test", { method: "POST", cookie, body: {} });
+  assert.equal(ok.status, 200);
+  let config = await api("/api/settings/provider", { cookie });
+  assert.equal(config.body.config.lastTest.status, "connected");
+  assert.equal(JSON.stringify(config.body).includes(FAKE_API_KEY), false);
+
+  fakeProvider.state.set({ listStatus: 401 });
+  const bad = await api("/api/settings/provider/test", { method: "POST", cookie, body: {} });
+  assert.equal(bad.status, 400);
+  config = await api("/api/settings/provider", { cookie });
+  assert.equal(config.body.config.lastTest.status, "invalid_key");
+  fakeProvider.state.reset();
+});
+
+test("per-user daily quota is enforced and reported clearly", async () => {
+  process.env.AI_DAILY_QUOTA = "2";
+  try {
+    const { cookie } = await signupUser();
+    await configureProvider(cookie);
+    const send = () =>
+      api("/api/chat", {
+        method: "POST",
+        cookie,
+        body: { stream: false, messages: [{ role: "user", content: "quota check" }] }
+      });
+    assert.equal((await send()).status, 200);
+    assert.equal((await send()).status, 200);
+    const third = await send();
+    assert.equal(third.status, 429);
+    assert.equal(third.body.code, "quota_exceeded");
+    assert.match(third.body.message, /Daily AI request limit/i);
+  } finally {
+    delete process.env.AI_DAILY_QUOTA;
+  }
+});
+
+test("only administrators can manage AI access and disabled users cannot chat", async () => {
+  const admin = await signupUser();
+  const victim = await signupUser();
+  await configureProvider(victim.cookie);
+  process.env.ADMIN_EMAILS = admin.email;
+  try {
+    const forbidden = await api("/api/admin/ai-access", {
+      method: "POST",
+      cookie: victim.cookie,
+      body: { email: victim.email, enabled: false }
+    });
+    assert.equal(forbidden.status, 403);
+
+    const disabled = await api("/api/admin/ai-access", {
+      method: "POST",
+      cookie: admin.cookie,
+      body: { email: victim.email, enabled: false }
+    });
+    assert.equal(disabled.status, 200);
+    assert.equal(disabled.body.user.aiEnabled, false);
+
+    const blockedChat = await api("/api/chat", {
+      method: "POST",
+      cookie: victim.cookie,
+      body: { stream: false, messages: [{ role: "user", content: "hello" }] }
+    });
+    assert.equal(blockedChat.status, 403);
+    assert.equal(blockedChat.body.code, "ai_disabled");
+
+    const reEnabled = await api("/api/admin/ai-access", {
+      method: "POST",
+      cookie: admin.cookie,
+      body: { email: victim.email, enabled: true }
+    });
+    assert.equal(reEnabled.status, 200);
+    const chatWorks = await api("/api/chat", {
+      method: "POST",
+      cookie: victim.cookie,
+      body: { stream: false, messages: [{ role: "user", content: "hi again" }] }
+    });
+    assert.equal(chatWorks.status, 200);
+  } finally {
+    delete process.env.ADMIN_EMAILS;
+  }
+});
+
+test("malformed JSON bodies are rejected with a clear 400", async () => {
+  const response = await fetch(`${baseURL}/api/auth/signup`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{broken json"
+  });
+  assert.equal(response.status, 400);
+  const body = await response.json();
+  assert.match(body.message, /valid JSON/i);
+});

@@ -4,11 +4,12 @@ import cors from "cors";
 import cookieParser from "cookie-parser";
 import helmet from "helmet";
 import mongoose from "mongoose";
-import connectToDatabase, { describeDatabaseError } from "./db.js";
+import connectToDatabase, { describeDatabaseError, safeDatabaseErrorText } from "./db.js";
 import authRoutes from "./routes/auth.js";
 import settingsRoutes from "./routes/settings.js";
 import conversationsRoutes from "./routes/conversations.js";
 import chatRoutes from "./routes/chat.js";
+import adminRoutes from "./routes/admin.js";
 import { requireJsonBody, verifyOrigin } from "./middleware.js";
 
 const app = express();
@@ -72,7 +73,7 @@ app.get("/api/health", async (_req, res) => {
     });
   } catch (error) {
     const { reason, hint } = describeDatabaseError(error);
-    console.error("Health check failed:", error?.name || "UnknownError", reason);
+    console.error("Health check failed:", reason, "|", safeDatabaseErrorText(error));
     return res.status(503).json({
       success: false,
       message: "Backend is running but MongoDB is unavailable",
@@ -89,6 +90,7 @@ app.use("/api/auth", authRoutes);
 app.use("/api/settings", settingsRoutes);
 app.use("/api/conversations", conversationsRoutes);
 app.use("/api/chat", chatRoutes);
+app.use("/api/admin", adminRoutes);
 
 app.use((_req, res) => {
   return res.status(404).json({ message: "That API route does not exist." });
@@ -104,9 +106,9 @@ app.use((error, _req, res, _next) => {
       ...describeDatabaseError(error)
     });
   }
-  if (/Mongoose|MongoServer|MongoNetwork|MongoTopology/i.test(name)) {
+  if (/Mongoose|Mongo(Server|Network|Topology|Parse)/i.test(name)) {
     const { reason, hint } = describeDatabaseError(error);
-    console.error("Database request failed:", name, reason);
+    console.error("Database request failed:", reason, "|", safeDatabaseErrorText(error));
     return res.status(503).json({
       message: "The database is unavailable right now. Please try again shortly.",
       reason,
@@ -115,6 +117,9 @@ app.use((error, _req, res, _next) => {
   }
   if (name === "ValidationError") {
     return res.status(400).json({ message: "The submitted data is invalid." });
+  }
+  if (name === "SyntaxError" && (error?.status === 400 || error?.statusCode === 400 || error?.type === "entity.parse.failed")) {
+    return res.status(400).json({ message: "Request body must be valid JSON." });
   }
   if (name === "Error" && /Origin not allowed/i.test(error?.message || "")) {
     return res.status(403).json({ message: "Request blocked: origin not allowed." });

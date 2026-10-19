@@ -25,6 +25,12 @@ export function describeDatabaseError(error) {
       hint: "The database rejected the configured user. Verify the username and login in MONGODB_URI, and that the user can access the target database."
     };
   }
+  if (/MongoParseError|Invalid scheme|URI must|percent-encoding|malformed/i.test(raw)) {
+    return {
+      reason: "invalid_uri",
+      hint: "MONGODB_URI is malformed. Percent-encode special characters in the username or password (@ → %40, : → %3A, / → %2F, # → %23, ? → %3F, % → %25, space → %20)."
+    };
+  }
   if (/ENOTFOUND|EAI_AGAIN|querySrv|getaddrinfo/i.test(raw)) {
     return {
       reason: "dns_error",
@@ -34,7 +40,7 @@ export function describeDatabaseError(error) {
   if (/ETIMEDOUT|timed out|timeout|ServerSelectionError/i.test(raw)) {
     return {
       reason: "timeout",
-      hint: "The database could not be reached before the timeout. If using Atlas, add your current IP address under Network Access, then retry."
+      hint: "The database could not be reached before the timeout. In Atlas, allow the backend's outbound traffic under Network Access (Render's free tier needs 0.0.0.0/0) and make sure the cluster is running."
     };
   }
   if (/ECONNREFUSED|ECONNRESET|not allowed|allowlist|SSL|TLS/i.test(raw)) {
@@ -47,6 +53,23 @@ export function describeDatabaseError(error) {
     reason: "unavailable",
     hint: "The database connection failed. Check the backend logs for details."
   };
+}
+
+export function safeDatabaseErrorText(error) {
+  const parts = [error?.name || "", error?.message || ""];
+  const servers = error?.reason?.servers;
+  if (servers?.values) {
+    for (const server of servers.values()) {
+      if (server?.error?.message) parts.push(server.error.message);
+    }
+  }
+  return parts
+    .join(" ")
+    .replace(/mongodb(?:\+srv)?:\/\/[^\s"']+/gi, "mongodb://[redacted]")
+    .replace(/(password|passwd|pwd)=[^&\s"']+/gi, "$1=[redacted]")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 400);
 }
 
 export default async function connectToDatabase() {

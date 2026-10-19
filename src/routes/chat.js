@@ -12,6 +12,7 @@ import {
   startChatCompletionStream
 } from "../providerClient.js";
 import { chatRateLimiter, requireAuth } from "../middleware.js";
+import { UsageError, acquireSlot, consumeDailyQuota, releaseSlot } from "../usage.js";
 
 const router = Router();
 
@@ -110,6 +111,11 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
         : undefined;
 
     await connectToDatabase();
+
+    if (req.user?.aiEnabled === false) {
+      return res.status(403).json({ message: "AI chat has been disabled for your account by an administrator.", code: "ai_disabled" });
+    }
+
     let provider;
     try {
       provider = await resolveProvider(req.userId);
@@ -123,6 +129,20 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
     const requestedModel = typeof body.model === "string" ? body.model.trim() : "";
     const model = requestedModel || provider.defaultModel;
     if (!model) return res.status(400).json({ message: "Select a model in Settings or choose one from the model picker.", code: "no_model" });
+
+    if (!acquireSlot(req.userId)) {
+      return res.status(429).json({
+        message: "Too many AI requests are already in flight for your account. Wait for them to finish and try again.",
+        code: "concurrency_limit"
+      });
+    }
+    res.on("close", () => releaseSlot(req.userId));
+    try {
+      await consumeDailyQuota(req.userId);
+    } catch (error) {
+      if (error instanceof UsageError) return res.status(429).json({ message: error.message, code: error.code });
+      throw error;
+    }
 
     const conversationId = typeof body.conversationId === "string" ? body.conversationId : null;
     const upstreamMessages = [{ role: "system", content: SYSTEM_PROMPT }, ...validated.messages];

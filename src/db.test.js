@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { describeDatabaseError } from "./db.js";
+import { describeDatabaseError, safeDatabaseErrorText } from "./db.js";
 
 test("describes a missing MONGODB_URI as not_configured", () => {
   const result = describeDatabaseError(new Error("Database is not configured."));
@@ -14,6 +14,22 @@ test("describes a rejected Atlas user as auth_failed", () => {
   const result = describeDatabaseError(error);
   assert.equal(result.reason, "auth_failed");
   assert.match(result.hint, /username/i);
+});
+
+test("describes a malformed connection string as invalid_uri", () => {
+  const error = new Error('Invalid scheme, expected connection string to start with "mongodb://" or "mongodb+srv://"');
+  error.name = "MongoParseError";
+  const result = describeDatabaseError(error);
+  assert.equal(result.reason, "invalid_uri");
+  assert.match(result.hint, /Percent-encode/i);
+});
+
+test("redacts credentials from logged database errors", () => {
+  const error = new Error("Failed mongodb+srv://app:sup3r-secret@cluster0.example.net/vupsrouter?password=sup3r-secret");
+  error.name = "MongoServerSelectionError";
+  const text = safeDatabaseErrorText(error);
+  assert.doesNotMatch(text, /sup3r-secret/);
+  assert.match(text, /\[redacted\]/);
 });
 
 test("describes an unresolvable host as dns_error", () => {
