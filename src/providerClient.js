@@ -58,6 +58,23 @@ export function isOpenCodeZenBase(value) {
   }
 }
 
+// OpenCode restricts its zero-cost Zen models to the official OpenCode client.
+// Those IDs end in "-free" in the live catalogue. VupsRouter must not imitate
+// that client or relay those models; it rejects them with an actionable error.
+export function isOpenCodeZenFreeModel(model) {
+  return /-free$/i.test(String(model ?? "").trim());
+}
+
+function rejectFreeZenModel(model) {
+  const id = String(model ?? "").trim();
+  if (!isOpenCodeZenFreeModel(id)) return;
+  throw new ProviderError(
+    `OpenCode Zen only allows its free model "${id}" inside the official OpenCode client, so VupsRouter cannot use it. Choose a paid OpenCode Zen model (add credits in the OpenCode Console) or connect another provider.`,
+    403,
+    "free_tier_client_only"
+  );
+}
+
 // OpenCode Zen serves each model through one documented API family. The
 // endpoint table is the source of truth, so route by model instead of asking
 // users to change the protocol for every request.
@@ -71,6 +88,7 @@ export function opencodeZenProtocol(model) {
 }
 
 function opencodeZenEndpoint(baseUrl, model) {
+  rejectFreeZenModel(model);
   const family = opencodeZenProtocol(model);
   if (family === "unsupported") {
     throw new ProviderError(
@@ -392,12 +410,23 @@ function logProviderFailure(url, response, payload) {
   }));
 }
 
+// Upstream error bodies are third-party data. Never surface HTML error pages or
+// markup: summarize them instead, and keep JSON/message details short.
+function sanitizedErrorDetail(payload) {
+  const raw = payload?.error?.message || payload?.message || (typeof payload === "string" ? payload : "");
+  if (typeof raw !== "string") return "";
+  const text = raw.trim();
+  if (!text) return "";
+  if (/<(?:!doctype|html|head|body|title|h1)\b/i.test(text) || /<\/?(?:html|head|body|div|p|pre|code|title)\b/i.test(text)) {
+    return "The provider returned an HTML error page instead of an API response. Check the API base URL and try again.";
+  }
+  return redactSecrets(truncate(text));
+}
+
 export function describeProviderError(status, payload) {
-  const detail = redactSecrets(truncate(
-    payload?.error?.message || payload?.message || (typeof payload === "string" ? payload : "")
-  ));
+  const detail = sanitizedErrorDetail(payload);
   const suffix = detail ? ` Provider said: ${detail}` : "";
-  if (status === 400) return new ProviderError(`The provider rejected the request (HTTP 400). Check the model ID and parameters.${suffix}`, status, "bad_request");
+  if (status === 400) return new ProviderError(`The provider rejected the request (HTTP 400)${detail ? "." : " and did not include details. Check the API key, model ID, and API base URL."}${suffix}`, status, "bad_request");
   if (status === 401) return new ProviderError(`The provider rejected your API key (HTTP 401). Check the key in Settings.${suffix}`, status, "invalid_api_key");
   if (status === 402) return new ProviderError(`Your provider account has insufficient credits (HTTP 402).${suffix}`, status, "insufficient_credits");
   if (status === 403) return new ProviderError(`The provider denied access (HTTP 403). Your key may lack permission for this model.${suffix}`, status, "forbidden");
@@ -549,9 +578,10 @@ async function authHeaders(apiKey, providerType = "openai_compatible", baseUrl =
 
 export async function listProviderModels({ baseUrl, apiKey, providerType = "openai_compatible" }, signal) {
   const type = normalizeProviderType(providerType);
+  const zen = isOpenCodeZenBase(baseUrl);
   let url;
-  if (isOpenCodeZenBase(baseUrl)) {
-    url = `${new URL(normalizeBaseUrl(baseUrl)).origin}/inference/v1/models`;
+  if (zen) {
+    url = `${new URL(normalizeBaseUrl(baseUrl)).origin}/zen/v1/models`;
   } else if (type === "anthropic_compatible") {
     url = `${anthropicBaseUrl(baseUrl)}/models`;
   } else if (type === "watsonx") {
@@ -604,11 +634,16 @@ export async function listProviderModels({ baseUrl, apiKey, providerType = "open
     throw new ProviderError("The provider's response did not contain a model list. Enter the model ID manually.", response.status, "unsupported_listing");
   }
   return entries
-    .map(entry => ({
-      id: typeof entry?.id === "string" ? entry.id : typeof entry?.name === "string" ? entry.name : null,
-      ownedBy: typeof entry?.owned_by === "string" ? entry.owned_by : typeof entry?.display_name === "string" ? entry.display_name : undefined
-    }))
-    .filter(entry => entry.id)
+    .map(entry => {
+      const id = typeof entry?.id === "string" ? entry.id : typeof entry?.name === "string" ? entry.name : null;
+      if (!id) return null;
+      return {
+        id,
+        ownedBy: typeof entry?.owned_by === "string" ? entry.owned_by : typeof entry?.display_name === "string" ? entry.display_name : undefined,
+        ...(zen ? { free: isOpenCodeZenFreeModel(id), restrictedProvider: isOpenCodeZenFreeModel(id) } : {})
+      };
+    })
+    .filter(Boolean)
     .slice(0, 1000);
 }
 
@@ -886,6 +921,7 @@ export async function testProviderModel({ baseUrl, apiKey, model, providerType =
   if (selectedModel.length > 200) {
     throw new ProviderError("Model ID must be 200 characters or fewer.", 400, "invalid_model");
   }
+  if (isOpenCodeZenBase(baseUrl)) rejectFreeZenModel(selectedModel);
   let availableModels = [];
   try {
     const discovery = await discoverModels({ baseUrl, apiKey, providerType }, signal);

@@ -286,6 +286,11 @@ const PROVIDER_STATUS_BY_CODE = {
   unprocessable: 422,
   local_endpoint: 400,
   private_endpoint: 400,
+  unsafe_redirect: 400,
+  missing_project_id: 400,
+  unsupported_protocol: 400,
+  free_tier_client_only: 403,
+  model_unavailable: 400,
   dns_error: 502,
   connection_refused: 502,
   provider_disabled: 403,
@@ -295,12 +300,14 @@ const PROVIDER_STATUS_BY_CODE = {
   provider_unavailable: 502,
   network_error: 502,
   empty_response: 502,
+  empty_stream: 502,
+  response_too_large: 413,
   stream_error: 502
 };
 
 function providerFailureStatus(error) {
   if (error?.code && PROVIDER_STATUS_BY_CODE[error.code]) return PROVIDER_STATUS_BY_CODE[error.code];
-  if (typeof error?.status === "number" && error.status >= 400 && error.status <= 499) return 400;
+  if (typeof error?.status === "number" && error.status >= 400 && error.status <= 599) return error.status;
   return 502;
 }
 

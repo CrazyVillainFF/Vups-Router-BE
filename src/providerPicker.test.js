@@ -416,3 +416,44 @@ test("legacy rows without a configId migrate without losing settings", async () 
 });
 
 
+
+test("OpenCode Zen restricted models fail with actionable statuses before any upstream request", async () => {
+  const { cookie } = await signupUser();
+  const created = await createConfig(cookie, {
+    provider: "OpenCode Zen",
+    providerId: "opencode-zen",
+    baseUrl: "https://opencode.ai/inference/openai/v1",
+    apiKey: "oc_sk_test_restricted_123456",
+    model: "deepseek-v4.1-flash-free"
+  });
+  assert.equal(created.status, 201);
+  const configId = created.body.config.configId;
+
+  const freeChat = await api("/api/chat", {
+    method: "POST",
+    cookie,
+    body: {
+      stream: false,
+      configId,
+      model: "deepseek-v4.1-flash-free",
+      messages: [{ role: "user", content: "hi" }]
+    }
+  });
+  assert.equal(freeChat.status, 403);
+  assert.equal(freeChat.body.code, "free_tier_client_only");
+  assert.match(freeChat.body.message, /official OpenCode client/);
+
+  const unsupportedChat = await api("/api/chat", {
+    method: "POST",
+    cookie,
+    body: {
+      stream: false,
+      configId,
+      model: "gemini-3.1-pro",
+      messages: [{ role: "user", content: "hi" }]
+    }
+  });
+  assert.equal(unsupportedChat.status, 400);
+  assert.equal(unsupportedChat.body.code, "unsupported_protocol");
+  assert.match(unsupportedChat.body.message, /native API/);
+});

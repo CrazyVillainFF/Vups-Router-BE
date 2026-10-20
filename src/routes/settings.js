@@ -5,6 +5,8 @@ import { decryptSecret, encryptSecret, maskApiKey } from "../encryption.js";
 import {
   ProviderError,
   assertAllowedProviderUrl,
+  isOpenCodeZenBase,
+  isOpenCodeZenFreeModel,
   listProviderModels,
   normalizeBaseUrl,
   normalizeProviderType,
@@ -81,6 +83,8 @@ function testStatusFor(error) {
   if (error.code === "invalid_api_key") return "invalid_key";
   if (error.code === "insufficient_credits") return "insufficient_balance";
   if (error.code === "model_unavailable") return "model_unavailable";
+  if (error.code === "free_tier_client_only") return "restricted";
+  if (error.code === "unsupported_protocol") return "unsupported";
   if (error.code === "timeout") return "timeout";
   if (error.code === "network_error" || error.code === "dns_error" || error.code === "connection_refused") return "unreachable";
   if (error.code === "local_endpoint" || error.code === "private_endpoint") return "unreachable";
@@ -215,6 +219,7 @@ function modelIdsFor(config) {
 
 function savedModelRows(config) {
   const apiKeyMasked = decryptedMask(config);
+  const zen = isOpenCodeZenBase(config.baseUrl);
   return modelIdsFor(config).map(id => ({
     id,
     name: id,
@@ -225,7 +230,8 @@ function savedModelRows(config) {
     apiKeyMasked,
     shared: false,
     saved: true,
-    vision: null
+    vision: null,
+    ...(zen ? { free: isOpenCodeZenFreeModel(id), restrictedProvider: isOpenCodeZenFreeModel(id) } : {})
   }));
 }
 

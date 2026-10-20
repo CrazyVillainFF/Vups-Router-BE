@@ -6,14 +6,17 @@ import {
   buildChatRequestBody,
   buildProviderFailureLog,
   chatCompletion,
+  describeProviderError,
   extractResponseText,
   extractStreamText,
   isOpenCodeZenBase,
+  isOpenCodeZenFreeModel,
   listProviderModels,
   normalizeBaseUrl,
   resolveChatEndpoint,
   startChatCompletionStream,
-  testProviderConnection
+  testProviderConnection,
+  testProviderModel
 } from "./providerClient.js";
 
 function readBody(req) {
@@ -217,14 +220,14 @@ test("OpenCode Zen resolves each documented model family to its endpoint", () =>
   assert.equal(isOpenCodeZenBase("https://opencode.ai/inference/custom/conn_123"), false);
 });
 
-test("OpenCode Zen discovers models from the documented central endpoint with Bearer auth", async () => {
+test("OpenCode Zen discovers models from the Zen catalog with Bearer auth", async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];
   globalThis.fetch = async (url, options) => {
     calls.push({ url: String(url), headers: options.headers });
     return new Response(JSON.stringify({
       object: "list",
-      data: [{ id: "deepseek-v4.1-flash" }, { id: "claude-sonnet-4-6" }]
+      data: [{ id: "deepseek-v4.1-flash" }, { id: "deepseek-v4.1-flash-free" }, { id: "claude-sonnet-4-6" }]
     }), { status: 200, headers: { "Content-Type": "application/json" } });
   };
   try {
@@ -233,13 +236,57 @@ test("OpenCode Zen discovers models from the documented central endpoint with Be
       apiKey: "oc_sk_test_123456",
       providerType: "openai_compatible"
     });
-    assert.deepEqual(models.map(entry => entry.id), ["deepseek-v4.1-flash", "claude-sonnet-4-6"]);
+    assert.deepEqual(models.map(entry => entry.id), ["deepseek-v4.1-flash", "deepseek-v4.1-flash-free", "claude-sonnet-4-6"]);
+    assert.equal(models[0].free, false);
+    assert.equal(models[1].free, true);
+    assert.equal(models[1].restrictedProvider, true);
     assert.equal(calls.length, 1);
-    assert.equal(calls[0].url, "https://opencode.ai/inference/v1/models");
+    assert.equal(calls[0].url, "https://opencode.ai/zen/v1/models");
     assert.equal(calls[0].headers.Authorization, "Bearer oc_sk_test_123456");
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("OpenCode Zen free models are rejected before any upstream request", async () => {
+  const originalFetch = globalThis.fetch;
+  let called = false;
+  globalThis.fetch = async () => {
+    called = true;
+    return new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } });
+  };
+  try {
+    assert.equal(isOpenCodeZenFreeModel("deepseek-v4.1-flash-free"), true);
+    assert.equal(isOpenCodeZenFreeModel("deepseek-v4.1-flash"), false);
+    const baseUrl = "https://opencode.ai/inference/openai/v1";
+    const apiKey = "oc_sk_test_123456";
+    const messages = [{ role: "user", content: "Hello" }];
+
+    for (const action of [
+      () => chatCompletion({ baseUrl, apiKey, model: "deepseek-v4.1-flash-free", messages }),
+      () => startChatCompletionStream({ baseUrl, apiKey, model: "deepseek-v4.1-flash-free", messages }),
+      () => testProviderModel({ baseUrl, apiKey, model: "deepseek-v4.1-flash-free" })
+    ]) {
+      await assert.rejects(
+        action,
+        error => error instanceof ProviderError
+          && error.code === "free_tier_client_only"
+          && error.status === 403
+          && /official OpenCode client/.test(error.message)
+      );
+    }
+    assert.equal(called, false, "restricted models must never reach the provider");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("provider error details never echo a raw HTML error page", () => {
+  const error = describeProviderError(503, "<!DOCTYPE html><html><body><h1>Bad gateway</h1><script>alert(1)</script></body></html>");
+  assert.equal(error.code, "provider_unavailable");
+  assert.equal(error.status, 503);
+  assert.match(error.message, /HTML error page/);
+  assert.doesNotMatch(error.message, /<html|<!DOCTYPE|script/i);
 });
 
 test("OpenCode Zen connection checks validate the key without inference", async () => {
