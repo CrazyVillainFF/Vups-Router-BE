@@ -323,6 +323,63 @@ test("chat uses exactly the active provider and switching cannot cross keys", as
   assert.equal(fakeDeepSeek.state.chatRequests[0].key, FAKE_API_KEY);
 });
 
+test("personal OmniRoute uses only the user's key, never the server gateway key", async () => {
+  const previousUrl = process.env.OMNIROUTE_BASE_URL;
+  const previousKey = process.env.OMNIROUTE_API_KEY;
+  const previousEnabled = process.env.OMNIROUTE_ENABLED;
+  try {
+    process.env.OMNIROUTE_BASE_URL = fakeFlagship.baseUrl.replace(/\/v1$/, "");
+    process.env.OMNIROUTE_API_KEY = "sk-server-shared-gateway-key";
+    process.env.OMNIROUTE_ENABLED = "true";
+
+    const { cookie } = await signupUser();
+    const saved = await saveProvider(cookie, "omniroute", {
+      provider: "OmniRoute",
+      baseUrl: fakeDeepSeek.baseUrl,
+      apiKey: FAKE_API_KEY,
+      model: "fake-model-mini"
+    });
+    assert.equal(saved.status, 200);
+
+    fakeDeepSeek.state.reset();
+    fakeFlagship.state.reset();
+    const check = await api("/api/settings/providers/omniroute/test", { method: "POST", cookie, body: {} });
+    assert.equal(check.status, 200);
+    assert.equal(fakeDeepSeek.state.modelsRequests, 1, "Check must list models");
+    assert.equal(fakeDeepSeek.state.chatRequests.length, 0, "Check must stay zero-inference");
+    assert.equal(fakeFlagship.state.modelsRequests, 0, "the shared gateway must not be contacted");
+
+    const modelTest = await api("/api/settings/providers/omniroute/test-model", {
+      method: "POST",
+      cookie,
+      body: { model: "fake-model-mini" }
+    });
+    assert.equal(modelTest.status, 200);
+    assert.equal(fakeDeepSeek.state.chatRequests.length, 1, "Test model is the explicit inference action");
+    assert.equal(fakeDeepSeek.state.chatRequests[0].key, FAKE_API_KEY);
+    assert.equal(fakeFlagship.state.chatRequests.length, 0);
+
+    fakeDeepSeek.state.reset();
+    fakeFlagship.state.reset();
+    const chat = await api("/api/chat", {
+      method: "POST",
+      cookie,
+      body: { stream: false, messages: [{ role: "user", content: "personal omniroute" }] }
+    });
+    assert.equal(chat.status, 200);
+    assert.equal(fakeDeepSeek.state.chatRequests.length, 1);
+    assert.equal(fakeDeepSeek.state.chatRequests[0].key, FAKE_API_KEY);
+    assert.equal(fakeFlagship.state.chatRequests.length, 0, "chat must not fall back to the shared gateway");
+  } finally {
+    if (previousUrl === undefined) delete process.env.OMNIROUTE_BASE_URL;
+    else process.env.OMNIROUTE_BASE_URL = previousUrl;
+    if (previousKey === undefined) delete process.env.OMNIROUTE_API_KEY;
+    else process.env.OMNIROUTE_API_KEY = previousKey;
+    if (previousEnabled === undefined) delete process.env.OMNIROUTE_ENABLED;
+    else process.env.OMNIROUTE_ENABLED = previousEnabled;
+  }
+});
+
 test("legacy single-provider clients migrate without losing their configuration", async () => {
   const { cookie } = await signupUser();
   const legacySave = await api("/api/settings/provider", {
