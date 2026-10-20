@@ -22,6 +22,7 @@ export class ProviderError extends Error {
 const ENDPOINT_SUFFIX = /\/(chat\/completions|text\/chat|text\/chat_stream|responses|messages|completions|models|embeddings)$/i;
 const AGENTROUTER_HOSTS = new Set(["agentrouter.org", "www.agentrouter.org"]);
 const ANTHROPIC_HOSTS = new Set(["api.anthropic.com", "www.api.anthropic.com"]);
+const OPENCODE_ZEN_HOSTS = new Set(["opencode.ai", "www.opencode.ai"]);
 const PROVIDER_TYPES = ["openai_compatible", "openai_responses", "anthropic_compatible", "azure_openai", "watsonx", "local_gateway", "native"];
 const WATSONX_VERSION = "2024-10-08";
 const WATSONX_LISTING_VERSION = "2024-10-10";
@@ -41,6 +42,52 @@ function isAgentRouterHost(hostname) {
 
 function isAnthropicHost(hostname) {
   return ANTHROPIC_HOSTS.has(String(hostname || "").toLowerCase());
+}
+
+export function isOpenCodeZenHost(hostname) {
+  return OPENCODE_ZEN_HOSTS.has(String(hostname || "").toLowerCase());
+}
+
+export function isOpenCodeZenBase(value) {
+  try {
+    const parsed = new URL(String(value ?? "").trim());
+    return isOpenCodeZenHost(parsed.hostname)
+      && /^\/inference(?:\/(?:openai|anthropic|google|systemone|v\d+)(?:\/|$)|$)/i.test(parsed.pathname);
+  } catch {
+    return false;
+  }
+}
+
+// OpenCode Zen serves each model through one documented API family. The
+// endpoint table is the source of truth, so route by model instead of asking
+// users to change the protocol for every request.
+export function opencodeZenProtocol(model) {
+  const id = String(model ?? "").trim().toLowerCase();
+  if (/^(?:gemini|jev)(?:-|$)/.test(id)) return "unsupported";
+  if (/^claude(?:-|$)/.test(id)) return "anthropic";
+  if (/^qwen/.test(id)) return /^qwen3\.8-max(?:-|$)/.test(id) ? "chat" : "anthropic";
+  if (/^(?:gpt|grok|muse-spark)(?:-|$)/.test(id)) return "responses";
+  return "chat";
+}
+
+function opencodeZenEndpoint(baseUrl, model) {
+  const family = opencodeZenProtocol(model);
+  if (family === "unsupported") {
+    throw new ProviderError(
+      `OpenCode Zen serves "${String(model ?? "").trim()}" through a native API that VupsRouter does not support yet. Choose an OpenAI-compatible, Responses, or Anthropic Messages model instead.`,
+      400,
+      "unsupported_protocol"
+    );
+  }
+  const origin = new URL(normalizeBaseUrl(baseUrl)).origin;
+  if (family === "anthropic") return `${origin}/inference/anthropic/v1/messages`;
+  if (family === "responses") return `${origin}/inference/openai/v1/responses`;
+  return `${origin}/inference/openai/v1/chat/completions`;
+}
+
+function usesAnthropicApi(baseUrl, model, providerType) {
+  if (isOpenCodeZenBase(baseUrl)) return opencodeZenProtocol(model) === "anthropic";
+  return normalizeProviderType(providerType) === "anthropic_compatible";
 }
 
 export function normalizeProviderType(value) {
@@ -126,6 +173,7 @@ function requireWatsonxProjectId(baseUrl) {
 // OpenAI Responses can be selected explicitly, or inferred for AgentRouter's
 // GPT models. Anthropic and every other provider use their own endpoint.
 export function usesResponsesApi(baseUrl, model, providerType = "openai_compatible") {
+  if (isOpenCodeZenBase(baseUrl)) return opencodeZenProtocol(model) === "responses";
   const type = normalizeProviderType(providerType);
   if (type === "openai_responses") return true;
   if (type === "anthropic_compatible" || type === "azure_openai" || type === "watsonx") return false;
@@ -140,6 +188,7 @@ export function usesResponsesApi(baseUrl, model, providerType = "openai_compatib
 }
 
 export function resolveChatEndpoint(baseUrl, model, providerType = "openai_compatible", { stream = false } = {}) {
+  if (isOpenCodeZenBase(baseUrl)) return opencodeZenEndpoint(baseUrl, model);
   const type = normalizeProviderType(providerType);
   if (type === "anthropic_compatible") return `${anthropicBaseUrl(baseUrl)}/messages`;
   if (type === "watsonx") return `${watsonxBaseUrl(baseUrl)}/text/chat${stream ? "_stream" : ""}?version=${WATSONX_VERSION}`;
@@ -306,6 +355,7 @@ function truncate(value, limit = MAX_ERROR_LENGTH) {
 export function redactSecrets(value) {
   return value
     .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [redacted]")
+    .replace(/\boc_sk_[A-Za-z0-9_-]{6,}/g, "[redacted]")
     .replace(/\b(?:sk|ak)-[A-Za-z0-9_-]{6,}/g, "[redacted]")
     .replace(/("?(?:api[_-]?key|token|authorization|secret)"?\s*[:=]\s*)"[^"]*"/gi, '$1"[redacted]"');
 }
@@ -459,8 +509,15 @@ async function watsonxAccessToken(apiKey) {
   return token;
 }
 
-async function authHeaders(apiKey, providerType = "openai_compatible") {
+async function authHeaders(apiKey, providerType = "openai_compatible", baseUrl = "") {
   const type = normalizeProviderType(providerType);
+  if (isOpenCodeZenBase(baseUrl)) {
+    return {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      Authorization: `Bearer ${apiKey}`
+    };
+  }
   if (type === "anthropic_compatible") {
     return {
       "Content-Type": "application/json",
@@ -493,7 +550,9 @@ async function authHeaders(apiKey, providerType = "openai_compatible") {
 export async function listProviderModels({ baseUrl, apiKey, providerType = "openai_compatible" }, signal) {
   const type = normalizeProviderType(providerType);
   let url;
-  if (type === "anthropic_compatible") {
+  if (isOpenCodeZenBase(baseUrl)) {
+    url = `${new URL(normalizeBaseUrl(baseUrl)).origin}/inference/v1/models`;
+  } else if (type === "anthropic_compatible") {
     url = `${anthropicBaseUrl(baseUrl)}/models`;
   } else if (type === "watsonx") {
     const projectId = watsonxProjectId(baseUrl);
@@ -505,7 +564,7 @@ export async function listProviderModels({ baseUrl, apiKey, providerType = "open
   try {
     response = await guardedProviderFetch(url, {
       method: "GET",
-      headers: await authHeaders(apiKey, type),
+      headers: await authHeaders(apiKey, type, baseUrl),
       signal: signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS)
     });
   } catch (error) {
@@ -688,8 +747,8 @@ function responsesFinishReason(payload) {
 
 export async function chatCompletion({ baseUrl, apiKey, model, messages, temperature, maxTokens, providerType = "openai_compatible" }, signal) {
   const type = normalizeProviderType(providerType);
-  const anthropic = type === "anthropic_compatible";
-  const watsonx = type === "watsonx";
+  const anthropic = usesAnthropicApi(baseUrl, model, type);
+  const watsonx = !isOpenCodeZenBase(baseUrl) && type === "watsonx";
   const responses = !anthropic && !watsonx && usesResponsesApi(baseUrl, model, type);
   const url = resolveChatEndpoint(baseUrl, model, type);
   const body = anthropic
@@ -702,7 +761,7 @@ export async function chatCompletion({ baseUrl, apiKey, model, messages, tempera
   try {
     response = await guardedProviderFetch(url, {
       method: "POST",
-      headers: await authHeaders(apiKey, type),
+      headers: await authHeaders(apiKey, type, baseUrl),
       body: JSON.stringify(body),
       signal: signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS)
     });
@@ -733,8 +792,8 @@ export async function chatCompletion({ baseUrl, apiKey, model, messages, tempera
 
 export async function startChatCompletionStream({ baseUrl, apiKey, model, messages, temperature, maxTokens, providerType = "openai_compatible" }, signal) {
   const type = normalizeProviderType(providerType);
-  const anthropic = type === "anthropic_compatible";
-  const watsonx = type === "watsonx";
+  const anthropic = usesAnthropicApi(baseUrl, model, type);
+  const watsonx = !isOpenCodeZenBase(baseUrl) && type === "watsonx";
   const responses = !anthropic && !watsonx && usesResponsesApi(baseUrl, model, type);
   const url = resolveChatEndpoint(baseUrl, model, type, { stream: true });
   const body = anthropic
@@ -747,7 +806,7 @@ export async function startChatCompletionStream({ baseUrl, apiKey, model, messag
   try {
     response = await guardedProviderFetch(url, {
       method: "POST",
-      headers: { ...(await authHeaders(apiKey, type)), Accept: "text/event-stream" },
+      headers: { ...(await authHeaders(apiKey, type, baseUrl)), Accept: "text/event-stream" },
       body: JSON.stringify(body),
       signal: signal ?? AbortSignal.timeout(STREAM_TIMEOUT_MS)
     });

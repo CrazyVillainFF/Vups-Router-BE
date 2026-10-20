@@ -8,9 +8,12 @@ import {
   chatCompletion,
   extractResponseText,
   extractStreamText,
+  isOpenCodeZenBase,
+  listProviderModels,
   normalizeBaseUrl,
   resolveChatEndpoint,
-  startChatCompletionStream
+  startChatCompletionStream,
+  testProviderConnection
 } from "./providerClient.js";
 
 function readBody(req) {
@@ -195,8 +198,177 @@ test("AgentRouter GPT requests are POSTed to /v1/responses for both modes", asyn
   }
 });
 
+test("OpenCode Zen resolves each documented model family to its endpoint", () => {
+  const baseUrl = "https://opencode.ai/inference/openai/v1";
+  assert.equal(resolveChatEndpoint(baseUrl, "deepseek-v4.1-flash"), "https://opencode.ai/inference/openai/v1/chat/completions");
+  assert.equal(resolveChatEndpoint(baseUrl, "kimi-k3"), "https://opencode.ai/inference/openai/v1/chat/completions");
+  assert.equal(resolveChatEndpoint(baseUrl, "qwen3.8-max"), "https://opencode.ai/inference/openai/v1/chat/completions");
+  assert.equal(resolveChatEndpoint(baseUrl, "gpt-6-sol"), "https://opencode.ai/inference/openai/v1/responses");
+  assert.equal(resolveChatEndpoint(baseUrl, "grok-4.7"), "https://opencode.ai/inference/openai/v1/responses");
+  assert.equal(resolveChatEndpoint(baseUrl, "muse-spark-1.3"), "https://opencode.ai/inference/openai/v1/responses");
+  assert.equal(resolveChatEndpoint(baseUrl, "claude-sonnet-4-6"), "https://opencode.ai/inference/anthropic/v1/messages");
+  assert.equal(resolveChatEndpoint(baseUrl, "qwen3.8-flash"), "https://opencode.ai/inference/anthropic/v1/messages");
+  assert.throws(
+    () => resolveChatEndpoint(baseUrl, "gemini-3.1-pro"),
+    error => error instanceof ProviderError && error.code === "unsupported_protocol"
+  );
+  assert.equal(isOpenCodeZenBase(baseUrl), true);
+  assert.equal(isOpenCodeZenBase("https://opencode.ai/inference/v1"), true);
+  assert.equal(isOpenCodeZenBase("https://opencode.ai/inference/custom/conn_123"), false);
+});
+
+test("OpenCode Zen discovers models from the documented central endpoint with Bearer auth", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url: String(url), headers: options.headers });
+    return new Response(JSON.stringify({
+      object: "list",
+      data: [{ id: "deepseek-v4.1-flash" }, { id: "claude-sonnet-4-6" }]
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+  };
+  try {
+    const models = await listProviderModels({
+      baseUrl: "https://opencode.ai/inference/openai/v1",
+      apiKey: "oc_sk_test_123456",
+      providerType: "openai_compatible"
+    });
+    assert.deepEqual(models.map(entry => entry.id), ["deepseek-v4.1-flash", "claude-sonnet-4-6"]);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, "https://opencode.ai/inference/v1/models");
+    assert.equal(calls[0].headers.Authorization, "Bearer oc_sk_test_123456");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("OpenCode Zen connection checks validate the key without inference", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (_url, options) => {
+    calls.push({ method: options.method });
+    return new Response(JSON.stringify({ error: { message: "Invalid API key" } }), {
+      status: 401,
+      headers: { "Content-Type": "application/json" }
+    });
+  };
+  try {
+    await assert.rejects(
+      () => testProviderConnection({
+        baseUrl: "https://opencode.ai/inference/openai/v1",
+        apiKey: "oc_sk_bad_key",
+        providerType: "openai_compatible"
+      }),
+      error => error instanceof ProviderError && error.code === "invalid_api_key"
+    );
+    assert.deepEqual(calls, [{ method: "GET" }]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("OpenCode Zen chat routes OpenAI, Responses, and Anthropic models with Bearer auth", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    calls.push({ url: String(url), headers: options.headers, body });
+    if (String(url).endsWith("/messages")) {
+      return new Response(JSON.stringify({
+        content: [{ type: "text", text: "claude ok" }],
+        stop_reason: "end_turn"
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    if (String(url).endsWith("/responses")) {
+      return new Response(JSON.stringify({
+        output: [{ content: [{ type: "output_text", text: "gpt ok" }] }],
+        status: "completed"
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    return new Response(JSON.stringify({
+      choices: [{ message: { content: "chat ok" }, finish_reason: "stop" }]
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+  };
+  try {
+    const baseUrl = "https://opencode.ai/inference/openai/v1";
+    const apiKey = "oc_sk_test_123456";
+    const messages = [{ role: "user", content: "Hello" }];
+    const chat = await chatCompletion({ baseUrl, apiKey, model: "deepseek-v4.1-flash", messages });
+    const responses = await chatCompletion({ baseUrl, apiKey, model: "gpt-6-sol", messages });
+    const anthropic = await chatCompletion({ baseUrl, apiKey, model: "claude-sonnet-4-6", messages });
+
+    assert.equal(chat.content, "chat ok");
+    assert.equal(responses.content, "gpt ok");
+    assert.equal(anthropic.content, "claude ok");
+    assert.deepEqual(calls.map(call => call.url), [
+      "https://opencode.ai/inference/openai/v1/chat/completions",
+      "https://opencode.ai/inference/openai/v1/responses",
+      "https://opencode.ai/inference/anthropic/v1/messages"
+    ]);
+    assert.ok(calls.every(call => call.headers.Authorization === `Bearer ${apiKey}`));
+    assert.equal(calls[2].headers["x-api-key"], undefined);
+    assert.deepEqual(calls[1].body.input, [{ role: "user", content: "Hello" }]);
+    assert.equal(calls[2].body.max_tokens, 4096);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("OpenCode Zen streams Anthropic models through the Messages endpoint", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url: String(url), headers: options.headers, body: JSON.parse(options.body) });
+    const sse = [
+      'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello"}}',
+      'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}',
+      ""
+    ].join("\n\n");
+    return new Response(sse, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+  };
+  try {
+    const upstream = await startChatCompletionStream({
+      baseUrl: "https://opencode.ai/inference/openai/v1",
+      apiKey: "oc_sk_test_123456",
+      model: "claude-sonnet-4-6",
+      messages: [{ role: "user", content: "Hello" }]
+    });
+    assert.equal(await upstream.text(), 'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello"}}\n\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\n');
+    assert.equal(calls[0].url, "https://opencode.ai/inference/anthropic/v1/messages");
+    assert.equal(calls[0].headers.Authorization, "Bearer oc_sk_test_123456");
+    assert.equal(calls[0].body.stream, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("OpenCode Zen rejects native-only model families before sending a request", async () => {
+  const originalFetch = globalThis.fetch;
+  let called = false;
+  globalThis.fetch = async () => {
+    called = true;
+    return new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } });
+  };
+  try {
+    await assert.rejects(
+      () => chatCompletion({
+        baseUrl: "https://opencode.ai/inference/openai/v1",
+        apiKey: "oc_sk_test_123456",
+        model: "gemini-3.1-pro",
+        messages: [{ role: "user", content: "Hello" }]
+      }),
+      error => error instanceof ProviderError
+        && error.code === "unsupported_protocol"
+        && /native API/.test(error.message)
+    );
+    assert.equal(called, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("provider failure diagnostics include only safe request context and a truncated body", () => {
-  const payload = `Gateway challenge ${"x".repeat(2200)} sk-live-secret-123456 Bearer abc.def.secret`;
+  const payload = `Gateway challenge ${"x".repeat(2200)} sk-live-secret-123456 oc_sk_opencode-secret-123456 Bearer abc.def.secret`;
   const log = buildProviderFailureLog({
     url: "https://agentrouter.org/v1/responses?key=sk-query-secret-123456",
     method: "POST",
@@ -208,6 +380,7 @@ test("provider failure diagnostics include only safe request context and a trunc
   assert.ok(!log.includes("?key="), "query strings must not be logged");
   assert.ok(!log.includes("sk-live-secret-123456"));
   assert.ok(!log.includes("sk-query-secret-123456"));
+  assert.ok(!log.includes("oc_sk_opencode-secret-123456"));
   assert.ok(!log.includes("abc.def.secret"));
   const loggedBody = log.slice(log.indexOf("body=") + 5);
   assert.ok(loggedBody.length <= 2000, "upstream bodies must be truncated to 2000 characters");
