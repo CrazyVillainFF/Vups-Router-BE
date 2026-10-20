@@ -280,6 +280,7 @@ export async function resolveOmniRouteChat(requestedModel = "") {
   return {
     gateway: true,
     provider: provider.provider,
+    providerType: provider.providerType || "openai_compatible",
     baseUrl: provider.baseUrl,
     apiKey: provider.apiKey,
     defaultModel: model,

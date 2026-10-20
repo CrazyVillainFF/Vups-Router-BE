@@ -322,8 +322,9 @@ test("updating provider config without a new key keeps the saved key and it stil
   fakeProvider.state.reset();
 });
 
-test("test connection succeeds against a compatible provider and lists models", async () => {
+test("test connection lists models without sending an inference request", async () => {
   const { cookie } = await signupUser();
+  fakeProvider.state.reset();
   const response = await api("/api/settings/provider/test", {
     method: "POST",
     cookie,
@@ -331,8 +332,10 @@ test("test connection succeeds against a compatible provider and lists models", 
   });
   assert.equal(response.status, 200);
   assert.equal(response.body.ok, true);
-  assert.equal(response.body.modelChecked, true);
+  assert.equal(response.body.modelChecked, false);
+  assert.equal(response.body.listingSupported, true);
   assert.deepEqual(response.body.availableModels.map(model => model.id), FAKE_MODELS);
+  assert.equal(fakeProvider.state.chatRequests.length, 0, "connection checks must never run inference");
 });
 
 test("test connection reports an invalid API key clearly", async () => {
@@ -345,17 +348,32 @@ test("test connection reports an invalid API key clearly", async () => {
   assert.equal(response.status, 400);
   assert.equal(response.body.ok, false);
   assert.match(response.body.message, /API key/i);
+  assert.equal(fakeProvider.state.chatRequests.length, 0);
 });
 
-test("test connection reports an unavailable model without substituting one", async () => {
+test("explicit model testing validates the model and uses one tiny inference request", async () => {
   const { cookie } = await signupUser();
-  const response = await api("/api/settings/provider/test", {
+  fakeProvider.state.reset();
+  const unavailable = await api("/api/settings/provider/test-model", {
     method: "POST",
     cookie,
     body: { provider: "Fake", baseUrl: fakeProvider.baseUrl, apiKey: FAKE_API_KEY, model: "does-not-exist" }
   });
-  assert.equal(response.status, 400);
-  assert.match(response.body.message, /does not list a model named "does-not-exist"/);
+  assert.equal(unavailable.status, 400);
+  assert.match(unavailable.body.message, /does not list a model named "does-not-exist"/);
+  assert.equal(fakeProvider.state.chatRequests.length, 0);
+
+  const ok = await api("/api/settings/provider/test-model", {
+    method: "POST",
+    cookie,
+    body: { provider: "Fake", baseUrl: fakeProvider.baseUrl, apiKey: FAKE_API_KEY, model: "fake-model-pro" }
+  });
+  assert.equal(ok.status, 200);
+  assert.equal(ok.body.modelChecked, true);
+  assert.match(ok.body.sample, /fake-model-pro/);
+  assert.equal(fakeProvider.state.chatRequests.length, 1);
+  assert.match(ok.body.message, /tokens may have been used/i);
+  fakeProvider.state.reset();
 });
 
 test("test connection reports unreachable endpoints and bad URLs", async () => {
@@ -734,8 +752,10 @@ test("test connection records its status for the settings page without leaking t
   const { cookie } = await signupUser();
   await configureProvider(cookie);
 
+  fakeProvider.state.reset();
   const ok = await api("/api/settings/provider/test", { method: "POST", cookie, body: {} });
   assert.equal(ok.status, 200);
+  assert.equal(fakeProvider.state.chatRequests.length, 0);
   let config = await api("/api/settings/provider", { cookie });
   assert.equal(config.body.config.lastTest.status, "connected");
   assert.equal(JSON.stringify(config.body).includes(FAKE_API_KEY), false);

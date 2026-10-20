@@ -27,6 +27,7 @@ const SYSTEM_PROMPT =
 const MAX_MESSAGES = 60;
 const MAX_TOTAL_CHARS = 120000;
 const MAX_STORED_MESSAGES = 200;
+const MAX_UPSTREAM_TEXT_CHARS = 2_000_000;
 
 function validateMessages(value) {
   if (!Array.isArray(value) || value.length === 0) return "messages must be a non-empty array.";
@@ -123,6 +124,7 @@ function sharedRoute(shared, requestedModel = "") {
   return {
     shared: true,
     provider: provider.provider,
+    providerType: provider.providerType || "openai_compatible",
     baseUrl: provider.baseUrl,
     apiKey: provider.apiKey,
     defaultModel: model,
@@ -202,6 +204,7 @@ async function resolveProvider(userId, requestedModel, requestedConfigId, reques
   return {
     shared: false,
     provider: config.provider,
+    providerType: config.providerType || "openai_compatible",
     configId: config.configId,
     providerId: config.providerId,
     baseUrl,
@@ -457,7 +460,7 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
       let result;
       try {
         result = await chatCompletion(
-          { baseUrl: provider.baseUrl, apiKey: provider.apiKey, model, messages: upstreamMessages, temperature, maxTokens: provider.maxTokens },
+          { baseUrl: provider.baseUrl, apiKey: provider.apiKey, providerType: provider.providerType, model, messages: upstreamMessages, temperature, maxTokens: provider.maxTokens },
           undefined
         );
       } catch (error) {
@@ -498,7 +501,7 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
     let upstream;
     try {
       upstream = await startChatCompletionStream(
-        { baseUrl: provider.baseUrl, apiKey: provider.apiKey, model, messages: upstreamMessages, temperature, maxTokens: provider.maxTokens },
+        { baseUrl: provider.baseUrl, apiKey: provider.apiKey, providerType: provider.providerType, model, messages: upstreamMessages, temperature, maxTokens: provider.maxTokens },
         controller.signal
       );
     } catch (error) {
@@ -564,6 +567,16 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
           if (parsed?.usage && typeof parsed.usage === "object") {
             usage = parsed.usage;
           }
+          if (parsed?.type === "message_start" && parsed.message?.usage) {
+            usage = parsed.message.usage;
+          }
+          if (parsed?.type === "message_delta") {
+            if (parsed.usage && typeof parsed.usage === "object") usage = { ...(usage || {}), ...parsed.usage };
+            const stopReason = parsed.delta?.stop_reason;
+            if (stopReason === "max_tokens") finishReason = "length";
+            else if (stopReason === "end_turn" || stopReason === "stop_sequence") finishReason = "stop";
+            else if (typeof stopReason === "string") finishReason = stopReason;
+          }
           if ((parsed?.type === "response.completed" || parsed?.type === "response.incomplete") && parsed.response) {
             if (parsed.response.usage && typeof parsed.response.usage === "object") usage = parsed.response.usage;
             const incomplete = parsed.response.incomplete_details?.reason;
@@ -576,6 +589,10 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
           const text = extractStreamText(parsed);
           if (text) {
             fullText += text;
+            if (fullText.length > MAX_UPSTREAM_TEXT_CHARS) {
+              failure = new ProviderError("The provider returned more text than VupsRouter can safely process.", null, "response_too_large");
+              break;
+            }
             sendEvent(res, { type: "delta", content: text });
           }
         }

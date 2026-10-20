@@ -7,7 +7,9 @@ import {
   assertAllowedProviderUrl,
   listProviderModels,
   normalizeBaseUrl,
+  normalizeProviderType,
   testProviderConnection,
+  testProviderModel,
   validateProviderFields
 } from "../providerClient.js";
 import { requireAuth, settingsRateLimiter } from "../middleware.js";
@@ -175,9 +177,7 @@ function buildProviderUpdate(input, existing) {
   const normalizedBaseUrl = normalizeBaseUrl(input.baseUrl);
   assertAllowedProviderUrl(normalizedBaseUrl);
 
-  const providerType = ["openai_compatible", "anthropic_compatible", "native", "local_gateway"].includes(input.providerType)
-    ? input.providerType
-    : existing?.providerType || "openai_compatible";
+  const providerType = normalizeProviderType(input.providerType || existing?.providerType || "openai_compatible");
   const update = {
     providerId: sanitizeProviderId(input.providerId) || providerIdFromName(input.provider),
     provider: input.provider.trim(),
@@ -373,7 +373,7 @@ router.post("/providers/:identifier/test", async (req, res, next) => {
     const stored = await resolveStoredConfig(req.userId, identifier);
     if (!stored) return res.status(404).json({ message: "That configuration is not saved." });
     const baseUrl = (input.baseUrl || stored.baseUrl || "").trim();
-    const model = String(input.model ?? stored.defaultModel ?? stored.model ?? "").trim();
+    const providerType = normalizeProviderType(input.providerType || stored.providerType);
     let apiKey = typeof input.apiKey === "string" ? input.apiKey.trim() : "";
     if (!apiKey && stored.encryptedApiKey) {
       try {
@@ -397,9 +397,8 @@ router.post("/providers/:identifier/test", async (req, res, next) => {
     }
 
     try {
-      const result = await testProviderConnection({ baseUrl: normalizedBaseUrl, apiKey, model });
-      const parts = ["Connection succeeded."];
-      if (result.modelChecked) parts.push(`Model "${model}" responded correctly.`);
+      const result = await testProviderConnection({ baseUrl: normalizedBaseUrl, apiKey, providerType });
+      const parts = [result.listingSupported ? "Connection succeeded." : "Endpoint reached."];
       if (result.availableModels.length > 0) {
         parts.push(`${result.availableModels.length} models available.`);
         if (stored.models.length === 0) {
@@ -410,14 +409,74 @@ router.post("/providers/:identifier/test", async (req, res, next) => {
             { $set: { models: result.availableModels.map(entry => entry.id).slice(0, 500) } }
           );
         }
+      } else if (result.warning) {
+        parts.push(result.warning);
       }
       const message = parts.join(" ");
-      await recordTestResult(req.userId, stored, "connected", "", message);
+      await recordTestResult(req.userId, stored, result.listingSupported ? "connected" : "reachable", "", message);
       return res.json({
         ok: true,
         message,
         availableModels: result.availableModels,
-        modelChecked: result.modelChecked
+        modelChecked: false,
+        listingSupported: result.listingSupported,
+        warning: result.warning
+      });
+    } catch (error) {
+      if (error instanceof ProviderError) {
+        await recordTestResult(req.userId, stored, testStatusFor(error), error.code, error.message);
+        return res.status(400).json({ ok: false, message: error.message, code: error.code });
+      }
+      throw error;
+    }
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.post("/providers/:identifier/test-model", async (req, res, next) => {
+  try {
+    const identifier = String(req.params.identifier || "").trim().toLowerCase();
+    const input = req.body || {};
+    await connectToDatabase();
+    const stored = await resolveStoredConfig(req.userId, identifier);
+    if (!stored) return res.status(404).json({ message: "That configuration is not saved." });
+    const baseUrl = (input.baseUrl || stored.baseUrl || "").trim();
+    const model = String(input.model ?? stored.defaultModel ?? stored.model ?? "").trim();
+    const providerType = normalizeProviderType(input.providerType || stored.providerType);
+    let apiKey = typeof input.apiKey === "string" ? input.apiKey.trim() : "";
+    if (!apiKey && stored.encryptedApiKey) {
+      try {
+        apiKey = decryptSecret(stored.encryptedApiKey);
+      } catch {
+        return res.status(500).json({ message: "The stored API key could not be decrypted. Re-enter and save your key." });
+      }
+    }
+    if (!baseUrl) return res.status(400).json({ message: "Enter an API base URL first." });
+    if (!apiKey) return res.status(400).json({ message: "Enter an API key first." });
+    if (!model) return res.status(400).json({ message: "Enter the exact model ID before testing a model." });
+
+    let normalizedBaseUrl;
+    try {
+      normalizedBaseUrl = normalizeBaseUrl(baseUrl);
+      assertAllowedProviderUrl(normalizedBaseUrl);
+    } catch (error) {
+      if (error instanceof ProviderError) {
+        await recordTestResult(req.userId, stored, testStatusFor(error), error.code, error.message);
+      }
+      return providerErrorResponse(res, error);
+    }
+
+    try {
+      const result = await testProviderModel({ baseUrl: normalizedBaseUrl, apiKey, providerType, model });
+      const message = `Model "${model}" responded correctly. A small amount of provider tokens may have been used.`;
+      await recordTestResult(req.userId, stored, "connected", "", message);
+      return res.json({
+        ok: true,
+        message,
+        sample: result.sample,
+        availableModels: result.availableModels,
+        modelChecked: true
       });
     } catch (error) {
       if (error instanceof ProviderError) {
@@ -504,7 +563,7 @@ router.put("/provider", async (req, res, next) => {
     const providerId = existing?.providerId || providerIdFromName(input.provider);
     const update = {
       provider: input.provider.trim(),
-      providerType: existing?.providerType || "openai_compatible",
+      providerType: normalizeProviderType(input.providerType || existing?.providerType || "openai_compatible"),
       baseUrl: normalizedBaseUrl,
       model: typeof input.model === "string" ? input.model.trim() : existing?.model || ""
     };
@@ -549,7 +608,7 @@ router.post("/provider/test", async (req, res, next) => {
     await ensureProviderIds(req.userId);
     const stored = await loadActiveConfig(req.userId);
     const baseUrl = (input.baseUrl || stored?.baseUrl || "").trim();
-    const model = String(input.model ?? stored?.defaultModel ?? stored?.model ?? "").trim();
+    const providerType = normalizeProviderType(input.providerType || stored?.providerType);
     let apiKey = typeof input.apiKey === "string" ? input.apiKey.trim() : "";
     if (!apiKey && stored?.encryptedApiKey) {
       try {
@@ -573,13 +632,75 @@ router.post("/provider/test", async (req, res, next) => {
     }
 
     try {
-      const result = await testProviderConnection({ baseUrl: normalizedBaseUrl, apiKey, model });
-      const parts = ["Connection succeeded."];
-      if (result.modelChecked) parts.push(`Model "${model}" responded correctly.`);
+      const result = await testProviderConnection({ baseUrl: normalizedBaseUrl, apiKey, providerType });
+      const parts = [result.listingSupported ? "Connection succeeded." : "Endpoint reached."];
       if (result.availableModels.length > 0) parts.push(`${result.availableModels.length} models available.`);
+      else if (result.warning) parts.push(result.warning);
       const message = parts.join(" ");
+      if (stored) await recordTestResult(req.userId, stored, result.listingSupported ? "connected" : "reachable", "", message);
+      return res.json({
+        ok: true,
+        message,
+        availableModels: result.availableModels,
+        modelChecked: false,
+        listingSupported: result.listingSupported,
+        warning: result.warning
+      });
+    } catch (error) {
+      if (error instanceof ProviderError) {
+        if (stored) await recordTestResult(req.userId, stored, testStatusFor(error), error.code, error.message);
+        return res.status(400).json({ ok: false, message: error.message, code: error.code });
+      }
+      throw error;
+    }
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.post("/provider/test-model", async (req, res, next) => {
+  try {
+    const input = req.body || {};
+    await connectToDatabase();
+    await ensureProviderIds(req.userId);
+    const stored = await loadActiveConfig(req.userId);
+    const baseUrl = (input.baseUrl || stored?.baseUrl || "").trim();
+    const model = String(input.model ?? stored?.defaultModel ?? stored?.model ?? "").trim();
+    const providerType = normalizeProviderType(input.providerType || stored?.providerType);
+    let apiKey = typeof input.apiKey === "string" ? input.apiKey.trim() : "";
+    if (!apiKey && stored?.encryptedApiKey) {
+      try {
+        apiKey = decryptSecret(stored.encryptedApiKey);
+      } catch {
+        return res.status(500).json({ message: "The stored API key could not be decrypted. Re-enter and save your key." });
+      }
+    }
+    if (!baseUrl) return res.status(400).json({ message: "Enter an API base URL first." });
+    if (!apiKey) return res.status(400).json({ message: "Enter an API key first." });
+    if (!model) return res.status(400).json({ message: "Enter the exact model ID before testing a model." });
+
+    let normalizedBaseUrl;
+    try {
+      normalizedBaseUrl = normalizeBaseUrl(baseUrl);
+      assertAllowedProviderUrl(normalizedBaseUrl);
+    } catch (error) {
+      if (error instanceof ProviderError && stored) {
+        await recordTestResult(req.userId, stored, testStatusFor(error), error.code, error.message);
+      }
+      return providerErrorResponse(res, error);
+    }
+
+    try {
+      const result = await testProviderModel({ baseUrl: normalizedBaseUrl, apiKey, providerType, model });
+      const message = `Model "${model}" responded correctly. A small amount of provider tokens may have been used.`;
       if (stored) await recordTestResult(req.userId, stored, "connected", "", message);
-      return res.json({ ok: true, message, availableModels: result.availableModels, modelChecked: result.modelChecked });
+      return res.json({
+        ok: true,
+        message,
+        sample: result.sample,
+        availableModels: result.availableModels,
+        modelChecked: true
+      });
     } catch (error) {
       if (error instanceof ProviderError) {
         if (stored) await recordTestResult(req.userId, stored, testStatusFor(error), error.code, error.message);
@@ -651,7 +772,7 @@ router.get("/models", async (req, res, next) => {
         return res.status(500).json({ message: "The stored API key could not be decrypted. Re-enter and save your key." });
       }
       try {
-        const models = await listProviderModels({ baseUrl: stored.baseUrl, apiKey });
+        const models = await listProviderModels({ baseUrl: stored.baseUrl, apiKey, providerType: stored.providerType });
         const liveEntries = models.map(model => ({
           ...model,
           name: model.name || model.id,
@@ -712,7 +833,7 @@ router.get("/models", async (req, res, next) => {
         warning = { message: "The stored API key could not be decrypted. Re-enter and save your key.", code: "key_decryption_failed" };
       } else {
         try {
-          const models = await listProviderModels({ baseUrl: active.baseUrl, apiKey });
+          const models = await listProviderModels({ baseUrl: active.baseUrl, apiKey, providerType: active.providerType });
           const liveEntries = models.map(model => ({
             ...model,
             name: model.name || model.id,

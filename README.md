@@ -69,25 +69,39 @@ Each user can save **multiple configurations at once**, including several keys f
 | `PUT` | `/api/settings/providers/:identifier` | Upserts one configuration: `{ provider, baseUrl, apiKey?, model?, providerType? }`. `identifier` is the `configId` (or legacy `providerId` alias). A brand-new identifier becomes active; editing an existing one never steals the active slot |
 | `POST` | `/api/settings/providers/:identifier/activate` | Makes this configuration the one chat uses (only this document is written) |
 | `DELETE` | `/api/settings/providers/:identifier` | Deletes this configuration only; if it was active, the most recently updated remaining configuration is promoted |
-| `POST` | `/api/settings/providers/:identifier/test` | Tests the saved configuration (or supplied `baseUrl`/`apiKey`/`model` overrides) and records the result |
+| `POST` | `/api/settings/providers/:identifier/test` | Zero-inference connection check: reads `GET {baseUrl}/models` only, never sends a chat prompt, and records the result |
+| `POST` | `/api/settings/providers/:identifier/test-model` | Explicit inference test: sends one tiny prompt using `{ model }` after the user confirms; never runs automatically on save |
 | `PUT` | `/api/settings/providers/:identifier/models` | `{ models: string[], defaultModel? }` — validates length/uniqueness; `defaultModel` must be in the list |
 | `GET` | `/api/settings/models?configId=` | Focused discovery for one saved configuration (`GET {baseUrl}/models`); the saved list is returned with a `warning` if discovery fails. Without `configId` (or legacy `providerId`) it returns the free/shared catalogue plus saved rows for **every** configuration, so the chat picker always shows both; a discovery failure only adds a `warning` and never erases rows |
 
-Legacy endpoints (`GET/PUT/DELETE /api/settings/provider`, `POST /api/settings/provider/test`) remain for backward compatibility and operate on the active provider.
+Legacy endpoints (`GET/PUT/DELETE /api/settings/provider`, `POST /api/settings/provider/test`, `POST /api/settings/provider/test-model`) remain for backward compatibility and operate on the active provider.
 
-### Provider quick start (any OpenAI-compatible service)
+### Provider protocols and quick start
 
-1. Sign in and open **Provider settings**. Any real provider with an OpenAI-compatible API works with no code changes per provider: OpenRouter, DeepSeek, Groq, Google Gemini (OpenAI-compat path), Mistral, Cohere, Together, Fireworks, Cerebras, NVIDIA NIM, xAI, SambaNova, Novita, plus self-hosted gateways (Ollama, vLLM, LocalAI, LM Studio, LiteLLM, FlagshipRouter) and custom endpoints.
-2. Pick a provider card (or Add provider), paste your key, save. Repeat for as many providers as you want — each keeps its own key and models.
-3. **Load models** to fetch the live list, select the ones to keep, choose a default, then **Test connection**.
-4. **Use for chat** switches the active provider; chat requests go to `POST {baseUrl}/chat/completions` through the backend and the model is never silently substituted. AgentRouter GPT models (`gpt-*`) use its documented OpenAI Responses endpoint instead: the backend sends `POST https://agentrouter.org/v1/responses` and converts the Responses payload/stream back to VupsRouter's SSE format. Other AgentRouter models and every other provider keep using `/chat/completions`.
+VupsRouter dispatches through protocol adapters selected by `providerType`:
+
+- `openai_compatible` (default) and `local_gateway` — OpenAI Chat Completions (`/chat/completions`). This also covers Vercel AI Gateway, Hugging Face Inference Providers, AI21 Studio, Cloudflare Workers AI, and Amazon Bedrock's OpenAI-compatible route (`/openai/v1`).
+- `openai_responses` — OpenAI Responses API (`/responses`), also inferred for AgentRouter GPT models.
+- `anthropic_compatible` — Anthropic Messages API (`/v1/messages`) with `x-api-key`, `anthropic-version`, native system prompts, images, and SSE deltas.
+- `azure_openai` — Azure OpenAI v1 (`/chat/completions`) with the key in the `api-key` header instead of `Authorization`.
+- `watsonx` — IBM watsonx.ai (`/ml/v1/text/chat` and `/text/chat_stream`). The IBM Cloud API key is exchanged for a cached IAM bearer token; the base URL must include `?project_id=YOUR_PROJECT_ID`.
+- Google Gemini is supported through its official OpenAI-compatible endpoint (`https://generativelanguage.googleapis.com/v1beta/openai`).
+- `native` is retained for existing records but has no generic adapter and cannot be saved from the current UI.
+
+1. Sign in and open **Provider settings**. Pick a provider card (or add a custom endpoint), choose the API protocol, paste your key, and save. Each configuration keeps its own key and models.
+2. **Load models** to fetch the live list, select the ones to keep, and choose a default.
+3. **Check connection** reads the model list only and is guaranteed zero-inference. Some providers do not expose a model list; the endpoint is then recorded as reachable, not credential-verified.
+4. **Test model** is the only action that sends inference. It requires an explicit confirmation and uses one tiny prompt; model tests never run automatically on save.
+5. **Use for chat** switches the active provider. Chat requests go through the selected adapter and the model is never silently substituted.
 
 Notes:
 
 - **Localhost / private-network URLs**: a deployed backend (Render, Railway, …) cannot reach `http://localhost:...` on your computer — for example a FlagshipRouter or Ollama instance. On production, such URLs are rejected with `400 local_endpoint` / `private_endpoint` and an explanation (use a public HTTPS tunnel like ngrok/Cloudflare Tunnel, or run VupsRouter locally). During development and tests the guard is off; `ALLOW_PRIVATE_PROVIDER_URLS=true` re-enables private URLs for self-hosted backends that share the network.
-- **URL normalization**: trailing `/chat/completions`, `/responses`, `/messages`, `/completions`, `/models`, or `/embeddings` suffixes are stripped from the base URL automatically, so pasting a full endpoint URL does not produce a doubled path. `agentrouter.org` base URLs normalize to `/v1` even when only the origin was saved.
+- **URL normalization**: trailing `/chat/completions`, `/text/chat`, `/text/chat_stream`, `/responses`, `/messages`, `/completions`, `/models`, or `/embeddings` suffixes are stripped from the base URL automatically, so pasting a full endpoint URL does not produce a doubled path. `agentrouter.org` and `api.anthropic.com` base URLs normalize to `/v1` even when only the origin was saved; watsonx cluster URLs gain `/ml/v1`.
+- **Watsonx credentials**: the `apiKey` field holds the IBM Cloud API key (not an IAM token). Tokens are exchanged once, cached in memory, and refreshed automatically. Append `?project_id=...` to the base URL; without it, chat and model tests return `missing_project_id`.
+- **Providers without a model list**: Amazon Bedrock Runtime's OpenAI-compatible route has no `GET /models`. Check connection records the endpoint as reachable (zero inference), and Test model verifies the key; enter the model ID manually. The same reachable-only behavior applies to any other provider that returns 404/405 on `/models`.
 - **Network errors are specific**: `dns_error`, `connection_refused`, `network_error`, and `timeout` are reported with the target hostname — never as an "invalid API key".
-- The settings page shows a status badge per provider (Connected, Invalid key, Insufficient balance, Unreachable, Not tested). Model listings drive validation: if a provider later removes a model, chat returns an actionable `invalid_model` error instead of a mystery failure.
+- The settings page shows a status badge per provider (Connection verified, Endpoint reachable, Invalid key, Insufficient balance, Unreachable, Not tested). Model listings drive validation: if a provider later removes a model, chat returns an actionable `invalid_model` error instead of a mystery failure.
 
 ### Administration (requires `ADMIN_EMAILS`)
 
@@ -383,6 +397,8 @@ sending.
 - Provider API keys are encrypted with authenticated AES-256-GCM using `ENCRYPTION_SECRET` and are never returned to the client in full.
 - Sessions are HTTP-only cookies; tokens are not stored in `localStorage` by the shipped client.
 - Auth endpoints are rate-limited (30 requests / 15 min / IP); chat is limited to 30 requests / min.
-- Requests are size-limited (512 kB JSON globally; `/api/chat` allows the image-attachment budget described above). Conversation history is capped server-side. Image bytes are validated by magic bytes and never persisted.
+- Requests are size-limited (512 kB JSON globally; `/api/chat` allows the image-attachment budget described above). Upstream JSON responses are capped at 4 MB; streamed assistant text is capped at 2 million characters. Conversation history is capped server-side. Image bytes are validated by magic bytes and never persisted.
+- Provider URLs are checked for loopback/private/link-local/metadata destinations. In production the hostname is also DNS-resolved before use; redirects are followed only within the same origin, so credentials are never forwarded cross-origin and a public endpoint cannot redirect the backend into a private network.
 - The proxy never substitutes a different model when the requested model fails; it returns the provider's error instead.
+- Connection checks never run inference; only the explicitly confirmed Test model action sends a small prompt.
 
