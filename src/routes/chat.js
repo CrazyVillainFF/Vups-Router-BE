@@ -290,6 +290,8 @@ const PROVIDER_STATUS_BY_CODE = {
   missing_project_id: 400,
   unsupported_protocol: 400,
   free_tier_client_only: 403,
+  free_quota_exhausted: 429,
+  region_restricted: 403,
   model_unavailable: 400,
   dns_error: 502,
   connection_refused: 502,

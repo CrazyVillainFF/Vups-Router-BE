@@ -22,6 +22,7 @@ export class ProviderError extends Error {
 const ENDPOINT_SUFFIX = /\/(chat\/completions|text\/chat|text\/chat_stream|responses|messages|completions|models|embeddings)$/i;
 const AGENTROUTER_HOSTS = new Set(["agentrouter.org", "www.agentrouter.org"]);
 const ANTHROPIC_HOSTS = new Set(["api.anthropic.com", "www.api.anthropic.com"]);
+const GOOGLE_GEMINI_HOSTS = new Set(["generativelanguage.googleapis.com"]);
 const OPENCODE_ZEN_HOSTS = new Set(["opencode.ai", "www.opencode.ai"]);
 const PROVIDER_TYPES = ["openai_compatible", "openai_responses", "anthropic_compatible", "azure_openai", "watsonx", "local_gateway", "native"];
 const WATSONX_VERSION = "2024-10-08";
@@ -56,6 +57,29 @@ export function isOpenCodeZenBase(value) {
   } catch {
     return false;
   }
+}
+
+export function isGoogleGeminiHost(hostname) {
+  return GOOGLE_GEMINI_HOSTS.has(String(hostname || "").toLowerCase());
+}
+
+export function isGoogleGeminiBase(value) {
+  try {
+    return isGoogleGeminiHost(new URL(String(value ?? "").trim()).hostname);
+  } catch {
+    return false;
+  }
+}
+
+// Google's OpenAI-compatible surface lives under /v1beta/openai. The native
+// model catalogue and quota semantics live under /v1beta, so discovery and
+// error classification branch on this host while chat stays OpenAI-shaped.
+function googleGeminiModelsUrl(baseUrl) {
+  return `${new URL(normalizeBaseUrl(baseUrl)).origin}/v1beta/models?pageSize=1000`;
+}
+
+function isGoogleNonChatModel(id) {
+  return /(?:embedding|imagen|veo|lyria|tts|image|live|transcribe|audio|omni|computer-use|deep-research)/i.test(String(id ?? ""));
 }
 
 // OpenCode restricts its zero-cost Zen models to the official OpenCode client.
@@ -139,6 +163,9 @@ export function normalizeBaseUrl(value) {
   }
   if ((isAgentRouterHost(parsed.hostname) || isAnthropicHost(parsed.hostname)) && (cleanedPath === "" || /^(\/v\d+)+$/i.test(cleanedPath))) {
     cleanedPath = "/v1";
+  }
+  if (isGoogleGeminiHost(parsed.hostname) && (cleanedPath === "" || /^\/v1(?:beta)?$/i.test(cleanedPath) || /^\/openai$/i.test(cleanedPath))) {
+    cleanedPath = "/v1beta/openai";
   }
   return parsed.origin + cleanedPath + parsed.search;
 }
@@ -440,6 +467,42 @@ export function describeProviderError(status, payload) {
   return new ProviderError(`The provider returned an unexpected error${status ? ` (HTTP ${status})` : ""}.${suffix}`, status ?? null, "provider_error");
 }
 
+// Gemini uses Google-style error envelopes and separates free-tier quota
+// failures from ordinary HTTP 429s. Keep the message actionable and do not
+// imply that switching models resets a project-wide quota.
+function googleGeminiError(status, payload) {
+  const detail = sanitizedErrorDetail(payload);
+  const suffix = detail ? ` Provider said: ${detail}` : "";
+  if (status === 400 && /api[- ]?key|credential|API_KEY_INVALID/i.test(detail)) {
+    return new ProviderError(`Google Gemini rejected your API key (HTTP 400). Create a key in Google AI Studio and paste it in Settings.${suffix}`, 401, "invalid_api_key");
+  }
+  if (status === 403) {
+    if (/country|region|location|not available|unsupported/i.test(detail)) {
+      return new ProviderError(`Google Gemini is not available for this project's region. Free-tier Gemini API use is not offered in the EEA, Switzerland, or the UK; those regions require a paid Google Cloud project.${suffix}`, 403, "region_restricted");
+    }
+    if (/api[- ]?key|credential|permission|unregistered/i.test(detail)) {
+      return new ProviderError(`Google Gemini denied access (HTTP 403). Check that the key belongs to the intended project and that the Generative Language API is enabled in Google AI Studio.${suffix}`, 403, "forbidden");
+    }
+    return new ProviderError(`Google Gemini denied the request (HTTP 403). Enable the Gemini API for this project and check its regional availability.${suffix}`, 403, "forbidden");
+  }
+  if (status === 429) {
+    const daily = /per day|daily|\bRPD\b|requests per day/i.test(detail);
+    const freeTier = /free[- ]tier/i.test(detail);
+    const reset = daily ? "Daily quotas reset at midnight Pacific time." : "Wait a moment before retrying.";
+    return new ProviderError(`Google Gemini's ${daily ? "daily " : ""}${freeTier ? "free-tier " : ""}quota is exhausted (HTTP 429). ${reset} Quotas are enforced per Google Cloud project, so changing models may not help; check AI Studio or Google Cloud for current limits and billing.${suffix}`, 429, freeTier ? "free_quota_exhausted" : "rate_limited");
+  }
+  return describeProviderError(status, payload);
+}
+
+function providerHttpError(url, status, payload) {
+  try {
+    if (isGoogleGeminiHost(new URL(url).hostname)) return googleGeminiError(status, payload);
+  } catch {
+    /* fall through to the generic mapping */
+  }
+  return describeProviderError(status, payload);
+}
+
 const MAX_PROVIDER_RESPONSE_BYTES = 4 * 1024 * 1024;
 
 async function readResponseTextLimited(response) {
@@ -579,9 +642,12 @@ async function authHeaders(apiKey, providerType = "openai_compatible", baseUrl =
 export async function listProviderModels({ baseUrl, apiKey, providerType = "openai_compatible" }, signal) {
   const type = normalizeProviderType(providerType);
   const zen = isOpenCodeZenBase(baseUrl);
+  const google = isGoogleGeminiBase(baseUrl);
   let url;
   if (zen) {
     url = `${new URL(normalizeBaseUrl(baseUrl)).origin}/zen/v1/models`;
+  } else if (google) {
+    url = googleGeminiModelsUrl(baseUrl);
   } else if (type === "anthropic_compatible") {
     url = `${anthropicBaseUrl(baseUrl)}/models`;
   } else if (type === "watsonx") {
@@ -594,7 +660,9 @@ export async function listProviderModels({ baseUrl, apiKey, providerType = "open
   try {
     response = await guardedProviderFetch(url, {
       method: "GET",
-      headers: await authHeaders(apiKey, type, baseUrl),
+      headers: google
+        ? { Accept: "application/json", "x-goog-api-key": apiKey }
+        : await authHeaders(apiKey, type, baseUrl),
       signal: signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS)
     });
   } catch (error) {
@@ -620,9 +688,27 @@ export async function listProviderModels({ baseUrl, apiKey, providerType = "open
       );
     }
     const payload = await readJsonSafely(response);
-    throw describeProviderError(response.status, payload);
+    throw providerHttpError(url, response.status, payload);
   }
   const payload = await readJsonSafely(response);
+  if (google) {
+    const models = Array.isArray(payload?.models) ? payload.models : null;
+    if (!models) {
+      throw new ProviderError("Google Gemini did not return a model list. Enter a Gemini model ID manually or check the API key.", response.status, "unsupported_listing");
+    }
+    return models
+      .map(entry => {
+        const rawName = typeof entry?.name === "string" ? entry.name : "";
+        const id = rawName.replace(/^models\//i, "");
+        if (!id) return null;
+        const methods = Array.isArray(entry?.supportedGenerationMethods) ? entry.supportedGenerationMethods : null;
+        if (methods && !methods.includes("generateContent")) return null;
+        if (isGoogleNonChatModel(id)) return null;
+        return { id, ownedBy: "Google Gemini", vision: true };
+      })
+      .filter(Boolean)
+      .slice(0, 1000);
+  }
   const entries = Array.isArray(payload?.data)
     ? payload.data
     : Array.isArray(payload?.models)
@@ -810,7 +896,7 @@ export async function chatCompletion({ baseUrl, apiKey, model, messages, tempera
   if (!response.ok) {
     const failure = await readJsonSafely(response);
     logProviderFailure(url, response, failure);
-    throw describeProviderError(response.status, failure);
+    throw providerHttpError(url, response.status, failure);
   }
   const payload = await readJsonSafely(response);
   const content = anthropic ? extractAnthropicText(payload) : extractResponseText(payload);
@@ -856,7 +942,7 @@ export async function startChatCompletionStream({ baseUrl, apiKey, model, messag
   if (!response.ok) {
     const failure = await readJsonSafely(response);
     logProviderFailure(url, response, failure);
-    throw describeProviderError(response.status, failure);
+    throw providerHttpError(url, response.status, failure);
   }
   if (!response.body) {
     throw new ProviderError("The provider did not return a response stream.", response.status, "empty_stream");

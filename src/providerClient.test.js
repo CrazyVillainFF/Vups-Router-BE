@@ -9,6 +9,7 @@ import {
   describeProviderError,
   extractResponseText,
   extractStreamText,
+  isGoogleGeminiBase,
   isOpenCodeZenBase,
   isOpenCodeZenFreeModel,
   listProviderModels,
@@ -516,4 +517,141 @@ test("extracts non-streaming text from both API shapes", () => {
     output: [{ content: [{ type: "output_text", text: "a" }, { type: "output_text", text: "b" }] }]
   }), "ab");
   assert.equal(extractResponseText({ choices: [{ message: { content: "chat" } }] }), "chat");
+});
+
+test("Google Gemini base URLs normalize to the OpenAI-compatible surface", () => {
+  assert.equal(isGoogleGeminiBase("https://generativelanguage.googleapis.com/v1beta/openai"), true);
+  assert.equal(isGoogleGeminiBase("https://generativelanguage.googleapis.com"), true);
+  assert.equal(isGoogleGeminiBase("https://opencode.ai/inference/google/v1beta/models/gemini-3.8-flash"), false);
+  assert.equal(
+    normalizeBaseUrl("https://generativelanguage.googleapis.com"),
+    "https://generativelanguage.googleapis.com/v1beta/openai"
+  );
+  assert.equal(
+    normalizeBaseUrl("https://generativelanguage.googleapis.com/v1beta"),
+    "https://generativelanguage.googleapis.com/v1beta/openai"
+  );
+  assert.equal(
+    normalizeBaseUrl("https://generativelanguage.googleapis.com/v1beta/openai/"),
+    "https://generativelanguage.googleapis.com/v1beta/openai"
+  );
+});
+
+test("Google Gemini model discovery uses the native catalogue and x-goog-api-key", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url: String(url), headers: options.headers });
+    return new Response(JSON.stringify({
+      models: [
+        { name: "models/gemini-3.8-flash", supportedGenerationMethods: ["generateContent", "streamGenerateContent"] },
+        { name: "models/gemini-3.5-flash-lite", supportedGenerationMethods: ["generateContent"] },
+        { name: "models/gemini-embedding-2", supportedGenerationMethods: ["embedContent"] },
+        { name: "models/imagen-4", supportedGenerationMethods: ["generateContent"] },
+        { name: "models/gemini-3.8-flash-preview-tts", supportedGenerationMethods: ["generateContent"] }
+      ]
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+  };
+  try {
+    const models = await listProviderModels({
+      baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
+      apiKey: "AIza-test-key",
+      providerType: "openai_compatible"
+    });
+    assert.deepEqual(models.map(entry => entry.id), ["gemini-3.8-flash", "gemini-3.5-flash-lite"]);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000");
+    assert.equal(calls[0].headers["x-goog-api-key"], "AIza-test-key");
+    assert.equal(calls[0].headers.Authorization, undefined);
+    assert.doesNotMatch(calls[0].url, /key=/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("Google Gemini chat posts OpenAI-shaped requests and streams deltas", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url: String(url), headers: options.headers, body: JSON.parse(options.body) });
+    if (calls.length === 1) {
+      return new Response(JSON.stringify({
+        id: "chatcmpl-1",
+        choices: [{ message: { role: "assistant", content: "Hello from Gemini" }, finish_reason: "stop" }]
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    return new Response([
+      'data: {"choices":[{"delta":{"content":"Hel"}}]}',
+      'data: {"choices":[{"delta":{"content":"lo"}}]}',
+      'data: [DONE]',
+      ""
+    ].join("\n\n"), { status: 200, headers: { "Content-Type": "text/event-stream" } });
+  };
+  try {
+    const baseUrl = "https://generativelanguage.googleapis.com/v1beta/openai";
+    const messages = [{ role: "user", content: "Hi" }];
+    const answer = await chatCompletion({ baseUrl, apiKey: "AIza-test-key", model: "gemini-3.8-flash", messages });
+    assert.equal(answer.content, "Hello from Gemini");
+    const response = await startChatCompletionStream({ baseUrl, apiKey: "AIza-test-key", model: "gemini-3.8-flash", messages });
+    const text = await response.text();
+    assert.match(text, /"Hel"/);
+    assert.equal(calls[0].url, "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions");
+    assert.equal(calls[0].headers.Authorization, "Bearer AIza-test-key");
+    assert.equal(calls[0].body.model, "gemini-3.8-flash");
+    assert.equal(calls[0].body.stream, false);
+    assert.equal(calls[1].body.stream, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("Google Gemini invalid keys and free-tier quota errors stay actionable", async () => {
+  const originalFetch = globalThis.fetch;
+  let status = 400;
+  let payload = { error: { status: "INVALID_ARGUMENT", message: "API key not valid. Please pass a valid API key." } };
+  globalThis.fetch = async () => new Response(JSON.stringify(payload), {
+    status,
+    headers: { "Content-Type": "application/json" }
+  });
+  try {
+    await assert.rejects(
+      () => testProviderConnection({
+        baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
+        apiKey: "AIza-bad-key",
+        providerType: "openai_compatible"
+      }),
+      error => error instanceof ProviderError && error.code === "invalid_api_key" && error.status === 401
+    );
+    status = 429;
+    payload = { error: { status: "RESOURCE_EXHAUSTED", message: "Quota exceeded for quota metric 'Generate requests per day per project per model-free-tier'." } };
+    await assert.rejects(
+      () => chatCompletion({
+        baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
+        apiKey: "AIza-test-key",
+        model: "gemini-3.8-flash",
+        messages: [{ role: "user", content: "Hi" }]
+      }),
+      error => error instanceof ProviderError
+        && error.code === "free_quota_exhausted"
+        && error.status === 429
+        && /midnight Pacific/.test(error.message)
+        && /per Google Cloud project/.test(error.message)
+    );
+    status = 403;
+    payload = { error: { status: "PERMISSION_DENIED", message: "User location is not supported for the API use." } };
+    await assert.rejects(
+      () => chatCompletion({
+        baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
+        apiKey: "AIza-test-key",
+        model: "gemini-3.8-flash",
+        messages: [{ role: "user", content: "Hi" }]
+      }),
+      error => error instanceof ProviderError
+        && error.code === "region_restricted"
+        && error.status === 403
+        && /EEA, Switzerland, or the UK/.test(error.message)
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });

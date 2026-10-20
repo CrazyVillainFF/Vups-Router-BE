@@ -85,6 +85,8 @@ function testStatusFor(error) {
   if (error.code === "model_unavailable") return "model_unavailable";
   if (error.code === "free_tier_client_only") return "restricted";
   if (error.code === "unsupported_protocol") return "unsupported";
+  if (error.code === "free_quota_exhausted") return "quota_exhausted";
+  if (error.code === "region_restricted") return "region_restricted";
   if (error.code === "timeout") return "timeout";
   if (error.code === "network_error" || error.code === "dns_error" || error.code === "connection_refused") return "unreachable";
   if (error.code === "local_endpoint" || error.code === "private_endpoint") return "unreachable";
