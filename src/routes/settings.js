@@ -233,6 +233,10 @@ function savedModelRows(config) {
     shared: false,
     saved: true,
     vision: null,
+    capabilities: null,
+    contextLength: null,
+    maxOutputTokens: null,
+    free: null,
     ...(zen ? { free: isOpenCodeZenFreeModel(id), restrictedProvider: isOpenCodeZenFreeModel(id) } : {})
   }));
 }
@@ -751,7 +755,17 @@ router.get("/models", async (req, res, next) => {
     const sharedEntries = shared.available
       ? sharedModels
           .filter(model => model.available !== false)
-          .map(model => ({ id: model.id, name: model.name || model.id, ownedBy: SHARED_OWNER_LABEL, shared: true, vision: model.vision === true }))
+          .map(model => ({
+            id: model.id,
+            name: model.name || model.id,
+            ownedBy: SHARED_OWNER_LABEL,
+            shared: true,
+            free: true,
+            vision: model.vision === true,
+            capabilities: model.capabilities ?? null,
+            contextLength: model.contextLength ?? model.capabilities?.contextLength ?? null,
+            maxOutputTokens: model.maxOutputTokens ?? model.capabilities?.maxOutputTokens ?? null
+          }))
       : [];
     const sharedIds = new Set(sharedEntries.map(entry => entry.id));
     const omnirouteEntries = omnirouteModelRows(omniroute).filter(entry => !sharedIds.has(entry.id));
@@ -785,7 +799,7 @@ router.get("/models", async (req, res, next) => {
           ...model,
           name: model.name || model.id,
           shared: false,
-          vision: null,
+          vision: model.vision === true ? true : model.vision === false ? false : null,
           saved: false,
           provider: stored.provider,
           providerId: stored.providerId,
@@ -846,7 +860,7 @@ router.get("/models", async (req, res, next) => {
             ...model,
             name: model.name || model.id,
             shared: false,
-            vision: null,
+            vision: model.vision === true ? true : model.vision === false ? false : null,
             saved: false,
             provider: active.provider,
             providerId: active.providerId,

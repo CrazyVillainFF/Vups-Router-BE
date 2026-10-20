@@ -42,12 +42,19 @@ function originPatternToRegExp(pattern) {
 }
 
 function currentOriginPolicy() {
-  const configured = [process.env.CLIENT_ORIGIN, process.env.CLIENT_ORIGINS]
+  const configured = [
+    process.env.CLIENT_ORIGIN,
+    process.env.CLIENT_ORIGINS,
+    process.env.FRONTEND_ORIGIN,
+    process.env.FRONTEND_ORIGINS
+  ]
     .filter(Boolean)
     .flatMap(value => value.split(","))
     .map(origin => origin.trim().replace(/\/+$/, ""))
     .filter(Boolean);
-  const patterns = (process.env.CLIENT_ORIGIN_PATTERNS || "")
+  const patterns = [process.env.CLIENT_ORIGIN_PATTERNS, process.env.FRONTEND_ORIGIN_PATTERNS]
+    .filter(Boolean)
+    .join(",")
     .split(",")
     .map(value => value.trim().replace(/\/+$/, ""))
     .filter(value => value.includes("*"))

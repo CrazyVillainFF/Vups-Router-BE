@@ -544,7 +544,13 @@ test("Google Gemini model discovery uses the native catalogue and x-goog-api-key
     calls.push({ url: String(url), headers: options.headers });
     return new Response(JSON.stringify({
       models: [
-        { name: "models/gemini-3.8-flash", supportedGenerationMethods: ["generateContent", "streamGenerateContent"] },
+        {
+          name: "models/gemini-3.8-flash",
+          supportedGenerationMethods: ["generateContent", "streamGenerateContent"],
+          inputModalities: ["TEXT", "IMAGE"],
+          inputTokenLimit: 1048576,
+          outputTokenLimit: 65536
+        },
         { name: "models/gemini-3.5-flash-lite", supportedGenerationMethods: ["generateContent"] },
         { name: "models/gemini-embedding-2", supportedGenerationMethods: ["embedContent"] },
         { name: "models/imagen-4", supportedGenerationMethods: ["generateContent"] },
@@ -559,6 +565,9 @@ test("Google Gemini model discovery uses the native catalogue and x-goog-api-key
       providerType: "openai_compatible"
     });
     assert.deepEqual(models.map(entry => entry.id), ["gemini-3.8-flash", "gemini-3.5-flash-lite"]);
+    assert.equal(models[0].vision, true);
+    assert.equal(models[0].capabilities.contextLength, 1048576);
+    assert.equal(models[0].capabilities.maxOutputTokens, 65536);
     assert.equal(calls.length, 1);
     assert.equal(calls[0].url, "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000");
     assert.equal(calls[0].headers["x-goog-api-key"], "AIza-test-key");

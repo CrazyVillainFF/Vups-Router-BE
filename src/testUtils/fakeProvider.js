@@ -32,6 +32,8 @@ export async function startFakeProvider() {
       chatStatus: 200,
       chatStatusText: "",
       failStreamMidway: false,
+      failModel: null,
+      failModelStatus: 404,
       invalidKey: false,
       finishReason: "stop",
       usageChunk: false,
@@ -47,6 +49,8 @@ export async function startFakeProvider() {
       state.behavior.chatStatus = 200;
       state.behavior.chatStatusText = "";
       state.behavior.failStreamMidway = false;
+      state.behavior.failModel = null;
+      state.behavior.failModelStatus = 404;
       state.behavior.invalidKey = false;
       state.behavior.finishReason = "stop";
       state.behavior.usageChunk = false;
@@ -65,7 +69,18 @@ export async function startFakeProvider() {
       if (state.behavior.listStatus !== 200) {
         return json(res, state.behavior.listStatus, { error: { message: `Listing rejected with ${state.behavior.listStatus}` } });
       }
-      return json(res, 200, { data: FAKE_MODELS.map(id => ({ id, owned_by: "fake" })) });
+      return json(res, 200, {
+        data: FAKE_MODELS.map(id => ({
+          id,
+          name: id,
+          owned_by: "fake",
+          pricing: { prompt: "0", completion: "0", request: "0" },
+          architecture: { output_modalities: ["text"], modality: "text->text" },
+          supported_parameters: id === "fake-model-reasoning" ? ["tools", "reasoning"] : ["tools"],
+          context_length: 32768,
+          top_provider: { max_completion_tokens: 4096 }
+        }))
+      });
     }
 
     if (url.pathname.endsWith("/chat/completions") && req.method === "POST") {
@@ -73,6 +88,11 @@ export async function startFakeProvider() {
       state.chatRequests.push({ key, body });
       if (key !== FAKE_API_KEY || state.behavior.invalidKey) {
         return json(res, 401, { error: { message: "Invalid API key provided." } });
+      }
+      if (state.behavior.failModel && body.model === state.behavior.failModel) {
+        return json(res, state.behavior.failModelStatus, {
+          error: { message: `The model \`${body.model}\` is temporarily unavailable.` }
+        });
       }
       if (state.behavior.chatStatus !== 200) {
         if (state.behavior.chatStatus === 429) {

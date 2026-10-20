@@ -62,7 +62,11 @@ function validateMessages(value) {
 const SHARED_UNAVAILABLE_MESSAGES = {
   not_configured: "The shared AI model is not configured on this server. Configure your own provider in API settings.",
   unreachable: "The shared AI model server is unreachable right now. Please try again later or use your own provider.",
-  missing_model: "The shared model is not installed on the shared server. Please try again later or use your own provider."
+  unauthorized: "The shared free-model catalog rejected this server's OpenRouter key. Ask the administrator to verify OPENROUTER_API_KEY.",
+  rate_limited: "The shared free-model catalog is rate-limited right now. Please try again later or use your own provider.",
+  empty: "The shared free-model catalog returned no usable models. Please try again later or use your own provider.",
+  invalid_response: "The shared free-model catalog returned an invalid response. Please try again later or use your own provider.",
+  missing_model: "The shared model is not installed or is not available from the free catalog. Please try again later or use your own provider."
 };
 
 function sharedModelsOf(shared) {
@@ -98,26 +102,33 @@ function sharedRoute(shared, requestedModel = "") {
       "shared_unavailable"
     );
   }
+  const offeredIds = readyIds.slice(0, 20).join(", ");
+  const offeredSuffix = readyIds.length > 20 ? ` (and ${readyIds.length - 20} more)` : "";
   let model;
   if (requestedModel) {
     if (readyIds.includes(requestedModel)) {
       model = requestedModel;
     } else if (enabledModels.some(entry => entry.id === requestedModel)) {
       throw new ProviderError(
-        `That shared model is not available right now. Pick another shared model (${readyIds.join(", ")}) or try again later.`,
+        `That shared model is not available right now. Pick another shared model (${offeredIds}${offeredSuffix}) or try again later.`,
         503,
         "shared_model_unavailable"
       );
     } else {
       throw new ProviderError(
-        `"${requestedModel.slice(0, 80)}" is not an enabled shared model. Choose one of: ${readyIds.join(", ")}.`,
+        `"${requestedModel.slice(0, 80)}" is not an enabled shared model. Choose one of: ${offeredIds}${offeredSuffix}.`,
         400,
         "invalid_model"
       );
     }
   } else {
-    model = readyIds[0];
+    model = shared.model && readyIds.includes(shared.model) ? shared.model : readyIds[0];
   }
+  const configuredFallback =
+    shared.fallbackModel && shared.fallbackModel !== model && readyIds.includes(shared.fallbackModel)
+      ? shared.fallbackModel
+      : null;
+  const fallbackModel = configuredFallback || readyIds.find(id => id !== model) || null;
   const visionModelIds = enabledModels
     .filter(entry => entry.available !== false && entry.vision === true)
     .map(entry => entry.id);
@@ -128,6 +139,7 @@ function sharedRoute(shared, requestedModel = "") {
     baseUrl: provider.baseUrl,
     apiKey: provider.apiKey,
     defaultModel: model,
+    fallbackModel,
     maxTokens: provider.maxTokens,
     visionModelIds
   };
@@ -401,6 +413,17 @@ function logProviderFailure(provider, error) {
   );
 }
 
+function canTrySharedFallback(provider, error) {
+  if (!provider?.shared || !provider.fallbackModel) return false;
+  if (!["model_unavailable", "not_found", "rate_limited", "timeout", "network_error", "provider_unavailable", "empty_response", "empty_stream"].includes(error?.code)) {
+    return false;
+  }
+  if (error.code === "rate_limited" && /free-models-per-day|per.day|daily|credits|balance/i.test(String(error.message || ""))) {
+    return false;
+  }
+  return true;
+}
+
 router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
   try {
     const body = req.body || {};
@@ -467,25 +490,71 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
 
     if (!stream) {
       let result;
-      try {
-        result = await chatCompletion(
-          { baseUrl: provider.baseUrl, apiKey: provider.apiKey, providerType: provider.providerType, model, messages: upstreamMessages, temperature, maxTokens: provider.maxTokens },
-          undefined
-        );
-      } catch (error) {
-        if (error instanceof ProviderError) {
+      let usedModel = model;
+      let fallbackUsed = false;
+      while (true) {
+        try {
+          result = await chatCompletion(
+            { baseUrl: provider.baseUrl, apiKey: provider.apiKey, providerType: provider.providerType, model: usedModel, messages: upstreamMessages, temperature, maxTokens: provider.maxTokens },
+            undefined
+          );
+          break;
+        } catch (error) {
+          if (!(error instanceof ProviderError)) throw error;
           logProviderFailure(provider, error);
+          if (!fallbackUsed && canTrySharedFallback(provider, error)) {
+            fallbackUsed = true;
+            usedModel = provider.fallbackModel;
+            continue;
+          }
           const failure = providerFailure(provider, error);
           return res.status(failure.status).json({ message: failure.message, code: failure.code });
         }
-        throw error;
       }
       const conversation = await persistConversation(req.userId, conversationId, validated.messages, result.content);
       return res.json({
         conversationId: String(conversation._id),
         message: { role: "assistant", content: result.content },
-        finishReason: result.finishReason
+        finishReason: result.finishReason,
+        ...(fallbackUsed ? { model: usedModel, fallbackUsed: true } : {})
       });
+    }
+
+    let existingConversation = null;
+    if (conversationId && mongoose.isValidObjectId(conversationId)) {
+      existingConversation = await Conversation.findOne({ _id: conversationId, userId: req.userId }).select("_id");
+    }
+    const prospectiveId = existingConversation ? String(existingConversation._id) : String(new mongoose.Types.ObjectId());
+
+    const controller = new AbortController();
+    res.on("close", () => {
+      if (!res.writableEnded) controller.abort();
+    });
+
+    let upstream;
+    let usedModel = model;
+    let fallbackUsed = false;
+    while (true) {
+      try {
+        upstream = await startChatCompletionStream(
+          { baseUrl: provider.baseUrl, apiKey: provider.apiKey, providerType: provider.providerType, model: usedModel, messages: upstreamMessages, temperature, maxTokens: provider.maxTokens },
+          controller.signal
+        );
+        break;
+      } catch (error) {
+        if (controller.signal.aborted) return;
+        if (error instanceof ProviderError) {
+          logProviderFailure(provider, error);
+          if (!fallbackUsed && canTrySharedFallback(provider, error)) {
+            fallbackUsed = true;
+            usedModel = provider.fallbackModel;
+            continue;
+          }
+          const failure = providerFailure(provider, error);
+          return res.status(failure.status).json({ message: failure.message, code: failure.code });
+        }
+        return next(error);
+      }
     }
 
     res.status(200);
@@ -494,33 +563,11 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
     res.setHeader("Connection", "keep-alive");
     res.setHeader("X-Accel-Buffering", "no");
     if (typeof res.flushHeaders === "function") res.flushHeaders();
-
-    let existingConversation = null;
-    if (conversationId && mongoose.isValidObjectId(conversationId)) {
-      existingConversation = await Conversation.findOne({ _id: conversationId, userId: req.userId }).select("_id");
-    }
-    const prospectiveId = existingConversation ? String(existingConversation._id) : String(new mongoose.Types.ObjectId());
-    sendEvent(res, { type: "meta", conversationId: prospectiveId });
-
-    const controller = new AbortController();
-    res.on("close", () => {
-      if (!res.writableEnded) controller.abort();
+    sendEvent(res, {
+      type: "meta",
+      conversationId: prospectiveId,
+      ...(fallbackUsed ? { model: usedModel, fallbackUsed: true } : {})
     });
-
-    let upstream;
-    try {
-      upstream = await startChatCompletionStream(
-        { baseUrl: provider.baseUrl, apiKey: provider.apiKey, providerType: provider.providerType, model, messages: upstreamMessages, temperature, maxTokens: provider.maxTokens },
-        controller.signal
-      );
-    } catch (error) {
-      const failure = error instanceof ProviderError ? providerFailure(provider, error) : null;
-      if (error instanceof ProviderError) logProviderFailure(provider, error);
-      const message = failure ? failure.message : "Could not reach the provider.";
-      if (!controller.signal.aborted) sendEvent(res, { type: "error", message, ...(failure ? { code: failure.code } : {}) });
-      if (!res.writableEnded) res.end();
-      return;
-    }
 
     const reader = upstream.body.getReader();
     const decoder = new TextDecoder();

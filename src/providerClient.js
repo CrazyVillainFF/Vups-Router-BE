@@ -1,5 +1,6 @@
 import dns from "node:dns/promises";
 import { imageDataUrl } from "./chatImages.js";
+import { freeFromPricing, geminiCapabilities, normalizeCapabilities, visionFromCapabilities } from "./modelCapabilities.js";
 
 function envMillis(name, fallback) {
   const value = Number(process.env[name]);
@@ -704,7 +705,15 @@ export async function listProviderModels({ baseUrl, apiKey, providerType = "open
         const methods = Array.isArray(entry?.supportedGenerationMethods) ? entry.supportedGenerationMethods : null;
         if (methods && !methods.includes("generateContent")) return null;
         if (isGoogleNonChatModel(id)) return null;
-        return { id, ownedBy: "Google Gemini", vision: true };
+        const capabilities = geminiCapabilities(entry, id);
+        return {
+          id,
+          ownedBy: "Google Gemini",
+          vision: visionFromCapabilities(capabilities),
+          capabilities,
+          contextLength: capabilities.contextLength ?? null,
+          maxOutputTokens: capabilities.maxOutputTokens ?? null
+        };
       })
       .filter(Boolean)
       .slice(0, 1000);
@@ -723,9 +732,16 @@ export async function listProviderModels({ baseUrl, apiKey, providerType = "open
     .map(entry => {
       const id = typeof entry?.id === "string" ? entry.id : typeof entry?.name === "string" ? entry.name : null;
       if (!id) return null;
+      const capabilities = normalizeCapabilities(entry);
+      const free = freeFromPricing(entry);
       return {
         id,
         ownedBy: typeof entry?.owned_by === "string" ? entry.owned_by : typeof entry?.display_name === "string" ? entry.display_name : undefined,
+        vision: visionFromCapabilities(capabilities),
+        capabilities,
+        contextLength: capabilities.contextLength ?? null,
+        maxOutputTokens: capabilities.maxOutputTokens ?? null,
+        ...(free !== null ? { free } : {}),
         ...(zen ? { free: isOpenCodeZenFreeModel(id), restrictedProvider: isOpenCodeZenFreeModel(id) } : {})
       };
     })

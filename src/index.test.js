@@ -13,6 +13,7 @@ const mongod = await MongoMemoryServer.create();
 process.env.MONGODB_URI = mongod.getUri("vupsrouter_test");
 
 const { default: app } = await import("./index.js");
+const { resetOpenRouterCache } = await import("./openrouter.js");
 const { default: mongoose } = await import("mongoose");
 const { startFakeProvider, FAKE_API_KEY, FAKE_MODELS } = await import("./testUtils/fakeProvider.js");
 const fakeProvider = await startFakeProvider();
@@ -23,6 +24,9 @@ process.env.OLLAMA_MODEL = FAKE_OLLAMA_MODEL;
 delete process.env.OPENROUTER_API_KEY;
 delete process.env.OPENROUTER_BASE_URL;
 delete process.env.OPENROUTER_MODEL;
+delete process.env.OPENROUTER_DEFAULT_MODEL;
+delete process.env.OPENROUTER_FALLBACK_MODEL;
+delete process.env.OPENROUTER_MODELS;
 
 const server = app.listen(0, "127.0.0.1");
 await new Promise(resolve => server.once("listening", resolve));
@@ -284,7 +288,7 @@ test("provider config starts empty and saves encrypted keys without echoing them
   assert.doesNotMatch(JSON.stringify(fetched.body), new RegExp(FAKE_API_KEY));
 
   const stored = await mongoose.connection.db.collection("providerconfigs").findOne({});
-  assert.ok(stored.encryptedApiKey.startsWith("v1:"));
+  assert.ok(stored.encryptedApiKey.startsWith("v2:"));
   assert.doesNotMatch(stored.encryptedApiKey, new RegExp(FAKE_API_KEY));
 });
 
@@ -1134,7 +1138,9 @@ async function withOpenRouterEnv(overrides, fn) {
     OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY,
     OPENROUTER_BASE_URL: process.env.OPENROUTER_BASE_URL,
     OPENROUTER_MODEL: process.env.OPENROUTER_MODEL,
-    OPENROUTER_MODELS: process.env.OPENROUTER_MODELS
+    OPENROUTER_MODELS: process.env.OPENROUTER_MODELS,
+    OPENROUTER_DEFAULT_MODEL: process.env.OPENROUTER_DEFAULT_MODEL,
+    OPENROUTER_FALLBACK_MODEL: process.env.OPENROUTER_FALLBACK_MODEL
   };
   const apply = (name, value) => {
     if (value === undefined) delete process.env[name];
@@ -1144,6 +1150,9 @@ async function withOpenRouterEnv(overrides, fn) {
   apply("OPENROUTER_BASE_URL", overrides.baseUrl);
   apply("OPENROUTER_MODEL", overrides.model);
   apply("OPENROUTER_MODELS", overrides.models);
+  apply("OPENROUTER_DEFAULT_MODEL", overrides.defaultModel);
+  apply("OPENROUTER_FALLBACK_MODEL", overrides.fallbackModel);
+  resetOpenRouterCache();
   try {
     return await fn();
   } finally {
@@ -1151,6 +1160,7 @@ async function withOpenRouterEnv(overrides, fn) {
       if (value === undefined) delete process.env[name];
       else process.env[name] = value;
     }
+    resetOpenRouterCache();
     fakeProvider.state.reset();
   }
 }
@@ -1187,6 +1197,69 @@ test("OpenRouter becomes the shared model when OPENROUTER_API_KEY is configured"
   });
 });
 
+test("a failed shared model retries the configured free fallback exactly once", async () => {
+  await withOpenRouterEnv(
+    {
+      apiKey: FAKE_API_KEY,
+      baseUrl: fakeProvider.baseUrl,
+      model: "fake-model-mini",
+      fallbackModel: "fake-model-pro",
+      models: "fake-model-mini,fake-model-pro"
+    },
+    async () => {
+      const { cookie } = await signupUser();
+      fakeProvider.state.set({ failModel: "fake-model-mini", failModelStatus: 404 });
+      const chat = await api("/api/chat", {
+        method: "POST",
+        cookie,
+        body: { stream: false, messages: [{ role: "user", content: "fallback please" }] }
+      });
+      assert.equal(chat.status, 200);
+      assert.equal(chat.body.fallbackUsed, true);
+      assert.equal(chat.body.model, "fake-model-pro");
+      assert.match(chat.body.message.content, /Echo from fake-model-pro/);
+      assert.deepEqual(
+        fakeProvider.state.chatRequests.map(request => request.body.model),
+        ["fake-model-mini", "fake-model-pro"]
+      );
+    }
+  );
+});
+
+test("a shared stream falls back before headers are sent and reports the fallback model", async () => {
+  await withOpenRouterEnv(
+    {
+      apiKey: FAKE_API_KEY,
+      baseUrl: fakeProvider.baseUrl,
+      model: "fake-model-mini",
+      fallbackModel: "fake-model-pro",
+      models: "fake-model-mini,fake-model-pro"
+    },
+    async () => {
+      const { cookie } = await signupUser();
+      fakeProvider.state.set({ failModel: "fake-model-mini", failModelStatus: 503 });
+      const response = await fetch(`${baseURL}/api/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: cookie },
+        body: JSON.stringify({ stream: true, messages: [{ role: "user", content: "stream fallback" }] })
+      });
+      assert.equal(response.status, 200);
+      const text = await response.text();
+      const events = text
+        .split("\n")
+        .filter(line => line.startsWith("data: "))
+        .map(line => JSON.parse(line.slice(6)));
+      assert.equal(events.some(event => event.type === "error"), false);
+      assert.equal(events.find(event => event.type === "meta")?.fallbackUsed, true);
+      assert.equal(events.filter(event => event.type === "delta").map(event => event.content).join(""), "Hello from fake-model-pro!");
+      assert.deepEqual(
+        fakeProvider.state.chatRequests.map(request => request.body.model),
+        ["fake-model-mini", "fake-model-pro"]
+      );
+    }
+  );
+});
+
 test("OpenRouter quota exhaustion is handled safely with a clear 429", async () => {
   await withOpenRouterEnv({ apiKey: FAKE_API_KEY, baseUrl: fakeProvider.baseUrl, model: "fake-model-pro" }, async () => {
     const { cookie } = await signupUser();
@@ -1201,6 +1274,7 @@ test("OpenRouter quota exhaustion is handled safely with a clear 429", async () 
     assert.match(rateLimited.body.message, /another shared model/i);
     assert.ok(!/fake|rate limit reached/i.test(rateLimited.body.message), "raw provider quota text must not leak");
 
+    fakeProvider.state.reset();
     fakeProvider.state.set({
       chatStatus: 429,
       chatStatusText: "Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day"
@@ -1214,7 +1288,9 @@ test("OpenRouter quota exhaustion is handled safely with a clear 429", async () 
     assert.equal(accountWide.body.code, "shared_quota_exhausted");
     assert.match(accountWide.body.message, /switching models will not help/i);
     assert.ok(!/free-models-per-day|credits/i.test(accountWide.body.message), "raw provider quota text must not leak");
+    assert.equal(fakeProvider.state.chatRequests.length, 1, "account-wide quota failures must not retry another model");
 
+    fakeProvider.state.reset();
     fakeProvider.state.set({ chatStatus: 402, chatStatusText: "" });
     const credits = await api("/api/chat", {
       method: "POST",
@@ -1223,6 +1299,7 @@ test("OpenRouter quota exhaustion is handled safely with a clear 429", async () 
     });
     assert.equal(credits.status, 429);
     assert.equal(credits.body.code, "shared_quota_exhausted");
+    assert.equal(fakeProvider.state.chatRequests.length, 1, "credit exhaustion must not retry another model");
   });
 });
 
@@ -1321,6 +1398,7 @@ test("OpenRouter server-side key problems never leak details to users", async ()
     assert.equal(chat.status, 503);
     assert.equal(chat.body.code, "shared_unavailable");
     assert.ok(!/your api key|check the key/i.test(chat.body.message), "shared key failures must not tell users to check a nonexistent personal key");
+    assert.equal(fakeProvider.state.chatRequests.length, 1, "invalid shared credentials must not trigger a model retry");
   });
 });
 
@@ -1343,7 +1421,12 @@ test("an unreachable OpenRouter server is reported as unreachable", async () => 
 });
 
 test("a missing OpenRouter model is reported instead of pretending it is available", async () => {
-  await withOpenRouterEnv({ apiKey: FAKE_API_KEY, baseUrl: fakeProvider.baseUrl, model: "fake-model-does-not-exist" }, async () => {
+  await withOpenRouterEnv({
+    apiKey: FAKE_API_KEY,
+    baseUrl: fakeProvider.baseUrl,
+    model: "fake-model-does-not-exist",
+    models: "fake-model-does-not-exist"
+  }, async () => {
     const { cookie } = await signupUser();
     const status = await api("/api/settings/shared-model", { cookie });
     assert.equal(status.body.shared.status, "missing_model");
@@ -1440,6 +1523,15 @@ test("CORS allows Vite preview origins and pattern-configured Vercel aliases", a
   const preview = await api("/api/auth/me", { headers: { Origin: "http://localhost:4173" } });
   assert.equal(preview.headers.get("access-control-allow-origin"), "http://localhost:4173");
   assert.equal(preview.headers.get("access-control-allow-credentials"), "true");
+
+  process.env.FRONTEND_ORIGIN = "https://frontend.example.com";
+  try {
+    const alias = await api("/api/auth/me", { headers: { Origin: "https://frontend.example.com" } });
+    assert.equal(alias.status, 401);
+    assert.equal(alias.headers.get("access-control-allow-origin"), "https://frontend.example.com");
+  } finally {
+    delete process.env.FRONTEND_ORIGIN;
+  }
 
   process.env.CLIENT_ORIGIN_PATTERNS = "https://vups-router-*-vishnu-4571.vercel.app";
   try {

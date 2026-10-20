@@ -18,10 +18,11 @@ Create `server/.env` from `.env.example` and fill in the real values:
 | Variable | Required | Purpose |
 | --- | --- | --- |
 | `PORT` | no (default 4000) | HTTP port |
-| `CLIENT_ORIGIN` / `CLIENT_ORIGINS` | yes | Allowed frontend origins (comma-separated, no trailing slash) |
+| `CLIENT_ORIGIN` / `CLIENT_ORIGINS` / `FRONTEND_ORIGIN` / `FRONTEND_ORIGINS` | yes | Allowed frontend origins (comma-separated, no trailing slash). `CLIENT_*` and `FRONTEND_*` names are equivalent. |
 | `MONGODB_URI` | yes | MongoDB connection string |
 | `JWT_SECRET` | yes | Session token signing secret, >= 32 random characters |
 | `ENCRYPTION_SECRET` | yes | AES-256-GCM key for encrypting user provider API keys, >= 32 random characters |
+| `ENCRYPTION_SECRET_PREVIOUS` | rotation only | comma-separated previous encryption key(s), read during controlled rotation |
 | `AI_DAILY_QUOTA` | no (default 100) | Per-user daily AI request quota (resets midnight UTC) |
 | `AI_MAX_CONCURRENCY` | no (default 3) | Max simultaneous AI requests per user |
 | `ADMIN_EMAILS` | no | Comma-separated account emails allowed to call `/api/admin/*` |
@@ -161,8 +162,8 @@ Origin variables (Render → Environment; the server re-reads them on every requ
 
 | Variable | Meaning |
 | --- | --- |
-| `CLIENT_ORIGIN`, `CLIENT_ORIGINS` | exact origins, comma-separated, no trailing slash |
-| `CLIENT_ORIGIN_PATTERNS` | wildcard origins, comma-separated; `*` matches one hostname label (`a-z`, `0-9`, `-`), e.g. `https://vups-router-*-vishnu-4571.vercel.app` covers both the branch and deployment URLs of that project |
+| `CLIENT_ORIGIN`, `CLIENT_ORIGINS`, `FRONTEND_ORIGIN`, `FRONTEND_ORIGINS` | exact origins, comma-separated, no trailing slash; both prefix families are accepted and merged |
+| `CLIENT_ORIGIN_PATTERNS`, `FRONTEND_ORIGIN_PATTERNS` | wildcard origins, comma-separated; `*` matches one hostname label (`a-z`, `0-9`, `-`), e.g. `https://vups-router-*-vishnu-4571.vercel.app` covers both the branch and deployment URLs of that project |
 
 Built-in defaults already include `http://localhost:5173`, `http://127.0.0.1:5173` (dev), `http://localhost:4173`, `http://127.0.0.1:4173` (vite preview), and `https://vups-router-three.vercel.app`.
 
@@ -182,23 +183,41 @@ Verify after deploy: `curl https://vups-router-be.onrender.com/api/health` shoul
 
 If `/api/health` returns `"reason":"timeout"` from Render, it is almost always Atlas Network Access, not an application bug.
 
-Security: if a `.env` file was ever committed to this repo (it was, in the initial commit), rotate `JWT_SECRET` and `ENCRYPTION_SECRET` so the exposed values can no longer be used.
+Security: if a `.env` file was ever committed to this repo (it was, in the initial commit), rotate `JWT_SECRET` so the exposed session-signing value can no longer be used. Do not rotate `ENCRYPTION_SECRET` blindly: it decrypts every saved provider key. Use the key-rotation procedure below if that value was exposed.
+
+### Provider-key encryption rotation
+
+New secrets are stored as `v2:<key-id>:<iv>:<tag>:<ciphertext>` with AES-256-GCM. `ENCRYPTION_SECRET_PREVIOUS` is a comma-separated read-only keyring for migration, so old records remain usable while new writes move to the current key.
+
+1. Back up the `providerconfigs` collection, or take an Atlas snapshot.
+2. Set the new `ENCRYPTION_SECRET`, and set `ENCRYPTION_SECRET_PREVIOUS` to the old value.
+3. Run `npm run rotate-provider-keys` to see how many records need migration (dry run, no writes).
+4. Run `npm run rotate-provider-keys -- --apply`.
+5. Verify sign-in and a saved provider, then remove `ENCRYPTION_SECRET_PREVIOUS`.
+
+Rollback: restore the collection backup and set `ENCRYPTION_SECRET` back to the old value. Records that were already migrated are only readable with the new value, so a rollback of the secret alone is not sufficient after step 4.
 
 ## OpenRouter shared model (production)
 
-When `OPENROUTER_API_KEY` is set, every registered user — including brand-new accounts — gets shared OpenRouter models with no personal key. Up to four free models are offered in the in-chat model menu under "Shared · Free"; OpenRouter takes precedence over the Ollama shared model (below); if no OpenRouter key is set, the Ollama shared model is used.
+When `OPENROUTER_API_KEY` is set, every registered user — including brand-new accounts — gets shared OpenRouter models with no personal key. The backend refreshes `GET /api/v1/models` every five minutes and offers every model whose `pricing.prompt` and `pricing.completion` are both zero and whose metadata advertises text output. It never assumes a `:free` suffix means free, never treats missing pricing as free, and never switches to a paid model. An explicit `OPENROUTER_MODELS` allowlist is optional; when set, only those IDs are eligible and paid/missing IDs remain visible but unavailable.
 
-Verified live: the enabled free models answer real chat completions through this backend. The backend checks `GET /api/v1/models` and only lists models that are currently available; if the configured default is missing, status is `missing_model` / `unreachable`, and chat is blocked with a clear error instead of pretending to work. Enabled-but-unavailable models are rejected with `shared_model_unavailable` and the error names an available alternative.
+The in-chat model menu groups these rows under "FREE MODELS", shows capability badges, and provides search across model names, providers, tags, and capabilities. OpenRouter takes precedence over the Ollama shared model (below); if no OpenRouter key is set, the Ollama shared model is used.
 
-Note (live-testing history): `google/gemma-4-31b-it:free` is kept in the default set. Its upstream provider (Google AI Studio) has intermittently returned `429 temporarily rate-limited upstream` on chat probes while the rest of the catalog stayed healthy — that is a provider-side throttle reported honestly to users (`shared_model_rate_limited` with retry guidance), not an invalid model ID and not a reason to disable the model. `nvidia/nemotron-3-ultra-550b-a55b:free` remains available for operators to add via `OPENROUTER_MODELS`. Re-run `scripts/verify-openrouter.mjs` after any model-list change.
+Catalog results are cached in memory (`OPENROUTER_CATALOG_TTL_MS`, default five minutes). On a transient refresh failure the last catalog is served for up to `OPENROUTER_CATALOG_STALE_MS` (default 24 hours) and marked stale; a rejected server key (`401`/`403`) is reported as `unauthorized` instead of serving stale models. A configured default that disappears is replaced by the first currently free model, and `defaultUnavailable` is reported. If no free chat model is available, shared chat is blocked with a clear error rather than pretending to work.
+
+Shared chat tries the selected model once, then the configured fallback once, but only for model-availability or transient failures (`not_found`, `model_unavailable`, model-specific `rate_limited`, timeouts, network/provider outages, empty responses). It never retries invalid credentials, permission failures, malformed requests, account-wide free-quota exhaustion, or insufficient credits, and never falls back to a paid model. Streaming fallback happens before any SSE headers are sent, so clients never receive a partial answer from the failed model.
 
 Environment variables (set in the Render dashboard):
 
 | Variable | Value |
 | --- | --- |
 | `OPENROUTER_API_KEY` | your OpenRouter key (`sk-or-v1-...`). Server-side only; never commit it and never send it to the frontend. |
-| `OPENROUTER_MODELS` | comma-separated list of enabled shared model IDs. Defaults to `nvidia/nemotron-3.5-lightning:free,nvidia/nemotron-3-super-120b-a12b:free,cohere/north-mini-code:free,google/gemma-4-31b-it:free`. Only these IDs are accepted from clients — anything else is rejected with `400 invalid_model` before any upstream call. |
-| `OPENROUTER_MODEL` | `nvidia/nemotron-3.5-lightning:free` (default). Sets which enabled model is the default; it is automatically included in the enabled list. |
+| `OPENROUTER_MODELS` | optional comma-separated allowlist of shared model IDs. When unset, all zero-price text chat models from the live catalog are offered. Allowlisted models must still be free; paid/missing IDs are listed as unavailable and rejected before any upstream call. |
+| `OPENROUTER_DEFAULT_MODEL` | preferred default free model. Falls back to the first currently free chat model when missing. |
+| `OPENROUTER_FALLBACK_MODEL` | preferred fallback free model. Falls back to the first different available free model. |
+| `OPENROUTER_MODEL` | legacy alias for `OPENROUTER_DEFAULT_MODEL`; `OPENROUTER_DEFAULT_MODEL` wins when both are set. |
+| `OPENROUTER_CATALOG_TTL_MS` | catalog cache lifetime in milliseconds; default `300000` (five minutes). |
+| `OPENROUTER_CATALOG_STALE_MS` | maximum age of a cached catalog served during transient failures; default `86400000` (24 hours). |
 | `OPENROUTER_MAX_OUTPUT_TOKENS` | `4096` (default) — maximum output tokens per shared reply. Clamped server-side to 8192. |
 | `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` (default; override only for testing). |
 | `PROVIDER_TIMEOUT_MS` / `PROVIDER_STREAM_TIMEOUT_MS` | `60000` / `300000` (defaults) — upstream timeouts, both personal and shared providers. |
@@ -210,8 +229,10 @@ Behavior and safety:
 - Rate limits are distinguished: a model-specific rate limit returns `429 {"code":"shared_model_rate_limited"}` ("pick another shared model"), while account-wide free-quota exhaustion (OpenRouter `free-models-per-day` text or HTTP 402) returns `429 {"code":"shared_quota_exhausted"}` and explicitly says switching models will not help. Upstream key problems (401/403) map to `503 {"code":"shared_unavailable"}` and never instruct users to fix a personal key. No raw provider text or account details leak.
 - Free OpenRouter models are shared across the whole account (roughly 50 free requests/day for accounts with under $10 balance), so the per-user daily quota protects the shared pool.
 - Admins (`ADMIN_EMAILS`) can disable/re-enable the shared model at runtime: `POST /api/admin/shared-model {"enabled": false}`.
+- Automated tests cover zero-price filtering, missing/malformed pricing, cache refresh and stale fallback, unauthorized keys, explicit allowlists, non-streaming fallback, streaming fallback before headers, and no retries for account-wide quota failures. Live OpenRouter inference depends on the configured key, credits, and current provider availability; run the deployment check below before claiming a live success.
+- Live check on 2026-10-20: the catalog returned 20 zero-price chat models; the configured key was accepted as a free-tier key; the default (`nvidia/nemotron-3.5-lightning:free`) and fallback (`cohere/north-mini-code:free`) probes both returned `finish_reason: stop` with `OK`. This is a point-in-time result, not a guarantee of future availability.
 
-For a deploy sanity check, `node scripts/verify-openrouter.mjs` (with `OPENROUTER_API_KEY` in the environment) checks every enabled model against the live catalog and performs a minimal chat completion with each — it never prints the key and exits non-zero if any model is missing or not responding.
+For a deploy sanity check, `node scripts/verify-openrouter.mjs` (with `OPENROUTER_API_KEY` in the environment) refreshes the live catalog, verifies that selected IDs are zero-price and chat-capable, then probes up to three models (default plus fallback) with a minimal chat completion. Set `OPENROUTER_MODELS` to probe every allowlisted ID or `OPENROUTER_VERIFY_PROBE_LIMIT` to change the dynamic sample size. It never prints the key and exits non-zero on any failure.
 
 **Long responses & truncation.** The shared output limit defaults to `4096` tokens (`OPENROUTER_MAX_OUTPUT_TOKENS`, clamped server-side to `8192`). Every streaming reply forwards the provider's `finish_reason` in the final `done` SSE event (`stop`, `length`, …), plus token `usage` when the provider sends it. When a reply is cut off by the limit, the client keeps the partial answer, shows “Response reached its length limit”, and offers “Continue generating” — which asks the model to continue without repeating previous text. Code-generation prompts are instructed to split large projects into files and generate them in manageable stages.
 
@@ -390,13 +411,18 @@ Vision capability is enforced server-side:
 - Requesting images from a shared model without vision support returns `400`
   `model_no_vision` with the list of vision-capable shared models.
 
-`GET /api/settings/models` includes a `vision` flag per model (`true`/`false`
-for shared models, `null` for personal ones) so the client can warn before
-sending.
+`GET /api/settings/models` includes `vision` and a `capabilities` object per
+model. Capabilities are derived only from provider metadata: OpenRouter
+`architecture`/`supported_parameters`, Gemini token limits and modality fields,
+and equivalent declared fields from other providers. Missing metadata stays
+unknown (`null`) instead of being guessed; unknown personal models are still
+allowed to receive images and the provider's own error is surfaced. The client
+shows known capability badges and warns before sending images to a model that
+explicitly reports `vision: false`.
 
 ## Security notes
 
-- Provider API keys are encrypted with authenticated AES-256-GCM using `ENCRYPTION_SECRET` and are never returned to the client in full.
+- Provider API keys are encrypted with authenticated AES-256-GCM using `ENCRYPTION_SECRET`; ciphertexts carry a versioned key ID and are never returned to the client in full. `v2` is current, legacy `v1` records remain readable, and rotation is scripted.
 - Sessions are HTTP-only cookies; tokens are not stored in `localStorage` by the shipped client.
 - Auth endpoints are rate-limited (30 requests / 15 min / IP); chat is limited to 30 requests / min.
 - Requests are size-limited (512 kB JSON globally; `/api/chat` allows the image-attachment budget described above). Upstream JSON responses are capped at 4 MB; streamed assistant text is capped at 2 million characters. Conversation history is capped server-side. Image bytes are validated by magic bytes and never persisted.

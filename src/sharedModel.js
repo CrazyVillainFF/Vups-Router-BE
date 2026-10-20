@@ -21,6 +21,10 @@ export async function sharedModelStatus() {
       model: check.model,
       available: enabled && check.available,
       status: enabled ? check.status : "disabled",
+      fallbackModel: check.fallbackModel ?? null,
+      defaultUnavailable: check.defaultUnavailable === true,
+      freeOnly: check.freeOnly === true,
+      catalogStale: check.catalogStale === true,
       models: check.models ?? []
     };
   }
@@ -31,6 +35,10 @@ export async function sharedModelStatus() {
     model: check.model,
     available: enabled && check.available,
     status: enabled ? check.status : "disabled",
+    fallbackModel: null,
+    defaultUnavailable: false,
+    freeOnly: true,
+    catalogStale: false,
     models: [{ id: check.model, name: check.model, available: check.available, vision: ollamaVisionModels().has(check.model) }]
   };
 }

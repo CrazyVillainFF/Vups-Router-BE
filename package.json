@@ -8,7 +8,8 @@
     "dev": "nodemon src/index.js",
     "start": "node src/index.js",
     "test": "node --test",
-    "verify": "node scripts/verify-backend.mjs"
+    "verify": "node scripts/verify-backend.mjs",
+    "rotate-provider-keys": "node scripts/rotate-provider-keys.mjs"
   },
   "dependencies": {
     "bcryptjs": "^3.0.2",

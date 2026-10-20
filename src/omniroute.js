@@ -184,17 +184,22 @@ export function publicOmniRouteStatus(status) {
 
 export function omnirouteModelRows(status) {
   if (!status?.available) return [];
-  return status.models.map(model => ({
-    id: model.id,
-    name: model.name,
-    ownedBy: OMNIROUTE_OWNER_LABEL,
-    provider: OMNIROUTE_PROVIDER_LABEL,
-    source: "omniroute",
-    gateway: true,
-    shared: false,
-    saved: false,
-    vision: model.vision === true ? true : null
-  }));
+  return status.models.map(model => {
+    const capabilities = { chat: true, streaming: true };
+    if (model.vision === true) capabilities.vision = true;
+    return {
+      id: model.id,
+      name: model.name,
+      ownedBy: OMNIROUTE_OWNER_LABEL,
+      provider: OMNIROUTE_PROVIDER_LABEL,
+      source: "omniroute",
+      gateway: true,
+      shared: false,
+      saved: false,
+      vision: model.vision === true ? true : null,
+      capabilities
+    };
+  });
 }
 
 export function omnirouteProviderForChat() {
