@@ -138,6 +138,12 @@ test("state-changing requests from unknown origins are blocked", async () => {
   assert.equal(response.status, 403);
 });
 
+test("API responses are not cacheable so proxies never serve stale sessions", async () => {
+  const response = await api("/api/auth/me");
+  assert.equal(response.status, 401);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+});
+
 // ─── Registration and login ─────────────────────────────────────────────────
 
 test("registration succeeds, hashes the password, and sets an HTTP-only session cookie", async () => {
@@ -243,6 +249,16 @@ test("logout clears the session cookie and invalidates the session", async () =>
 
   const me = await api("/api/auth/me", { cookie: "vr_session=" });
   assert.equal(me.status, 401);
+});
+
+test("a session survives repeated requests, as when the page is refreshed", async () => {
+  const { cookie, email } = await signupUser();
+  const first = await api("/api/auth/me", { cookie });
+  const reload = await api("/api/auth/me", { cookie });
+  assert.equal(first.status, 200);
+  assert.equal(reload.status, 200);
+  assert.equal(first.body.user.email, email);
+  assert.equal(reload.body.user.email, email);
 });
 
 // ─── Provider configuration ─────────────────────────────────────────────────

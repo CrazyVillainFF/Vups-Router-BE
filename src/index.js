@@ -74,6 +74,10 @@ app.use(cors({
   credentials: true
 }));
 app.use(cookieParser());
+app.use("/api", (_req, res, next) => {
+  res.setHeader("Cache-Control", "no-store");
+  next();
+});
 // Chat requests can carry base64 image attachments; every other route keeps
 // the small JSON limit. The chat limit is derived from the image limits in
 // chatImages.js (base64 inflates decoded bytes by ~4/3).

@@ -47,7 +47,7 @@ The test suite is self-contained: it downloads a temporary MongoDB binary via `m
 
 ## API
 
-All state-changing requests must use `Content-Type: application/json`; requests from browsers with an unknown `Origin` are rejected. Authentication uses the HTTP-only `vr_session` cookie (`SameSite=None; Secure; Partitioned` in production, `Lax` in dev). A `Bearer` token from the signup/signin response is also accepted for API clients.
+All state-changing requests must use `Content-Type: application/json`; requests from browsers with an unknown `Origin` are rejected. Authentication uses the HTTP-only `vr_session` cookie (`SameSite=None; Secure; Partitioned` in production, `Lax` in dev). The shipped client reaches this API through the Vercel same-origin `/api/*` proxy, which keeps the cookie first-party so sessions survive reloads. A `Bearer` token from the signup/signin response is also accepted for API clients.
 
 ### Auth
 
@@ -150,7 +150,7 @@ MongoDB Atlas: under **Network Access**, allow `0.0.0.0/0` (Render's free tier d
 
 ### Frontend connectivity and CORS origins
 
-The backend serves every application route under `/api/*` (`/api/auth`, `/api/settings`, `/api/conversations`, `/api/chat`, `/api/admin`) and `GET /api` now returns a small JSON index with all route paths — a bare `/api` no longer looks like a broken backend. The frontend's `VITE_API_BASE_URL` must therefore end in `/api` (it already does: `https://vups-router-be.onrender.com/api`).
+The backend serves every application route under `/api/*` (`/api/auth`, `/api/settings`, `/api/conversations`, `/api/chat`, `/api/admin`) and `GET /api` now returns a small JSON index with all route paths — a bare `/api` no longer looks like a broken backend. The frontend normally calls `/api/*` on its own Vercel origin, and `client/vercel.json` proxies that path here; this is the recommended setup because the session cookie stays first-party and sign-ins survive page reloads. For direct calls, set `VITE_API_BASE_URL` to this service's URL ending in `/api` (for example `https://vups-router-be.onrender.com/api`).
 
 If the browser shows "Could not reach the VupsRouter backend at https://vups-router-be.onrender.com/api" **while `curl` to the same backend works**, the cause is almost always CORS: `curl` sends no `Origin` header, browsers do. When the frontend's origin is not in the allowlist, the backend rejects the request without CORS headers and the browser hides the response, so the frontend can only report a generic network error. The Render logs show `Origin not allowed by CORS` or `Request blocked: origin not allowed`.
 
