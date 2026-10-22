@@ -167,6 +167,7 @@ test("registration succeeds, hashes the password, and sets an HTTP-only session 
   assert.equal(response.body.user.passwordHash, undefined);
 
   const setCookies = response.headers.getSetCookie();
+  assert.equal(setCookies.length, 1, "login must not clear the cookie it just set");
   const session = setCookies.find(value => value.startsWith("vr_session="));
   assert.ok(session, "session cookie must be set");
   assert.match(session, /HttpOnly/i);

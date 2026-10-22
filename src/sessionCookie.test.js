@@ -49,7 +49,7 @@ test("the JWT lifetime exactly matches the session cookie lifetime", () => {
   assert.equal(SESSION_TTL_SECONDS * 1000, SESSION_TTL_MS);
 });
 
-test("production login replaces the old partitioned cookie and logout clears both variants", () => {
+test("production login sets only the first-party cookie, and logout clears both variants", () => {
   const calls = [];
   const res = {
     cookie: (...args) => calls.push(["set", ...args]),
@@ -57,14 +57,13 @@ test("production login replaces the old partitioned cookie and logout clears bot
   };
 
   withNodeEnv("production", () => setSessionCookie(res, "signed-token"));
+  assert.equal(calls.length, 1);
   assert.equal(calls[0][0], "set");
   assert.equal(calls[0][1], SESSION_COOKIE);
+  assert.equal(calls[0][2], "signed-token");
   assert.equal(calls[0][3].sameSite, "lax");
   assert.equal(calls[0][3].partitioned, undefined);
-  assert.equal(calls[1][0], "clear");
-  assert.equal(calls[1][2].sameSite, "none");
-  assert.equal(calls[1][2].partitioned, true);
-  assert.equal(calls[1][2].path, "/");
+  assert.equal(calls[0][3].maxAge, SESSION_TTL_MS);
 
   calls.length = 0;
   withNodeEnv("production", () => clearSessionCookie(res));

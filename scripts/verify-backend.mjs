@@ -168,6 +168,7 @@ async function verifyProductionFlow() {
       body: JSON.stringify({ name: "Prod User", email: "prod@example.com", password: "correct-horse-battery" })
     });
     assert.equal(signup.response.status, 201);
+    assert.equal(signup.response.headers.getSetCookie().length, 1);
     const setCookie = signup.response.headers.getSetCookie()[0];
     assert.match(setCookie, /HttpOnly/i);
     assert.match(setCookie, /Secure/i);

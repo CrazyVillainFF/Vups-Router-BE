@@ -37,9 +37,6 @@ function legacyCookieOptions() {
 
 export function setSessionCookie(res, token) {
   res.cookie(SESSION_COOKIE, token, sessionCookieOptions());
-  // Older deployments issued a Partitioned cookie. Clear that variant when
-  // production starts using the first-party cookie so both never coexist.
-  if (isProduction()) res.clearCookie(SESSION_COOKIE, legacyCookieOptions());
 }
 
 export function clearSessionCookie(res) {
