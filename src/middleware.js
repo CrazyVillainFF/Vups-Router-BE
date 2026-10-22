@@ -1,9 +1,9 @@
 import jwt from "jsonwebtoken";
 import { ipKeyGenerator, rateLimit } from "express-rate-limit";
 import User from "./user.js";
+import { SESSION_COOKIE, SESSION_TTL_MS } from "./session.js";
 
-export const SESSION_COOKIE = "vr_session";
-export const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+export { SESSION_COOKIE, SESSION_TTL_MS };
 
 export function isProduction() {
   return process.env.NODE_ENV === "production";
@@ -17,23 +17,34 @@ export function getJwtSecret() {
 }
 
 export function sessionCookieOptions() {
-  const production = isProduction();
   return {
     httpOnly: true,
-    secure: production,
-    sameSite: production ? "none" : "lax",
-    partitioned: production,
+    secure: isProduction(),
+    sameSite: "lax",
     path: "/",
     maxAge: SESSION_TTL_MS
   };
 }
 
+function legacyCookieOptions() {
+  return {
+    ...sessionCookieOptions(),
+    sameSite: "none",
+    partitioned: true,
+    maxAge: undefined
+  };
+}
+
 export function setSessionCookie(res, token) {
   res.cookie(SESSION_COOKIE, token, sessionCookieOptions());
+  // Older deployments issued a Partitioned cookie. Clear that variant when
+  // production starts using the first-party cookie so both never coexist.
+  if (isProduction()) res.clearCookie(SESSION_COOKIE, legacyCookieOptions());
 }
 
 export function clearSessionCookie(res) {
   res.clearCookie(SESSION_COOKIE, { ...sessionCookieOptions(), maxAge: undefined });
+  if (isProduction()) res.clearCookie(SESSION_COOKIE, legacyCookieOptions());
 }
 
 export function extractBearerToken(req) {

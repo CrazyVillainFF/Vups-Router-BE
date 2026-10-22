@@ -171,9 +171,10 @@ async function verifyProductionFlow() {
     const setCookie = signup.response.headers.getSetCookie()[0];
     assert.match(setCookie, /HttpOnly/i);
     assert.match(setCookie, /Secure/i);
-    assert.match(setCookie, /SameSite=None/i);
-    assert.match(setCookie, /Partitioned/i);
-    console.log("[ok] prod: signup Set-Cookie is HttpOnly; Secure; SameSite=None; Partitioned");
+    assert.match(setCookie, /SameSite=Lax/i);
+    assert.match(setCookie, /Max-Age=604800/i);
+    assert.doesNotMatch(setCookie, /Partitioned/i);
+    console.log("[ok] prod: signup Set-Cookie is HttpOnly; Secure; SameSite=Lax; Max-Age=604800");
 
     const me = await request("/api/auth/me", {
       headers: { Cookie: setCookie.split(";")[0] }

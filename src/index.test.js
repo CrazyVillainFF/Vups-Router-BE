@@ -170,6 +170,10 @@ test("registration succeeds, hashes the password, and sets an HTTP-only session 
   const session = setCookies.find(value => value.startsWith("vr_session="));
   assert.ok(session, "session cookie must be set");
   assert.match(session, /HttpOnly/i);
+  assert.match(session, /SameSite=Lax/i);
+  assert.match(session, /Max-Age=604800/i);
+  assert.doesNotMatch(session, /Partitioned/i);
+  assert.doesNotMatch(session, /Domain=/i);
 
   const stored = await mongoose.connection.db.collection("users").findOne({ email });
   assert.ok(stored.passwordHash.startsWith("$2"), "password must be bcrypt hashed");

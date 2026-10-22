@@ -1,7 +1,6 @@
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
-
-const TOKEN_TTL = "7d";
+import { SESSION_TTL_SECONDS } from "./session.js";
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -41,5 +40,7 @@ export async function passwordMatches(password, hash) {
 }
 
 export function createToken(user, secret) {
-  return jwt.sign({ sub: String(user._id ?? user.id), email: user.email }, secret, { expiresIn: TOKEN_TTL });
+  return jwt.sign({ sub: String(user._id ?? user.id), email: user.email }, secret, {
+    expiresIn: SESSION_TTL_SECONDS
+  });
 }
