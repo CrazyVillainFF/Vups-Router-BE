@@ -36,10 +36,12 @@ export async function startFakeProvider() {
       failStreamMidway: false,
       failModel: null,
       failModelStatus: 404,
+      failModelMessage: "",
       invalidKey: false,
       finishReason: "stop",
       usageChunk: false,
       emptyDeltaFirst: false,
+      emptyStream: false,
       extraModels: []
     },
     set(partial) {
@@ -56,10 +58,12 @@ export async function startFakeProvider() {
       state.behavior.failStreamMidway = false;
       state.behavior.failModel = null;
       state.behavior.failModelStatus = 404;
+      state.behavior.failModelMessage = "";
       state.behavior.invalidKey = false;
       state.behavior.finishReason = "stop";
       state.behavior.usageChunk = false;
       state.behavior.emptyDeltaFirst = false;
+      state.behavior.emptyStream = false;
       state.behavior.extraModels = [];
     }
   };
@@ -118,7 +122,9 @@ export async function startFakeProvider() {
       }
       if (state.behavior.failModel && body.model === state.behavior.failModel) {
         return json(res, state.behavior.failModelStatus, {
-          error: { message: `The model \`${body.model}\` is temporarily unavailable.` }
+          error: {
+            message: state.behavior.failModelMessage || `The model \`${body.model}\` is temporarily unavailable.`
+          }
         });
       }
       if (state.behavior.chatStatus !== 200) {
@@ -144,6 +150,13 @@ export async function startFakeProvider() {
       }
 
       res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
+      if (state.behavior.emptyStream) {
+        res.write(`data: ${JSON.stringify({ id: "chatcmpl-fake", model, choices: [{ delta: { role: "assistant" }, finish_reason: null }] })}\n\n`);
+        res.write(`data: ${JSON.stringify({ id: "chatcmpl-fake", model, choices: [{ delta: {}, finish_reason: state.behavior.finishReason }] })}\n\n`);
+        res.write("data: [DONE]\n\n");
+        res.end();
+        return;
+      }
       const chunks = ["Hello ", "from ", `${model}`, "!"];
       if (state.behavior.emptyDeltaFirst) {
         res.write(`data: ${JSON.stringify({ id: "chatcmpl-fake", model, choices: [{ delta: { role: "assistant" }, finish_reason: null }] })}\n\n`);

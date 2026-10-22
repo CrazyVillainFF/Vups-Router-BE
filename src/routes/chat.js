@@ -168,6 +168,7 @@ function sharedRoute(shared, requestedModel = "") {
     defaultModel: model,
     fallbackModel,
     maxTokens: provider.maxTokens,
+    reasoning: provider.reasoning,
     visionModelIds
   };
 }
@@ -501,6 +502,13 @@ function providerFailure(provider, error) {
         code: "shared_model_rate_limited"
       };
     }
+    if (error.code === "empty_response" || error.code === "output_limit") {
+      return {
+        status: 502,
+        message: "The shared model returned no answer text. Pick another shared model or try a shorter prompt.",
+        code: "shared_empty_response"
+      };
+    }
     return {
       status: 503,
       message: "The shared AI model is temporarily unavailable. Try again later, or connect your own provider in API settings.",
@@ -547,7 +555,16 @@ function vupsFailure(error, { hasImages = false } = {}) {
       code: "vups_timeout"
     };
   }
-  if (hasImages && ["bad_request", "unprocessable", "invalid_model"].includes(code)) {
+  if (code === "output_limit") {
+    return {
+      status: 502,
+      message: "Vups v3 Galax reached its output limit before writing an answer. Try a shorter prompt.",
+      code: "vups_output_limit"
+    };
+  }
+  const detail = typeof error?.message === "string" ? error.message : "";
+  const visionUnsupported = hasImages && /no endpoints found that support image input|does not support image input|image input (?:is )?not supported|does not accept image/i.test(detail);
+  if (hasImages && (["bad_request", "unprocessable", "invalid_model"].includes(code) || (visionUnsupported && ["not_found", "model_unavailable"].includes(code)))) {
     return {
       status: 400,
       message: "Vups v3 Galax could not read that image. The configured underlying model may not support image input. Try a different image or continue with text.",
@@ -619,7 +636,7 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
 
     let provider;
     try {
-      provider = vupsProviderForChat();
+      provider = vupsProviderForChat({ images: hasImages });
     } catch (error) {
       if (error instanceof ProviderError) {
         return res.status(error.status ?? 503).json({ message: error.message, code: error.code });
@@ -664,7 +681,8 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
           providerType: provider.providerType,
           model: provider.model,
           messages: upstreamMessages,
-          temperature
+          temperature,
+          reasoning: provider.reasoning
         });
       } catch (error) {
         if (!(error instanceof ProviderError)) throw error;
@@ -700,7 +718,8 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
           providerType: provider.providerType,
           model: provider.model,
           messages: upstreamMessages,
-          temperature
+          temperature,
+          reasoning: provider.reasoning
         },
         controller.signal
       );
@@ -756,6 +775,10 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
             break;
           }
           const choice = parsed?.choices?.[0];
+          if (choice?.error) {
+            failure = new ProviderError("The provider reported an error during streaming.", null, "stream_error");
+            break;
+          }
           if (typeof choice?.finish_reason === "string" && choice.finish_reason) {
             finishReason = choice.finish_reason;
           }
@@ -805,7 +828,9 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
     }
 
     if (!failure && fullText.length === 0 && !controller.signal.aborted) {
-      failure = new ProviderError("The provider returned an empty response.", null, "empty_response");
+      failure = finishReason === "length"
+        ? new ProviderError("Vups v3 Galax reached its output limit before writing an answer. Try a shorter prompt.", null, "output_limit")
+        : new ProviderError("The provider returned an empty response.", null, "empty_response");
     }
 
     if (fullText.length > 0) {
@@ -916,7 +941,7 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
       while (true) {
         try {
           result = await chatCompletion(
-            { baseUrl: provider.baseUrl, apiKey: provider.apiKey, providerType: provider.providerType, model: usedModel, messages: upstreamMessages, temperature, maxTokens: provider.maxTokens },
+            { baseUrl: provider.baseUrl, apiKey: provider.apiKey, providerType: provider.providerType, model: usedModel, messages: upstreamMessages, temperature, maxTokens: provider.maxTokens, reasoning: provider.reasoning },
             undefined
           );
           break;
@@ -958,7 +983,7 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
     while (true) {
       try {
         upstream = await startChatCompletionStream(
-          { baseUrl: provider.baseUrl, apiKey: provider.apiKey, providerType: provider.providerType, model: usedModel, messages: upstreamMessages, temperature, maxTokens: provider.maxTokens },
+          { baseUrl: provider.baseUrl, apiKey: provider.apiKey, providerType: provider.providerType, model: usedModel, messages: upstreamMessages, temperature, maxTokens: provider.maxTokens, reasoning: provider.reasoning },
           controller.signal
         );
         break;
@@ -1038,6 +1063,17 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
             break;
           }
           const choice = parsed?.choices?.[0];
+          if (choice?.error) {
+            const detail = typeof choice.error?.message === "string" ? choice.error.message : "";
+            failure = new ProviderError(
+              detail
+                ? `The provider reported an error during streaming: ${redactSecrets(detail)}`
+                : "The provider reported an error during streaming.",
+              null,
+              "stream_error"
+            );
+            break;
+          }
           if (typeof choice?.finish_reason === "string" && choice.finish_reason) {
             finishReason = choice.finish_reason;
           }
@@ -1087,7 +1123,9 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
     }
 
     if (!failure && fullText.length === 0 && !controller.signal.aborted) {
-      failure = new ProviderError("The provider returned an empty response. Check the model ID and try again.", null, "empty_response");
+      failure = finishReason === "length"
+        ? new ProviderError("The model reached its output limit before writing an answer. Try a shorter prompt or choose another model.", null, "output_limit")
+        : new ProviderError("The provider returned an empty response. Check the model ID and try again.", null, "empty_response");
     }
 
     if (fullText.length > 0) {

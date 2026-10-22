@@ -147,6 +147,15 @@ export const vupsGalaxRateLimiter = rateLimit({
   message: { message: "Too many Vups v3 Galax requests. Please slow down and try again shortly." }
 });
 
+export const imageGenerationRateLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: Number(process.env.IMAGE_GENERATION_RATE_LIMIT_MAX || 5),
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: req => `${req.userId || "anonymous"}:${ipKeyGenerator(req.ip)}`,
+  message: { message: "Too many image generation requests. Please wait a minute and try again." }
+});
+
 export const settingsRateLimiter = rateLimit(
   rateLimitOptions(60, "Too many settings requests. Please wait and try again.")
 );

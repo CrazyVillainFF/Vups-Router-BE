@@ -9,7 +9,7 @@ import { checkOpenRouter, openRouterConfigured, openRouterModel, openRouterProvi
 
 export { setSharedModelEnabled } from "./ollama.js";
 
-export const SHARED_OWNER_LABEL = "Shared · Free · No API key needed";
+export const SHARED_OWNER_LABEL = "Shared · Free";
 
 export async function sharedModelStatus() {
   const enabled = await sharedModelEnabled();

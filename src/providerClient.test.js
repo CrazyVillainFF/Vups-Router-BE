@@ -105,6 +105,23 @@ test("keeps the existing chat-completions payload shape", () => {
   assert.equal(body.max_output_tokens, undefined);
 });
 
+test("forwards an explicit reasoning policy only when one is provided", () => {
+  const disabled = buildChatRequestBody({
+    model: "reasoning-model",
+    messages: [{ role: "user", content: "Hello" }],
+    stream: false,
+    reasoning: { enabled: false }
+  });
+  assert.deepEqual(disabled.reasoning, { enabled: false });
+
+  const plain = buildChatRequestBody({
+    model: "reasoning-model",
+    messages: [{ role: "user", content: "Hello" }],
+    stream: false
+  });
+  assert.equal("reasoning" in plain, false);
+});
+
 test("sends POST to /v1/chat/completions for streaming and non-streaming requests", async () => {
   const requests = [];
   const { server, port } = await listen(async (req, res) => {

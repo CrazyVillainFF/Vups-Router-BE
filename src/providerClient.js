@@ -840,7 +840,7 @@ function anthropicFinishReason(payload) {
   return typeof reason === "string" ? reason : null;
 }
 
-export function buildChatRequestBody({ model, messages, temperature, maxTokens, stream, responses = false }) {
+export function buildChatRequestBody({ model, messages, temperature, maxTokens, stream, responses = false, reasoning }) {
   if (responses) {
     const instructions = messages
       .filter(message => message.role === "system" && typeof message.content === "string")
@@ -856,6 +856,7 @@ export function buildChatRequestBody({ model, messages, temperature, maxTokens, 
   const body = { model, messages: serializeMessages(messages), stream };
   if (typeof temperature === "number" && Number.isFinite(temperature)) body.temperature = temperature;
   if (typeof maxTokens === "number" && Number.isFinite(maxTokens)) body.max_tokens = maxTokens;
+  if (reasoning && typeof reasoning === "object") body.reasoning = reasoning;
   return body;
 }
 
@@ -882,7 +883,7 @@ function responsesFinishReason(payload) {
   return payload?.status === "completed" ? "stop" : null;
 }
 
-export async function chatCompletion({ baseUrl, apiKey, model, messages, temperature, maxTokens, providerType = "openai_compatible" }, signal) {
+export async function chatCompletion({ baseUrl, apiKey, model, messages, temperature, maxTokens, providerType = "openai_compatible", reasoning }, signal) {
   const type = normalizeProviderType(providerType);
   const anthropic = usesAnthropicApi(baseUrl, model, type);
   const watsonx = !isOpenCodeZenBase(baseUrl) && type === "watsonx";
@@ -892,7 +893,7 @@ export async function chatCompletion({ baseUrl, apiKey, model, messages, tempera
     ? buildAnthropicRequestBody({ model, messages, temperature, maxTokens, stream: false })
     : watsonx
       ? buildWatsonxRequestBody({ model, messages, temperature, maxTokens, stream: false, projectId: requireWatsonxProjectId(baseUrl) })
-      : buildChatRequestBody({ model, messages, temperature, maxTokens, stream: false, responses });
+      : buildChatRequestBody({ model, messages, temperature, maxTokens, stream: false, responses, reasoning });
 
   let response;
   try {
@@ -927,7 +928,7 @@ export async function chatCompletion({ baseUrl, apiKey, model, messages, tempera
   };
 }
 
-export async function startChatCompletionStream({ baseUrl, apiKey, model, messages, temperature, maxTokens, providerType = "openai_compatible" }, signal) {
+export async function startChatCompletionStream({ baseUrl, apiKey, model, messages, temperature, maxTokens, providerType = "openai_compatible", reasoning }, signal) {
   const type = normalizeProviderType(providerType);
   const anthropic = usesAnthropicApi(baseUrl, model, type);
   const watsonx = !isOpenCodeZenBase(baseUrl) && type === "watsonx";
@@ -937,7 +938,7 @@ export async function startChatCompletionStream({ baseUrl, apiKey, model, messag
     ? buildAnthropicRequestBody({ model, messages, temperature, maxTokens, stream: true })
     : watsonx
       ? buildWatsonxRequestBody({ model, messages, temperature, maxTokens, stream: true, projectId: requireWatsonxProjectId(baseUrl) })
-      : buildChatRequestBody({ model, messages, temperature, maxTokens, stream: true, responses });
+      : buildChatRequestBody({ model, messages, temperature, maxTokens, stream: true, responses, reasoning });
 
   let response;
   try {

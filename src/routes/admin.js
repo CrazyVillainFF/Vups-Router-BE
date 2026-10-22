@@ -125,7 +125,8 @@ router.post("/openrouter/test-model", async (req, res, next) => {
         apiKey: provider.apiKey,
         model,
         messages: [{ role: "user", content: "Reply with OK." }],
-        maxTokens: 16
+        maxTokens: 16,
+        reasoning: provider.reasoning
       });
       return res.json({
         ok: true,

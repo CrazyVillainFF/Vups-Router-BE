@@ -397,6 +397,7 @@ export function openRouterProviderForChat() {
     baseUrl,
     apiKey: key,
     defaultModel: openRouterModel(),
-    maxTokens: openRouterMaxOutputTokens()
+    maxTokens: openRouterMaxOutputTokens(),
+    reasoning: { enabled: false }
   };
 }

@@ -23,6 +23,11 @@ process.env.OPENROUTER_MODEL = "fake-model-mini";
 process.env.OPENROUTER_MODELS = "fake-model-mini,fake-model-pro";
 process.env.OPENROUTER_VISION_MODELS = "fake-model-mini";
 delete process.env.OLLAMA_BASE_URL;
+delete process.env.VUPS_BASE_URL;
+delete process.env.VUPS_API_KEY;
+delete process.env.VUPS_UNDERLYING_MODEL;
+delete process.env.VUPS_VISION;
+delete process.env.VUPS_VISION_MODEL;
 
 const { default: app } = await import("./index.js");
 const { default: mongoose } = await import("mongoose");
@@ -122,6 +127,26 @@ function lastChatRequest() {
 async function chatWith(cookie, payload) {
   const response = await api("/api/chat", { method: "POST", cookie, body: payload });
   return response;
+}
+
+async function withEnv(values, run) {
+  const saved = new Map(Object.keys(values).map(name => [name, process.env[name]]));
+  for (const [name, value] of Object.entries(values)) {
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
+  try {
+    return await run();
+  } finally {
+    for (const [name, value] of saved) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+}
+
+function vupsChat(cookie, payload) {
+  return api("/api/chat/vups-v3-galax", { method: "POST", cookie, body: payload });
 }
 
 // ─── Unit: validateImages ───────────────────────────────────────────────────
@@ -316,6 +341,112 @@ test("shared model list exposes vision capabilities to the client", async () => 
     shared.map(model => [model.id, model.vision]),
     [["fake-model-mini", true], ["fake-model-pro", false]]
   );
+});
+
+// ─── Integration: Vups v3 Galax fallback vision routing ─────────────────────
+
+test("Vups v3 Galax keeps text on the text model and routes images to the vision model", async () => {
+  const user = await signupUser();
+  await withEnv(
+    {
+      VUPS_BASE_URL: undefined,
+      VUPS_API_KEY: undefined,
+      VUPS_UNDERLYING_MODEL: undefined,
+      VUPS_VISION: undefined,
+      VUPS_VISION_MODEL: "fake-model-mini",
+      OPENROUTER_DEFAULT_MODEL: "fake-model-pro"
+    },
+    async () => {
+      fakeProvider.state.reset();
+
+      const text = await vupsChat(user.cookie, {
+        stream: false,
+        model: "vups-v3-galax",
+        messages: [{ role: "user", content: "hello text model" }]
+      });
+      assert.equal(text.status, 200);
+      assert.equal(lastChatRequest().body.model, "fake-model-pro");
+      assert.deepEqual(lastChatRequest().body.reasoning, { enabled: false });
+
+      const image = await vupsChat(user.cookie, {
+        stream: false,
+        model: "vups-v3-galax",
+        messages: [{ role: "user", content: "describe this", images: [pngImage()] }]
+      });
+      assert.equal(image.status, 200);
+      const upstream = lastChatRequest();
+      assert.equal(upstream.body.model, "fake-model-mini", "image requests must use the vision model");
+      assert.deepEqual(upstream.body.reasoning, { enabled: false });
+      const sent = upstream.body.messages.at(-1);
+      assert.ok(Array.isArray(sent.content));
+      assert.equal(sent.content[1].image_url.url, `data:image/png;base64,${PNG_DATA}`);
+
+      const conversation = await api(`/api/conversations/${image.body.conversationId}`, { cookie: user.cookie });
+      assert.equal(conversation.status, 200);
+      const [userMessage] = conversation.body.conversation.messages;
+      assert.deepEqual(userMessage.attachments, [
+        { name: "cat.png", mimeType: "image/png", bytes: PNG_BYTES.length }
+      ]);
+      assert.ok(!JSON.stringify(conversation.body).includes(PNG_DATA.slice(0, 24)));
+    }
+  );
+  fakeProvider.state.reset();
+});
+
+test("VUPS_VISION=false rejects Vups image requests before calling the provider", async () => {
+  const user = await signupUser();
+  await withEnv(
+    {
+      VUPS_BASE_URL: undefined,
+      VUPS_API_KEY: undefined,
+      VUPS_UNDERLYING_MODEL: undefined,
+      VUPS_VISION: "false",
+      VUPS_VISION_MODEL: "fake-model-mini",
+      OPENROUTER_DEFAULT_MODEL: "fake-model-pro"
+    },
+    async () => {
+      fakeProvider.state.reset();
+      const response = await vupsChat(user.cookie, {
+        stream: false,
+        model: "vups-v3-galax",
+        messages: [{ role: "user", content: "look", images: [pngImage()] }]
+      });
+      assert.equal(response.status, 400);
+      assert.equal(response.body.code, "vups_vision_unsupported");
+      assert.equal(fakeProvider.state.chatRequests.length, 0);
+    }
+  );
+});
+
+test("a no-image-endpoint provider error is reported as a vision rejection, not a missing model", async () => {
+  const user = await signupUser();
+  await withEnv(
+    {
+      VUPS_BASE_URL: undefined,
+      VUPS_API_KEY: undefined,
+      VUPS_UNDERLYING_MODEL: undefined,
+      VUPS_VISION: undefined,
+      VUPS_VISION_MODEL: "fake-model-mini",
+      OPENROUTER_DEFAULT_MODEL: "fake-model-pro"
+    },
+    async () => {
+      fakeProvider.state.reset();
+      fakeProvider.state.set({
+        failModel: "fake-model-mini",
+        failModelStatus: 404,
+        failModelMessage: "No endpoints found that support image input"
+      });
+      const response = await vupsChat(user.cookie, {
+        stream: false,
+        model: "vups-v3-galax",
+        messages: [{ role: "user", content: "look", images: [pngImage()] }]
+      });
+      assert.equal(response.status, 400);
+      assert.equal(response.body.code, "vups_vision_rejected");
+      assert.match(response.body.message, /could not read that image/i);
+    }
+  );
+  fakeProvider.state.reset();
 });
 
 // ─── Persistence ────────────────────────────────────────────────────────────

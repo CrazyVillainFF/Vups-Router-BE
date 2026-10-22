@@ -3,12 +3,14 @@ import { test } from "node:test";
 
 process.env.NODE_ENV = "test";
 
-const { vupsProviderForChat } = await import("./vupsGalax.js");
+const { vupsProviderForChat, DEFAULT_VUPS_VISION_MODEL } = await import("./vupsGalax.js");
 
 const ENV_KEYS = [
   "VUPS_BASE_URL",
   "VUPS_API_KEY",
   "VUPS_UNDERLYING_MODEL",
+  "VUPS_VISION",
+  "VUPS_VISION_MODEL",
   "OPENROUTER_API_KEY",
   "OPENROUTER_BASE_URL",
   "OPENROUTER_DEFAULT_MODEL",
@@ -67,6 +69,116 @@ test("missing VUPS configuration falls back to the shared OpenRouter setup", () 
       assert.equal(provider.baseUrl, "https://openrouter.ai/api/v1");
       assert.equal(provider.apiKey, "openrouter-key");
       assert.equal(provider.model, "free/shared:free");
+    }
+  );
+});
+
+test("shared OpenRouter fallback keeps text on the default model and routes images to the free vision model", () => {
+  withEnv(
+    {
+      VUPS_BASE_URL: undefined,
+      VUPS_API_KEY: undefined,
+      VUPS_UNDERLYING_MODEL: undefined,
+      VUPS_VISION: undefined,
+      VUPS_VISION_MODEL: undefined,
+      OPENROUTER_API_KEY: "openrouter-key",
+      OPENROUTER_BASE_URL: "https://openrouter.ai/api/v1",
+      OPENROUTER_DEFAULT_MODEL: "text/model:free"
+    },
+    () => {
+      const text = vupsProviderForChat();
+      assert.equal(text.model, "text/model:free");
+      assert.equal(text.vision, null);
+
+      const image = vupsProviderForChat({ images: true });
+      assert.equal(image.model, DEFAULT_VUPS_VISION_MODEL);
+      assert.equal(image.vision, true);
+      assert.deepEqual(image.reasoning, { enabled: false });
+    }
+  );
+});
+
+test("VUPS_VISION_MODEL overrides the fallback image model and VUPS_VISION=false disables images", () => {
+  withEnv(
+    {
+      VUPS_BASE_URL: undefined,
+      VUPS_API_KEY: undefined,
+      VUPS_UNDERLYING_MODEL: undefined,
+      VUPS_VISION: undefined,
+      VUPS_VISION_MODEL: "custom/vision:free",
+      OPENROUTER_API_KEY: "openrouter-key",
+      OPENROUTER_BASE_URL: "https://openrouter.ai/api/v1",
+      OPENROUTER_DEFAULT_MODEL: "text/model:free"
+    },
+    () => {
+      const image = vupsProviderForChat({ images: true });
+      assert.equal(image.model, "custom/vision:free");
+      assert.equal(image.vision, true);
+    }
+  );
+
+  withEnv(
+    {
+      VUPS_BASE_URL: undefined,
+      VUPS_API_KEY: undefined,
+      VUPS_UNDERLYING_MODEL: undefined,
+      VUPS_VISION: "false",
+      VUPS_VISION_MODEL: "custom/vision:free",
+      OPENROUTER_API_KEY: "openrouter-key",
+      OPENROUTER_BASE_URL: "https://openrouter.ai/api/v1",
+      OPENROUTER_DEFAULT_MODEL: "text/model:free"
+    },
+    () => {
+      const image = vupsProviderForChat({ images: true });
+      assert.equal(image.model, "text/model:free");
+      assert.equal(image.vision, false);
+    }
+  );
+});
+
+test("dedicated VUPS configuration uses VUPS_VISION_MODEL for image requests", () => {
+  withEnv(
+    {
+      VUPS_BASE_URL: "https://vups.example.com/v1",
+      VUPS_API_KEY: "vups-key",
+      VUPS_UNDERLYING_MODEL: "vups-text-model",
+      VUPS_VISION: undefined,
+      VUPS_VISION_MODEL: "vups-vision-model",
+      OPENROUTER_API_KEY: undefined,
+      OPENROUTER_BASE_URL: undefined,
+      OPENROUTER_DEFAULT_MODEL: undefined
+    },
+    () => {
+      const text = vupsProviderForChat();
+      assert.equal(text.model, "vups-text-model");
+      assert.equal(text.vision, null);
+      assert.equal(text.reasoning, undefined);
+
+      const image = vupsProviderForChat({ images: true });
+      assert.equal(image.model, "vups-vision-model");
+      assert.equal(image.vision, true);
+    }
+  );
+});
+
+test("dedicated VUPS image requests require an explicit vision setting", () => {
+  withEnv(
+    {
+      VUPS_BASE_URL: "https://vups.example.com/v1",
+      VUPS_API_KEY: "vups-key",
+      VUPS_UNDERLYING_MODEL: "vups-text-model",
+      VUPS_VISION: undefined,
+      VUPS_VISION_MODEL: undefined,
+      OPENROUTER_API_KEY: undefined,
+      OPENROUTER_BASE_URL: undefined,
+      OPENROUTER_DEFAULT_MODEL: undefined
+    },
+    () => {
+      assert.throws(
+        () => vupsProviderForChat({ images: true }),
+        error => error.status === 400 && error.code === "vups_vision_unsupported" && /VUPS_VISION_MODEL/.test(error.message)
+      );
+      assert.equal(vupsProviderForChat().model, "vups-text-model");
     }
   );
 });

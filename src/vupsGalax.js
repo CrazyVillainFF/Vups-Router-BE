@@ -3,6 +3,7 @@ import { openRouterApiKey, openRouterBaseUrl, openRouterModel } from "./openrout
 
 export const VUPS_MODEL_ID = "vups-v3-galax";
 export const VUPS_MODEL_NAME = "Vups v3 Galax";
+export const DEFAULT_VUPS_VISION_MODEL = "google/gemma-4-26b-a4b-it:free";
 
 export const VUPS_BASE_PROMPT = `You are Vups v3 Galax, an AI model created by Vups and available for free on VupsRouter AI.
 
@@ -48,7 +49,7 @@ function envText(name) {
   return typeof process.env[name] === "string" ? process.env[name].trim() : "";
 }
 
-export function vupsProviderForChat() {
+export function vupsProviderForChat({ images = false } = {}) {
   const dedicated = {
     baseUrlValue: envText("VUPS_BASE_URL"),
     apiKey: envText("VUPS_API_KEY"),
@@ -75,11 +76,38 @@ export function vupsProviderForChat() {
       "vups_not_configured"
     );
   }
+
+  const configuredVision = visionSetting(process.env.VUPS_VISION);
+  const configuredVisionModel = envText("VUPS_VISION_MODEL");
+  let requestModel = model;
+  let requestVision = configuredVision;
+
+  if (images && configuredVision !== false) {
+    if (useDedicated) {
+      if (configuredVisionModel) {
+        requestModel = configuredVisionModel;
+        requestVision = true;
+      } else if (configuredVision === true) {
+        requestVision = true;
+      } else {
+        throw new ProviderError(
+          "Vups v3 Galax image requests need a vision-capable model. Set VUPS_VISION_MODEL to an image model available at VUPS_BASE_URL, or set VUPS_VISION=true if that dedicated model supports images.",
+          400,
+          "vups_vision_unsupported"
+        );
+      }
+    } else {
+      requestModel = configuredVisionModel || DEFAULT_VUPS_VISION_MODEL;
+      requestVision = true;
+    }
+  }
+
   return {
     baseUrl,
     apiKey,
-    model,
+    model: requestModel,
     providerType: "openai_compatible",
-    vision: visionSetting(process.env.VUPS_VISION)
+    vision: requestVision,
+    reasoning: useDedicated ? undefined : { enabled: false }
   };
 }

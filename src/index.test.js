@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import http from "node:http";
 import { after, test } from "node:test";
 
 process.env.NODE_ENV = "test";
@@ -678,24 +679,29 @@ test("Vups v3 Galax streams SSE and enforces configured vision support", async (
   assert.equal(conversation.status, 200);
   assert.equal(conversation.body.conversation.messages.at(-1).content, "Hello from fake-model-mini!");
 
-  fakeProvider.state.reset();
   const pngData = Buffer.concat([
     Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
     Buffer.from("vups-galax-image")
   ]).toString("base64");
-  const vision = await api("/api/chat/vups-v3-galax", {
-    method: "POST",
-    cookie,
-    body: {
-      stream: false,
-      model: "vups-v3-galax",
-      messages: [{ role: "user", content: "Read this", images: [{ mimeType: "image/png", data: pngData }] }]
-    }
-  });
-  assert.equal(vision.status, 200);
-  const parts = fakeProvider.state.chatRequests.at(-1).body.messages[1].content;
-  assert.ok(Array.isArray(parts));
-  assert.ok(parts.some(part => part.type === "image_url" && part.image_url?.url?.startsWith("data:image/png;base64,")));
+  process.env.VUPS_VISION = "true";
+  try {
+    fakeProvider.state.reset();
+    const vision = await api("/api/chat/vups-v3-galax", {
+      method: "POST",
+      cookie,
+      body: {
+        stream: false,
+        model: "vups-v3-galax",
+        messages: [{ role: "user", content: "Read this", images: [{ mimeType: "image/png", data: pngData }] }]
+      }
+    });
+    assert.equal(vision.status, 200);
+    const parts = fakeProvider.state.chatRequests.at(-1).body.messages[1].content;
+    assert.ok(Array.isArray(parts));
+    assert.ok(parts.some(part => part.type === "image_url" && part.image_url?.url?.startsWith("data:image/png;base64,")));
+  } finally {
+    delete process.env.VUPS_VISION;
+  }
 
   process.env.VUPS_VISION = "false";
   try {
@@ -715,6 +721,29 @@ test("Vups v3 Galax streams SSE and enforces configured vision support", async (
   } finally {
     delete process.env.VUPS_VISION;
   }
+});
+
+test("Vups v3 Galax reports a reasoning-only length stream as output_limit", async () => {
+  const { cookie } = await signupUser();
+  fakeProvider.state.reset();
+  fakeProvider.state.set({ emptyStream: true, finishReason: "length" });
+
+  const response = await fetch(`${baseURL}/api/chat/vups-v3-galax`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Cookie: cookie },
+    body: JSON.stringify({ stream: true, model: "vups-v3-galax", messages: [{ role: "user", content: "Think only" }] })
+  });
+  const events = (await response.text())
+    .split("\n")
+    .filter(line => line.startsWith("data: "))
+    .map(line => JSON.parse(line.slice(6)));
+  const errorEvent = events.find(event => event.type === "error");
+  assert.equal(response.status, 200);
+  assert.ok(errorEvent, "a stream that never writes an answer must report an error");
+  assert.equal(errorEvent.code, "vups_output_limit");
+  assert.equal(events.some(event => event.type === "done"), false, "a reasoning-only stream must not report success");
+  assert.equal(events.filter(event => event.type === "delta").length, 0);
+  fakeProvider.state.reset();
 });
 
 test("chat surfaces provider errors clearly (invalid key, rate limit, unavailable model)", async () => {
@@ -1774,6 +1803,135 @@ test("OpenRouter without an API key falls back to the Ollama shared model", asyn
 });
 
 // ─── Frontend connectivity / CORS origins ───────────────────────────────────
+
+async function startFakeCloudflare() {
+  const requests = [];
+  const imageBytes = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    Buffer.from("vups-cloudflare-image")
+  ]);
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", chunk => { body += chunk; });
+    req.on("end", () => {
+      requests.push({ method: req.method, url: req.url, auth: req.headers.authorization, body: JSON.parse(body) });
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ result: { image: imageBytes.toString("base64") }, success: true, errors: [] }));
+    });
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  return {
+    baseUrl: `http://127.0.0.1:${server.address().port}`,
+    requests,
+    close: () => new Promise(resolve => server.close(resolve))
+  };
+}
+
+test("image generation endpoint returns the generated image from Cloudflare", async () => {
+  const fakeCloudflare = await startFakeCloudflare();
+  const { cookie } = await signupUser();
+  const saved = {
+    account: process.env.CLOUDFLARE_ACCOUNT_ID,
+    token: process.env.CLOUDFLARE_API_TOKEN,
+    base: process.env.CLOUDFLARE_AI_BASE_URL
+  };
+  process.env.CLOUDFLARE_ACCOUNT_ID = "test-account";
+  process.env.CLOUDFLARE_API_TOKEN = "test-token";
+  process.env.CLOUDFLARE_AI_BASE_URL = fakeCloudflare.baseUrl;
+  try {
+    const response = await api("/api/images/generate", {
+      method: "POST",
+      cookie,
+      body: { prompt: "a lime green robot" }
+    });
+    assert.equal(response.status, 200);
+    assert.equal(response.body.success, true);
+    assert.equal(response.body.model, "@cf/black-forest-labs/flux-1-schnell");
+    assert.equal(response.body.mimeType, "image/png");
+    assert.match(response.body.image, /^data:image\/png;base64,/);
+    assert.equal(fakeCloudflare.requests.length, 1);
+    assert.equal(fakeCloudflare.requests[0].auth, "Bearer test-token");
+    assert.equal(fakeCloudflare.requests[0].url, "/accounts/test-account/ai/run/@cf/black-forest-labs/flux-1-schnell");
+    assert.deepEqual(fakeCloudflare.requests[0].body, { prompt: "a lime green robot" });
+  } finally {
+    for (const [key, value] of [
+      ["CLOUDFLARE_ACCOUNT_ID", saved.account],
+      ["CLOUDFLARE_API_TOKEN", saved.token],
+      ["CLOUDFLARE_AI_BASE_URL", saved.base]
+    ]) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await fakeCloudflare.close();
+  }
+});
+
+test("image generation requires authentication and Cloudflare configuration", async () => {
+  const anonymous = await api("/api/images/generate", {
+    method: "POST",
+    body: { prompt: "a lime green robot" }
+  });
+  assert.equal(anonymous.status, 401);
+
+  const { cookie } = await signupUser();
+  const savedAccount = process.env.CLOUDFLARE_ACCOUNT_ID;
+  const savedToken = process.env.CLOUDFLARE_API_TOKEN;
+  delete process.env.CLOUDFLARE_ACCOUNT_ID;
+  delete process.env.CLOUDFLARE_API_TOKEN;
+  try {
+    const missing = await api("/api/images/generate", {
+      method: "POST",
+      cookie,
+      body: { prompt: "a lime green robot" }
+    });
+    assert.equal(missing.status, 503);
+    assert.equal(missing.body.code, "image_generation_not_configured");
+    assert.match(missing.body.message, /CLOUDFLARE_ACCOUNT_ID/);
+  } finally {
+    if (savedAccount === undefined) delete process.env.CLOUDFLARE_ACCOUNT_ID;
+    else process.env.CLOUDFLARE_ACCOUNT_ID = savedAccount;
+    if (savedToken === undefined) delete process.env.CLOUDFLARE_API_TOKEN;
+    else process.env.CLOUDFLARE_API_TOKEN = savedToken;
+  }
+
+  const invalid = await api("/api/images/generate", {
+    method: "POST",
+    cookie,
+    body: { prompt: "   " }
+  });
+  assert.equal(invalid.status, 400);
+  assert.equal(invalid.body.code, "image_prompt_invalid");
+});
+
+test("image generation is rate limited per user", async () => {
+  const { cookie } = await signupUser();
+  const savedAccount = process.env.CLOUDFLARE_ACCOUNT_ID;
+  const savedToken = process.env.CLOUDFLARE_API_TOKEN;
+  delete process.env.CLOUDFLARE_ACCOUNT_ID;
+  delete process.env.CLOUDFLARE_API_TOKEN;
+  try {
+    for (let index = 0; index < 5; index += 1) {
+      const response = await api("/api/images/generate", {
+        method: "POST",
+        cookie,
+        body: { prompt: "a lighthouse at dusk" }
+      });
+      assert.equal(response.status, 503);
+    }
+    const limited = await api("/api/images/generate", {
+      method: "POST",
+      cookie,
+      body: { prompt: "a lighthouse at dusk" }
+    });
+    assert.equal(limited.status, 429);
+    assert.match(limited.body.message, /Too many image generation requests/);
+  } finally {
+    if (savedAccount === undefined) delete process.env.CLOUDFLARE_ACCOUNT_ID;
+    else process.env.CLOUDFLARE_ACCOUNT_ID = savedAccount;
+    if (savedToken === undefined) delete process.env.CLOUDFLARE_API_TOKEN;
+    else process.env.CLOUDFLARE_API_TOKEN = savedToken;
+  }
+});
 
 test("GET /api returns an informative index instead of a bare 404", async () => {
   const response = await api("/api");

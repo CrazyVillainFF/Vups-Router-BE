@@ -250,9 +250,9 @@ For a deploy sanity check, `node scripts/verify-openrouter.mjs` (with `OPENROUTE
 - Browser requests go to `POST /api/chat/vups-v3-galax`, never directly to the upstream. The browser sees only the public model ID and a safe `Default` badge.
 - The system prompt is assembled server-side and cannot be supplied or replaced by the client. The `motion` mode appends a fixed motion-design instruction.
 - `VUPS_BASE_URL`, `VUPS_API_KEY`, and `VUPS_UNDERLYING_MODEL` are private backend values. When all three are set, they take precedence. When none are set, Vups v3 Galax reuses the existing shared OpenRouter configuration (`OPENROUTER_API_KEY`, optional `OPENROUTER_BASE_URL`, and `OPENROUTER_DEFAULT_MODEL`) so a deployment with working shared models does not need duplicate credentials. Partial VUPS configuration or neither configuration returns `503 {"code":"vups_not_configured"}`; invalid clients cannot choose a different underlying model.
-- Image input is forwarded only for the dedicated route and is rejected with `400 {"code":"vups_vision_unsupported"}` when `VUPS_VISION=false`. The server never generates images.
+- Image requests route to `VUPS_VISION_MODEL` when it is set. With the shared OpenRouter fallback, the default is the free, vision-capable `google/gemma-4-26b-a4b-it:free`, while text-only chats keep using `OPENROUTER_DEFAULT_MODEL`/`OPENROUTER_MODEL`. This prevents the text-only default model from rejecting images. A dedicated `VUPS_*` deployment must set `VUPS_VISION_MODEL` to an image-capable model available at `VUPS_BASE_URL`, or set `VUPS_VISION=true` to explicitly mark the dedicated model itself as vision-capable. `VUPS_VISION=false` disables image requests; a dedicated image request without either setting returns `400 {"code":"vups_vision_unsupported"}` instead of assuming text models can see images. Vups chat itself never generates images; prompt-based generation is a separate, optional Cloudflare Workers AI endpoint described below.
 - The route supports SSE streaming and non-streaming replies, persists normal conversation history, and uses the existing signed-in user, daily quota, and concurrency protections. Its rate limit defaults to 30 requests per minute per user and IP (`VUPS_CHAT_RATE_LIMIT_MAX`).
-- Streaming, vision, and free-tier availability depend on the configured upstream model. Verify those capabilities with the provider before advertising them; tests here use a fake provider.
+- Streaming, vision, and free-tier availability depend on the configured upstream model. The OpenRouter vision default is verified against the live catalog, but free-tier capacity can still be rate-limited; provide `VUPS_VISION_MODEL` to choose another compatible model.
 
 Environment variables (set in the Render dashboard, or omit all three to use the shared OpenRouter configuration):
 
@@ -261,8 +261,31 @@ Environment variables (set in the Render dashboard, or omit all three to use the
 | `VUPS_BASE_URL` | optional private OpenAI-compatible base URL, for example `https://provider.example.com/v1`. Server-side only. |
 | `VUPS_API_KEY` | optional private upstream key. Never expose, log, or commit it. |
 | `VUPS_UNDERLYING_MODEL` | optional exact upstream model ID that serves Vups v3 Galax. |
-| `VUPS_VISION` | optional `true` / `false`; unset lets the provider decide. |
+| `VUPS_VISION` | optional `true` / `false` for a dedicated model. `true` marks the dedicated model as vision-capable; `false` disables image requests; unset requires `VUPS_VISION_MODEL`. |
+| `VUPS_VISION_MODEL` | optional exact model ID for image requests. Defaults to `google/gemma-4-26b-a4b-it:free` when using the shared OpenRouter fallback. |
 | `VUPS_CHAT_RATE_LIMIT_MAX` | optional requests per minute per user and IP; default `30`. |
+
+## Image generation (Cloudflare Workers AI, optional)
+
+`POST /api/images/generate` generates an image from a prompt with Cloudflare Workers AI model `@cf/black-forest-labs/flux-1-schnell`. It is separate from chat and from image understanding/vision: it never changes the selected chat model, and generated images are not persisted in conversation history.
+
+- Requires a signed-in user, the existing per-user daily AI quota, concurrency protection, and an image-specific rate limit (default 5 requests per minute per user and IP).
+- Prompts are trimmed and limited to 2,048 characters, matching the model schema. Missing configuration returns `503 {"code":"image_generation_not_configured"}` before consuming quota.
+- The backend calls `POST https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/@cf/black-forest-labs/flux-1-schnell` with `Authorization: Bearer {CLOUDFLARE_API_TOKEN}`. This is the REST API, not the Worker-only `env.AI.run()` binding.
+- The documented JSON response contains `result.image` as base64 JPEG. The backend also accepts a binary `image/*` response, validates the payload, and returns `{ "success": true, "image": "data:image/jpeg;base64,...", "mimeType": "image/jpeg", "model": "@cf/black-forest-labs/flux-1-schnell" }`.
+- Cloudflare `401/403` maps to a safe `503` credential message, `429` maps to `429 image_generation_rate_limited`, timeouts to `504`, and other provider failures to `502`. No paid fallback is used, and a failed request never reports success.
+- Credentials and prompts are never logged. The frontend only receives the generated data URL and safe error messages.
+- Free Workers AI usage is quota-limited, not guaranteed. The frontend shows loading, error, download, and retry controls.
+
+Environment variables:
+
+| Variable | Value |
+| --- | --- |
+| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account ID. Server-side only. |
+| `CLOUDFLARE_API_TOKEN` | Workers AI API token with Read/Edit permission. Never expose or commit it. |
+| `CLOUDFLARE_AI_BASE_URL` | optional endpoint override, default `https://api.cloudflare.com/client/v4`. |
+| `IMAGE_GENERATION_TIMEOUT_MS` | optional request timeout, default `45000` (5s–120s). |
+| `IMAGE_GENERATION_RATE_LIMIT_MAX` | optional requests per minute per user and IP, default `5`. |
 
 ## Shared Ollama model (optional)
 
@@ -295,7 +318,7 @@ Do **not** run Ollama inside the existing Render web service. Render's free/stan
    ```
    curl https://vups-router-be.onrender.com/api/health          # database still connected
    ```
-   Sign in as any user and open the app — the model picker should list `gemma3:4b` under the "FREE MODELS" section (tagged "Free · No API key needed"), alongside any saved keys. `GET /api/settings/shared-model` (authenticated) reports `status: "available"` only when the model is actually installed and the server is reachable.
+   Sign in as any user and open the app — the model picker should list `gemma3:4b` under the "FREE MODELS" section (tagged "Free"), alongside any saved keys. `GET /api/settings/shared-model` (authenticated) reports `status: "available"` only when the model is actually installed and the server is reachable.
 6. If the Ollama host is unreachable from Render (private network not routable), requests fail cleanly with `shared_unavailable`; users with personal providers are unaffected.
 
 ### Admin controls
@@ -434,6 +457,12 @@ Vision capability is enforced server-side:
   `OLLAMA_VISION_MODELS` (Ollama does not report vision support).
 - **Personal providers**: unknown, so requests are allowed and no capability
   claim is made; the provider's own error surfaces if it rejects the image.
+- **Vups v3 Galax via OpenRouter fallback**: image requests use
+  `VUPS_VISION_MODEL` or the free default `google/gemma-4-26b-a4b-it:free`;
+  text requests keep the configured text model. Dedicated `VUPS_*` deployments
+  must set `VUPS_VISION_MODEL` (or `VUPS_VISION=true` for the dedicated model).
+  A provider response saying no endpoint supports image input is returned as
+  `400` `vups_vision_rejected`, not as a missing model.
 - Requesting images from a shared model without vision support returns `400`
   `model_no_vision` with the list of vision-capable shared models.
 
