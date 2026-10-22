@@ -1,5 +1,5 @@
 import jwt from "jsonwebtoken";
-import { rateLimit } from "express-rate-limit";
+import { ipKeyGenerator, rateLimit } from "express-rate-limit";
 import User from "./user.js";
 
 export const SESSION_COOKIE = "vr_session";
@@ -128,6 +128,15 @@ export const chatRateLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { message: "Too many chat requests. Please slow down and try again shortly." }
+});
+
+export const vupsGalaxRateLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: Number(process.env.VUPS_CHAT_RATE_LIMIT_MAX || 30),
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: req => `${req.userId || "anonymous"}:${ipKeyGenerator(req.ip)}`,
+  message: { message: "Too many Vups v3 Galax requests. Please slow down and try again shortly." }
 });
 
 export const settingsRateLimiter = rateLimit(

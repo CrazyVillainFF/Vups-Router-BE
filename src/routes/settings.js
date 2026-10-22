@@ -760,7 +760,7 @@ router.get("/models", async (req, res, next) => {
             name: model.name || model.id,
             ownedBy: SHARED_OWNER_LABEL,
             shared: true,
-            free: true,
+            free: model.free !== false,
             vision: model.vision === true,
             capabilities: model.capabilities ?? null,
             contextLength: model.contextLength ?? model.capabilities?.contextLength ?? null,

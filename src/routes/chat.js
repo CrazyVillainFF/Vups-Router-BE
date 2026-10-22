@@ -13,16 +13,40 @@ import {
   redactSecrets,
   startChatCompletionStream
 } from "../providerClient.js";
-import { chatRateLimiter, requireAuth } from "../middleware.js";
+import { chatRateLimiter, requireAuth, vupsGalaxRateLimiter } from "../middleware.js";
 import { UsageError, acquireSlot, consumeDailyQuota, releaseSlot } from "../usage.js";
 import { sharedModelStatus, sharedProviderForChat } from "../sharedModel.js";
 import { resolveOmniRouteChat } from "../omniroute.js";
 import { attachmentMetadata, validateImages } from "../chatImages.js";
+import {
+  VUPS_MODEL_ID,
+  buildVupsSystemPrompt,
+  normalizeVupsMode,
+  vupsProviderForChat
+} from "../vupsGalax.js";
 
 const router = Router();
 
 const SYSTEM_PROMPT =
-  "You are the VupsRouter AI assistant. VupsRouter helps developers and users explore AI models — hosted providers, OpenAI-compatible APIs, and locally-run open-weight models. Be concise, helpful, and honest about model limitations. Use markdown when it improves clarity. Do not pretend to know real-time facts you do not have. For large projects or multi-file code (for example a full marketplace app), organize the answer into named files/modules and generate them in manageable stages instead of promising an entire complex project in one reply. When the output limit is near, stop at a natural boundary and tell the user which files remain so they can continue.";
+  "You are the VupsRouter AI assistant. VupsRouter helps developers and users explore AI models — hosted providers, OpenAI-compatible APIs, and locally-run open-weight models. Be concise, helpful, and honest about model limitations. Use markdown when it improves clarity. Do not pretend to know real-time facts you do not have. For large projects or multi-file code (for example a full marketplace app), organize the answer into named files/modules and generate them in manageable stages instead of promising an entire complex project in one reply. When the output limit is near, stop at a natural boundary and tell the user which files remain so they can continue. For downloadable multi-file projects, put a line in the exact form `FILE: relative/path.ext` immediately before each fenced code block so the client can package the real files; use safe relative paths and never invent files.";
+
+const MOTION_DESIGN_SYSTEM_PROMPT = `${SYSTEM_PROMPT}
+
+You are currently in Motion Design mode. Act as a senior creative frontend engineer and motion designer. Help users plan, implement, explain, and debug production-quality web motion.
+
+Priorities:
+- Prefer GSAP timelines and ScrollTrigger for complex sequencing and scroll-linked motion. Use @gsap/react when the project uses React, and clean up timelines, ScrollTriggers, and listeners in effect cleanup.
+- Use CSS transitions/keyframes for simple state changes and microinteractions. Suggest Framer Motion/Motion for React only when its component model is a better fit. Use SVG animation for paths, drawing, and typography. Use Three.js/React Three Fiber only when the requested result justifies the cost and the hardware budget.
+- Start with the simplest technique that achieves the visual result. Do not add libraries or animate every element. Avoid generic layouts, decorative clutter, excessive gradients, and motion that harms readability.
+- Produce complete, runnable code with exact file paths, imports, and integration steps. If repository tools are available, inspect and modify the real files, then run the relevant checks. If they are not available, say so and give copy-ready code instead of claiming changes were made.
+- Respect prefers-reduced-motion, keyboard access, touch input, resizing, and mobile performance. Prefer transform and opacity, avoid layout thrashing, horizontal overflow, scroll traps, and broken pinning.
+- Check cleanup, stacking contexts, clipping, layout shift, animation timing, and GPU cost when debugging.
+- Never claim code was executed, tested, deployed, or visually verified unless it actually was. State remaining limitations and the exact commands the user must run.`;
+
+const CHAT_MODES = new Map([
+  ["general", SYSTEM_PROMPT],
+  ["motion", MOTION_DESIGN_SYSTEM_PROMPT]
+]);
 
 const MAX_MESSAGES = 60;
 const MAX_TOTAL_CHARS = 120000;
@@ -124,11 +148,14 @@ function sharedRoute(shared, requestedModel = "") {
   } else {
     model = shared.model && readyIds.includes(shared.model) ? shared.model : readyIds[0];
   }
+  const freeReadyIds = enabledModels
+    .filter(entry => entry.available !== false && entry.free === true)
+    .map(entry => entry.id);
   const configuredFallback =
-    shared.fallbackModel && shared.fallbackModel !== model && readyIds.includes(shared.fallbackModel)
+    shared.fallbackModel && shared.fallbackModel !== model && freeReadyIds.includes(shared.fallbackModel)
       ? shared.fallbackModel
       : null;
-  const fallbackModel = configuredFallback || readyIds.find(id => id !== model) || null;
+  const fallbackModel = configuredFallback || freeReadyIds.find(id => id !== model) || null;
   const visionModelIds = enabledModels
     .filter(entry => entry.available !== false && entry.vision === true)
     .map(entry => entry.id);
@@ -145,7 +172,23 @@ function sharedRoute(shared, requestedModel = "") {
   };
 }
 
-async function resolveProvider(userId, requestedModel, requestedConfigId, requestedSource = "") {
+function configOffersModel(config, model) {
+  if (!model) return true;
+  if (config.model === model) return true;
+  const savedModels = Array.isArray(config.models) ? config.models : [];
+  if (savedModels.length === 0) return true;
+  return savedModels.includes(model);
+}
+
+function chooseSavedConfig(candidates) {
+  if (candidates.length === 0) return { config: null, reason: "none" };
+  const active = candidates.filter(candidate => candidate.active === true);
+  if (active.length === 1) return { config: active[0], reason: null };
+  if (active.length > 1 || candidates.length > 1) return { config: null, reason: "ambiguous" };
+  return { config: candidates[0], reason: null };
+}
+
+async function resolveProvider(userId, requestedModel, requestedConfigId, requestedSource = "", requestedProviderId = "") {
   // A gateway source is an explicit, whitelisted selection from the model
   // picker. Client input can never choose an upstream URL.
   if (requestedSource) {
@@ -176,16 +219,79 @@ async function resolveProvider(userId, requestedModel, requestedConfigId, reques
         "config_not_found"
       );
     }
+    if (requestedProviderId && config.providerId !== requestedProviderId) {
+      throw new ProviderError(
+        "The selected provider does not match that saved configuration. Refresh the model menu and pick it again.",
+        400,
+        "provider_mismatch"
+      );
+    }
   }
 
   const sharedIds = new Set(sharedModelsOf(shared).map(model => model.id));
   if (!requestedConfigId) {
-    if (requestedModel && sharedIds.has(requestedModel)) {
+    if (requestedProviderId) {
+      const savedConfigs = await ProviderConfig.find({ userId })
+        .sort({ active: -1, updatedAt: -1 })
+        .select("+encryptedApiKey");
+      const providerConfigs = savedConfigs.filter(candidate => candidate.providerId === requestedProviderId);
+      if (providerConfigs.length === 0) {
+        throw new ProviderError(
+          "That saved provider was removed. Pick another model from the model menu.",
+          404,
+          "config_not_found"
+        );
+      }
+      const candidates = requestedModel
+        ? providerConfigs.filter(candidate => configOffersModel(candidate, requestedModel))
+        : providerConfigs;
+      if (candidates.length === 0) {
+        throw new ProviderError(
+          `"${requestedModel.slice(0, 80)}" is not one of your saved models for that provider. Refresh the model menu and choose a saved model.`,
+          400,
+          "invalid_model"
+        );
+      }
+      const chosen = chooseSavedConfig(candidates);
+      if (!chosen.config) {
+        throw new ProviderError(
+          "More than one saved provider matches that model. Choose the exact saved model from the model menu.",
+          409,
+          "ambiguous_model"
+        );
+      }
+      config = chosen.config;
+    } else if (requestedModel && sharedIds.has(requestedModel)) {
       return sharedRoute(shared, requestedModel);
+    } else if (requestedModel) {
+      // Never infer a provider from an unrelated active configuration. The
+      // requested model must belong to the configuration we use.
+      const candidates = (await ProviderConfig.find({ userId })
+        .sort({ active: -1, updatedAt: -1 })
+        .select("+encryptedApiKey"))
+        .filter(candidate => configOffersModel(candidate, requestedModel));
+      if (candidates.length === 0) {
+        if (shared.enabled && shared.available) return sharedRoute(shared, requestedModel);
+        throw new ProviderError(
+          "That model does not belong to any saved provider. Choose a model from the model menu or add it in settings.",
+          400,
+          "invalid_model"
+        );
+      }
+      const chosen = chooseSavedConfig(candidates);
+      if (!chosen.config) {
+        throw new ProviderError(
+          "More than one saved provider has that model. Choose the exact saved model from the model menu.",
+          409,
+          "ambiguous_model"
+        );
+      }
+      config = chosen.config;
+    } else {
+      config =
+        (await ProviderConfig.findOne({ userId, active: true }).select("+encryptedApiKey")) ||
+        (await ProviderConfig.findOne({ userId }).sort({ updatedAt: -1 }).select("+encryptedApiKey"));
     }
-    config =
-      (await ProviderConfig.findOne({ userId, active: true }).select("+encryptedApiKey")) ||
-      (await ProviderConfig.findOne({ userId }).sort({ updatedAt: -1 }).select("+encryptedApiKey"));
   }
   if (!config) {
     return sharedRoute(shared, requestedModel);
@@ -424,6 +530,316 @@ function canTrySharedFallback(provider, error) {
   return true;
 }
 
+function vupsFailure(error, { hasImages = false } = {}) {
+  const code = error?.code || "vups_upstream_error";
+  if (code === "vups_not_configured") return { status: 503, message: error.message, code };
+  if (code === "rate_limited") {
+    return {
+      status: 429,
+      message: "Vups v3 Galax is receiving too many requests right now. Please wait a moment and try again.",
+      code: "vups_rate_limited"
+    };
+  }
+  if (code === "timeout") {
+    return {
+      status: 504,
+      message: "Vups v3 Galax took too long to answer. Please try again.",
+      code: "vups_timeout"
+    };
+  }
+  if (hasImages && ["bad_request", "unprocessable", "invalid_model"].includes(code)) {
+    return {
+      status: 400,
+      message: "Vups v3 Galax could not read that image. The configured underlying model may not support image input. Try a different image or continue with text.",
+      code: "vups_vision_rejected"
+    };
+  }
+  if (["invalid_api_key", "forbidden", "insufficient_credits"].includes(code)) {
+    return {
+      status: 503,
+      message: "Vups v3 Galax is not available right now. Ask the administrator to verify the server configuration.",
+      code: "vups_unavailable"
+    };
+  }
+  if (["not_found", "model_unavailable", "empty_response", "empty_stream"].includes(code)) {
+    return {
+      status: 503,
+      message: "Vups v3 Galax's configured underlying model is unavailable right now. Ask the administrator to verify VUPS_UNDERLYING_MODEL.",
+      code: "vups_model_unavailable"
+    };
+  }
+  if (["network_error", "dns_error", "connection_refused", "provider_unavailable"].includes(code)) {
+    return {
+      status: 502,
+      message: "Vups v3 Galax could not reach its configured server. Please try again later.",
+      code: "vups_unreachable"
+    };
+  }
+  if (code === "too_large" || code === "response_too_large") {
+    return {
+      status: 413,
+      message: "That request is too large for Vups v3 Galax. Shorten the conversation or image and try again.",
+      code
+    };
+  }
+  return {
+    status: 502,
+    message: "Vups v3 Galax could not complete that request. Please try again.",
+    code: "vups_upstream_error"
+  };
+}
+
+router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res, next) => {
+  try {
+    const body = req.body || {};
+    const validated = validateMessages(body.messages);
+    if (typeof validated === "string") return res.status(400).json({ message: validated });
+
+    if (body.model !== undefined && body.model !== VUPS_MODEL_ID) {
+      return res.status(400).json({ message: "This route only serves Vups v3 Galax.", code: "invalid_model" });
+    }
+    if (body.system !== undefined || body.systemPrompt !== undefined) {
+      return res.status(400).json({ message: "System prompts are configured by the server and cannot be supplied by the client.", code: "invalid_prompt_source" });
+    }
+
+    let mode;
+    try {
+      mode = normalizeVupsMode(body.mode);
+    } catch (error) {
+      if (error instanceof ProviderError) return res.status(error.status ?? 400).json({ message: error.message, code: error.code });
+      throw error;
+    }
+
+    const stream = body.stream !== false;
+    const temperature =
+      typeof body.temperature === "number" && body.temperature >= 0 && body.temperature <= 2
+        ? body.temperature
+        : undefined;
+    const hasImages = validated.messages.some(message => Array.isArray(message.images) && message.images.length > 0);
+
+    let provider;
+    try {
+      provider = vupsProviderForChat();
+    } catch (error) {
+      if (error instanceof ProviderError) {
+        return res.status(error.status ?? 503).json({ message: error.message, code: error.code });
+      }
+      throw error;
+    }
+    if (hasImages && provider.vision === false) {
+      return res.status(400).json({
+        message: "Vups v3 Galax's configured underlying model does not support image input. Continue with text or ask the administrator to configure a vision-capable model.",
+        code: "vups_vision_unsupported"
+      });
+    }
+
+    await connectToDatabase();
+    if (req.user?.aiEnabled === false) {
+      return res.status(403).json({ message: "AI chat has been disabled for your account by an administrator.", code: "ai_disabled" });
+    }
+
+    if (!acquireSlot(req.userId)) {
+      return res.status(429).json({
+        message: "Too many AI requests are already in flight for your account. Wait for them to finish and try again.",
+        code: "concurrency_limit"
+      });
+    }
+    res.on("close", () => releaseSlot(req.userId));
+    try {
+      await consumeDailyQuota(req.userId);
+    } catch (error) {
+      if (error instanceof UsageError) return res.status(429).json({ message: error.message, code: error.code });
+      throw error;
+    }
+
+    const conversationId = typeof body.conversationId === "string" ? body.conversationId : null;
+    const upstreamMessages = [{ role: "system", content: buildVupsSystemPrompt(mode) }, ...validated.messages];
+
+    if (!stream) {
+      let result;
+      try {
+        result = await chatCompletion({
+          baseUrl: provider.baseUrl,
+          apiKey: provider.apiKey,
+          providerType: provider.providerType,
+          model: provider.model,
+          messages: upstreamMessages,
+          temperature
+        });
+      } catch (error) {
+        if (!(error instanceof ProviderError)) throw error;
+        const failure = vupsFailure(error, { hasImages });
+        return res.status(failure.status).json({ message: failure.message, code: failure.code });
+      }
+      const conversation = await persistConversation(req.userId, conversationId, validated.messages, result.content);
+      return res.json({
+        conversationId: String(conversation._id),
+        model: VUPS_MODEL_ID,
+        message: { role: "assistant", content: result.content },
+        finishReason: result.finishReason
+      });
+    }
+
+    let existingConversation = null;
+    if (conversationId && mongoose.isValidObjectId(conversationId)) {
+      existingConversation = await Conversation.findOne({ _id: conversationId, userId: req.userId }).select("_id");
+    }
+    const prospectiveId = existingConversation ? String(existingConversation._id) : String(new mongoose.Types.ObjectId());
+
+    const controller = new AbortController();
+    res.on("close", () => {
+      if (!res.writableEnded) controller.abort();
+    });
+
+    let upstream;
+    try {
+      upstream = await startChatCompletionStream(
+        {
+          baseUrl: provider.baseUrl,
+          apiKey: provider.apiKey,
+          providerType: provider.providerType,
+          model: provider.model,
+          messages: upstreamMessages,
+          temperature
+        },
+        controller.signal
+      );
+    } catch (error) {
+      if (controller.signal.aborted) return;
+      if (error instanceof ProviderError) {
+        const failure = vupsFailure(error, { hasImages });
+        return res.status(failure.status).json({ message: failure.message, code: failure.code });
+      }
+      return next(error);
+    }
+
+    res.status(200);
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+    if (typeof res.flushHeaders === "function") res.flushHeaders();
+    sendEvent(res, { type: "meta", conversationId: prospectiveId, model: VUPS_MODEL_ID });
+
+    const reader = upstream.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let fullText = "";
+    let failure = null;
+    let finishReason = null;
+    let usage = null;
+
+    try {
+      while (!failure) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith("data:")) continue;
+          const raw = trimmed.slice(5).trim();
+          if (!raw || raw === "[DONE]") continue;
+          let parsed;
+          try {
+            parsed = JSON.parse(raw);
+          } catch {
+            continue;
+          }
+          if (parsed?.error) {
+            failure = new ProviderError("The provider reported an error during streaming.", null, "stream_error");
+            break;
+          }
+          if (parsed?.type === "response.failed") {
+            failure = new ProviderError("The provider reported an error during streaming.", null, "stream_error");
+            break;
+          }
+          const choice = parsed?.choices?.[0];
+          if (typeof choice?.finish_reason === "string" && choice.finish_reason) {
+            finishReason = choice.finish_reason;
+          }
+          if (parsed?.usage && typeof parsed.usage === "object") {
+            usage = parsed.usage;
+          }
+          if (parsed?.type === "message_start" && parsed.message?.usage) {
+            usage = parsed.message.usage;
+          }
+          if (parsed?.type === "message_delta") {
+            if (parsed.usage && typeof parsed.usage === "object") usage = { ...(usage || {}), ...parsed.usage };
+            const stopReason = parsed.delta?.stop_reason;
+            if (stopReason === "max_tokens") finishReason = "length";
+            else if (stopReason === "end_turn" || stopReason === "stop_sequence") finishReason = "stop";
+            else if (typeof stopReason === "string") finishReason = stopReason;
+          }
+          if ((parsed?.type === "response.completed" || parsed?.type === "response.incomplete") && parsed.response) {
+            if (parsed.response.usage && typeof parsed.response.usage === "object") usage = parsed.response.usage;
+            const incomplete = parsed.response.incomplete_details?.reason;
+            if (typeof incomplete === "string" && incomplete) {
+              finishReason = incomplete === "max_output_tokens" ? "length" : incomplete;
+            } else if (parsed.response.status === "completed") {
+              finishReason = finishReason ?? "stop";
+            }
+          }
+          const text = extractStreamText(parsed);
+          if (text) {
+            fullText += text;
+            if (fullText.length > MAX_UPSTREAM_TEXT_CHARS) {
+              failure = new ProviderError("The provider returned more text than VupsRouter can safely process.", null, "response_too_large");
+              break;
+            }
+            sendEvent(res, { type: "delta", content: text });
+          }
+        }
+      }
+    } catch (error) {
+      if (!controller.signal.aborted) {
+        failure = error instanceof ProviderError ? error : new ProviderError("The provider stream was interrupted.", null, "stream_error");
+      }
+    } finally {
+      try {
+        await reader.cancel();
+      } catch {
+        /* stream already closed */
+      }
+    }
+
+    if (!failure && fullText.length === 0 && !controller.signal.aborted) {
+      failure = new ProviderError("The provider returned an empty response.", null, "empty_response");
+    }
+
+    if (fullText.length > 0) {
+      try {
+        const conversation = await persistConversation(req.userId, prospectiveId, validated.messages, fullText);
+        if (!failure && !controller.signal.aborted) {
+          sendEvent(res, {
+            type: "done",
+            conversationId: String(conversation._id),
+            finishReason: finishReason ?? "stop",
+            model: VUPS_MODEL_ID,
+            ...(usage ? { usage } : {})
+          });
+        }
+      } catch {
+        if (!failure) failure = new ProviderError("The response was generated but could not be saved to your history.", null, "persist_failed");
+      }
+    }
+
+    if (failure) {
+      const safe = vupsFailure(failure, { hasImages });
+      if (!controller.signal.aborted) sendEvent(res, { type: "error", message: safe.message, code: safe.code });
+    }
+    if (!res.writableEnded) res.end();
+  } catch (error) {
+    if (res.headersSent) {
+      sendEvent(res, { type: "error", message: "Something went wrong while streaming the Vups v3 Galax response.", code: "vups_stream_error" });
+      if (!res.writableEnded) res.end();
+      return;
+    }
+    return next(error);
+  }
+});
+
 router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
   try {
     const body = req.body || {};
@@ -431,6 +847,10 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
     if (typeof validated === "string") return res.status(400).json({ message: validated });
 
     const stream = body.stream !== false;
+    const mode = typeof body.mode === "string" ? body.mode.trim().toLowerCase() || "general" : "general";
+    if (!CHAT_MODES.has(mode)) {
+      return res.status(400).json({ message: "Unknown chat mode. Choose general or motion.", code: "invalid_mode" });
+    }
     const temperature =
       typeof body.temperature === "number" && body.temperature >= 0 && body.temperature <= 2
         ? body.temperature
@@ -444,11 +864,12 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
 
     const requestedModel = typeof body.model === "string" ? body.model.trim() : "";
     const requestedConfigId = typeof body.configId === "string" ? body.configId.trim() : "";
+    const requestedProviderId = typeof body.providerId === "string" ? body.providerId.trim().slice(0, 80) : "";
     const requestedSource = typeof body.source === "string" ? body.source.trim().toLowerCase() : "";
 
     let provider;
     try {
-      provider = await resolveProvider(req.userId, requestedModel, requestedConfigId, requestedSource);
+      provider = await resolveProvider(req.userId, requestedModel, requestedConfigId, requestedSource, requestedProviderId);
     } catch (error) {
       if (error instanceof ProviderError) {
         return res.status(error.status ?? (error.code === "key_decryption_failed" ? 500 : 400)).json({ message: error.message, code: error.code });
@@ -486,7 +907,7 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
     }
 
     const conversationId = typeof body.conversationId === "string" ? body.conversationId : null;
-    const upstreamMessages = [{ role: "system", content: SYSTEM_PROMPT }, ...validated.messages];
+    const upstreamMessages = [{ role: "system", content: CHAT_MODES.get(mode) }, ...validated.messages];
 
     if (!stream) {
       let result;

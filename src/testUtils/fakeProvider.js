@@ -27,8 +27,10 @@ export async function startFakeProvider() {
   const state = {
     chatRequests: [],
     modelsRequests: 0,
+    keyRequests: 0,
     behavior: {
       listStatus: 200,
+      keyStatus: 200,
       chatStatus: 200,
       chatStatusText: "",
       failStreamMidway: false,
@@ -37,7 +39,8 @@ export async function startFakeProvider() {
       invalidKey: false,
       finishReason: "stop",
       usageChunk: false,
-      emptyDeltaFirst: false
+      emptyDeltaFirst: false,
+      extraModels: []
     },
     set(partial) {
       Object.assign(state.behavior, partial);
@@ -45,7 +48,9 @@ export async function startFakeProvider() {
     reset() {
       state.chatRequests.length = 0;
       state.modelsRequests = 0;
+      state.keyRequests = 0;
       state.behavior.listStatus = 200;
+      state.behavior.keyStatus = 200;
       state.behavior.chatStatus = 200;
       state.behavior.chatStatusText = "";
       state.behavior.failStreamMidway = false;
@@ -55,6 +60,7 @@ export async function startFakeProvider() {
       state.behavior.finishReason = "stop";
       state.behavior.usageChunk = false;
       state.behavior.emptyDeltaFirst = false;
+      state.behavior.extraModels = [];
     }
   };
 
@@ -63,14 +69,33 @@ export async function startFakeProvider() {
     const auth = req.headers.authorization || "";
     const key = auth.startsWith("Bearer ") ? auth.slice(7) : "";
 
+    if (url.pathname.endsWith("/key") && req.method === "GET") {
+      state.keyRequests += 1;
+      if (key !== FAKE_API_KEY || state.behavior.invalidKey) {
+        return json(res, 401, { error: { message: "Invalid API key provided." } });
+      }
+      if (state.behavior.keyStatus !== 200) {
+        return json(res, state.behavior.keyStatus, { error: { message: `Key check rejected with ${state.behavior.keyStatus}` } });
+      }
+      return json(res, 200, {
+        data: {
+          label: "fake-key-label",
+          limit: 5,
+          limit_remaining: 3.5,
+          usage: 1.5,
+          is_free_tier: true
+        }
+      });
+    }
+
     if (url.pathname.endsWith("/models") && req.method === "GET") {
       state.modelsRequests += 1;
       if (key !== FAKE_API_KEY) return json(res, 401, { error: { message: "Invalid API key provided." } });
       if (state.behavior.listStatus !== 200) {
         return json(res, state.behavior.listStatus, { error: { message: `Listing rejected with ${state.behavior.listStatus}` } });
       }
-      return json(res, 200, {
-        data: FAKE_MODELS.map(id => ({
+      const models = [
+        ...FAKE_MODELS.map(id => ({
           id,
           name: id,
           owned_by: "fake",
@@ -79,8 +104,10 @@ export async function startFakeProvider() {
           supported_parameters: id === "fake-model-reasoning" ? ["tools", "reasoning"] : ["tools"],
           context_length: 32768,
           top_provider: { max_completion_tokens: 4096 }
-        }))
-      });
+        })),
+        ...state.behavior.extraModels
+      ];
+      return json(res, 200, { data: models });
     }
 
     if (url.pathname.endsWith("/chat/completions") && req.method === "POST") {
@@ -102,7 +129,8 @@ export async function startFakeProvider() {
         if (state.behavior.chatStatus === 404) return json(res, 404, { error: { message: "The model does not exist." } });
         return json(res, state.behavior.chatStatus, { error: { message: "Provider failure." } });
       }
-      if (!body.model || !FAKE_MODELS.includes(body.model)) {
+      const knownModels = [...FAKE_MODELS, ...state.behavior.extraModels.map(entry => entry.id)];
+      if (!body.model || !knownModels.includes(body.model)) {
         return json(res, 404, { error: { message: `The model \`${body.model}\` does not exist.` } });
       }
       const model = body.model;

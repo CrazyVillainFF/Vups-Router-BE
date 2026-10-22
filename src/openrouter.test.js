@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { after, beforeEach, test } from "node:test";
 
-const { checkOpenRouter, openRouterModelIsChat, openRouterModelIsFree, resetOpenRouterCache } = await import("./openrouter.js");
+const { checkOpenRouter, checkOpenRouterKey, openRouterModelIsChat, openRouterModelIsFree, resetOpenRouterCache } = await import("./openrouter.js");
 
 const FREE_ALPHA = {
   id: "free/alpha:free",
@@ -38,8 +38,27 @@ const NO_PRICING = {
   architecture: { input_modalities: ["text"], output_modalities: ["text"] }
 };
 
-const state = { modelsRequests: 0, listStatus: 200 };
+const state = { modelsRequests: 0, keyRequests: 0, listStatus: 200, keyStatus: 200 };
 const server = http.createServer((req, res) => {
+  if (req.url === "/v1/key") {
+    state.keyRequests += 1;
+    if (state.keyStatus !== 200) {
+      res.writeHead(state.keyStatus, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "invalid key" } }));
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      data: {
+        label: "test-label",
+        usage: 1.5,
+        limit: 5,
+        limit_remaining: 3.5,
+        is_free_tier: true
+      }
+    }));
+    return;
+  }
   if (req.url === "/v1/models") {
     state.modelsRequests += 1;
     if (state.listStatus !== 200) {
@@ -84,7 +103,9 @@ function setEnv({ model = FREE_ALPHA.id, fallback, models, ttl } = {}) {
 
 beforeEach(() => {
   state.modelsRequests = 0;
+  state.keyRequests = 0;
   state.listStatus = 200;
+  state.keyStatus = 200;
 });
 
 after(async () => {
@@ -122,18 +143,63 @@ test("the pricing filter does not trust model names or assume missing pricing is
   assert.equal(openRouterModelIsChat(FREE_ALPHA), true);
 });
 
-test("an explicit allowlist keeps missing or paid IDs visible but unavailable", async () => {
+test("an explicit allowlist enables paid IDs while keeping missing IDs unavailable", async () => {
   setEnv({ model: FREE_ALPHA.id, models: `${FREE_ALPHA.id},paid/premium,missing/model:free` });
   const result = await checkOpenRouter();
   assert.equal(result.status, "available");
   assert.equal(result.freeOnly, false);
   const paid = result.models.find(model => model.id === "paid/premium");
-  assert.equal(paid.available, false);
-  assert.equal(paid.reason, "not_free");
+  assert.equal(paid.available, true);
+  assert.equal(paid.paid, true);
+  assert.equal(paid.reason, undefined);
   const missing = result.models.find(model => model.id === "missing/model:free");
   assert.equal(missing.available, false);
   assert.equal(missing.reason, "missing");
   assert.ok(!result.models.some(model => model.id === FREE_BETA.id), "dynamic free models must not leak into an explicit allowlist");
+});
+
+test("paid defaults never make paid models fallback candidates", async () => {
+  setEnv({ model: PAID.id, models: `${PAID.id},${FREE_ALPHA.id},${FREE_BETA.id}`, fallback: FREE_BETA.id });
+  const result = await checkOpenRouter();
+  assert.equal(result.status, "available");
+  assert.equal(result.model, PAID.id);
+  assert.equal(result.fallbackModel, FREE_BETA.id);
+  assert.equal(result.models[0].paid, true);
+  assert.equal(result.models.find(model => model.id === FREE_ALPHA.id).paid, false);
+});
+
+test("a paid-only allowlist without a safe default does not silently choose a paid model", async () => {
+  setEnv({ model: "missing/default", models: PAID.id });
+  const result = await checkOpenRouter();
+  assert.equal(result.status, "missing_model");
+  assert.equal(result.available, false);
+  assert.equal(result.models.find(model => model.id === PAID.id).available, true);
+});
+
+test("OpenRouter key verification reports safe account limits and rejects bad keys", async () => {
+  setEnv();
+  const valid = await checkOpenRouterKey();
+  assert.equal(valid.configured, true);
+  assert.equal(valid.authenticated, true);
+  assert.equal(valid.status, "authenticated");
+  assert.equal(valid.usage, 1.5);
+  assert.equal(valid.limit, 5);
+  assert.equal(valid.limitRemaining, 3.5);
+  assert.equal(valid.isFreeTier, true);
+  assert.equal(valid.label, undefined, "key labels must not be exposed");
+  assert.equal(state.keyRequests, 1);
+
+  state.keyStatus = 401;
+  const rejected = await checkOpenRouterKey();
+  assert.equal(rejected.authenticated, false);
+  assert.equal(rejected.status, "unauthorized");
+  assert.equal(rejected.httpStatus, 401);
+  assert.equal(rejected.detail, undefined, "raw key errors must not be exposed");
+
+  delete process.env.OPENROUTER_API_KEY;
+  const missing = await checkOpenRouterKey();
+  assert.equal(missing.configured, false);
+  assert.equal(missing.status, "not_configured");
 });
 
 test("the catalog is cached and forceRefresh bypasses the cache", async () => {

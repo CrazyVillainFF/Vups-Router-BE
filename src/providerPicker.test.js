@@ -218,6 +218,58 @@ test("chat with a configId uses exactly that configuration's credentials", async
   assert.equal(fakeB.state.chatRequests.length, 0);
 });
 
+test("provider identity cannot cross saved configurations", async () => {
+  const { cookie } = await signupUser();
+  const first = await createConfig(cookie, {
+    provider: "Provider A",
+    providerId: "provider-a",
+    baseUrl: fakeA.baseUrl,
+    apiKey: FAKE_API_KEY,
+    model: "fake-model-mini"
+  });
+  const second = await createConfig(cookie, {
+    provider: "Provider B",
+    providerId: "provider-b",
+    baseUrl: fakeB.baseUrl,
+    apiKey: "sk-provider-b-key-333333",
+    model: "fake-model-mini"
+  });
+  await api(`/api/settings/providers/${first.body.config.configId}/activate`, { method: "POST", cookie });
+  fakeA.state.reset();
+  fakeB.state.reset();
+
+  const mismatch = await api("/api/chat", {
+    method: "POST",
+    cookie,
+    body: {
+      stream: false,
+      configId: second.body.config.configId,
+      providerId: "provider-a",
+      model: "fake-model-mini",
+      messages: [{ role: "user", content: "must not cross providers" }]
+    }
+  });
+  assert.equal(mismatch.status, 400);
+  assert.equal(mismatch.body.code, "provider_mismatch");
+  assert.equal(fakeA.state.chatRequests.length, 0);
+  assert.equal(fakeB.state.chatRequests.length, 0);
+
+  const selectedByProvider = await api("/api/chat", {
+    method: "POST",
+    cookie,
+    body: {
+      stream: false,
+      providerId: "provider-b",
+      model: "fake-model-mini",
+      messages: [{ role: "user", content: "route by provider identity" }]
+    }
+  });
+  assert.equal(selectedByProvider.status, 401, "provider B only accepts its own key");
+  assert.equal(fakeB.state.chatRequests.length, 1);
+  assert.equal(fakeB.state.chatRequests[0].key, "sk-provider-b-key-333333");
+  assert.equal(fakeA.state.chatRequests.length, 0, "the active provider must not receive a provider-B request");
+});
+
 test("a deleted configuration reference fails clearly instead of switching keys", async () => {
   const { cookie } = await signupUser();
   const created = await createConfig(cookie, {

@@ -118,10 +118,12 @@ All admin routes return `403` unless the signed-in user's email is listed in `AD
 
 | Method | Path | Notes |
 | --- | --- | --- |
-| `POST` | `/api/chat` | `{ conversationId?, messages, model?, configId?, temperature?, stream? }`. `configId` selects the exact saved configuration (omit for the free/shared model); an unknown `configId` returns `404 config_not_found`. The final message may carry `images: [{ name?, mimeType, data }]` (base64, PNG/JPEG/WebP/GIF). Proxies to `{baseUrl}/chat/completions` (AgentRouter `gpt-*` models: `{baseUrl}/responses`; OpenCode Zen routes each model to its documented chat, Responses, or Anthropic Messages endpoint). Streams SSE (`meta`, `delta`, `done`, `error` events) by default |
+| `POST` | `/api/chat` | `{ conversationId?, messages, model?, configId?, providerId?, source?, mode?, temperature?, stream? }`. `configId` selects the exact saved configuration; `providerId` prevents a saved-model request from falling through to another provider; omit both for the shared model. `mode` is `general` (default) or `motion`. An unknown `configId` returns `404 config_not_found`. The final message may carry `images: [{ name?, mimeType, data }]` (base64, PNG/JPEG/WebP/GIF). Proxies to `{baseUrl}/chat/completions` (AgentRouter `gpt-*` models: `{baseUrl}/responses`; OpenCode Zen routes each model to its documented chat, Responses, or Anthropic Messages endpoint). Streams SSE (`meta`, `delta`, `done`, `error` events) by default |
 | `GET` | `/api/conversations` | Lists the user's conversations |
 | `GET` | `/api/conversations/:id` | Full conversation with messages |
 | `DELETE` | `/api/conversations/:id` | Deletes one conversation |
+
+**Motion Design mode.** The chat composer has a real General/Motion Design selector. It sends `mode: "motion"` with the chat request; the backend swaps the system prompt for motion-engineering guidance covering GSAP timelines and ScrollTrigger, `@gsap/react` cleanup, CSS/SVG animation, Framer Motion trade-offs, responsive and reduced-motion behavior, performance, and debugging. It works through whichever provider/model is selected. The mode is stored in browser storage and is carried by both normal and Continue requests. Unknown modes return `400 invalid_mode`; the provider, credentials, persistence, and streaming behavior are unchanged.
 
 `GET /api/health` pings MongoDB and returns `503` when it is unavailable. `GET /` is a liveness response.
 
@@ -199,9 +201,9 @@ Rollback: restore the collection backup and set `ENCRYPTION_SECRET` back to the 
 
 ## OpenRouter shared model (production)
 
-When `OPENROUTER_API_KEY` is set, every registered user — including brand-new accounts — gets shared OpenRouter models with no personal key. The backend refreshes `GET /api/v1/models` every five minutes and offers every model whose `pricing.prompt` and `pricing.completion` are both zero and whose metadata advertises text output. It never assumes a `:free` suffix means free, never treats missing pricing as free, and never switches to a paid model. An explicit `OPENROUTER_MODELS` allowlist is optional; when set, only those IDs are eligible and paid/missing IDs remain visible but unavailable.
+When `OPENROUTER_API_KEY` is set, every registered user — including brand-new accounts — gets shared OpenRouter models with no personal key. The backend refreshes `GET /api/v1/models` every five minutes and offers every model whose `pricing.prompt` and `pricing.completion` are both zero and whose metadata advertises text output. It never assumes a `:free` suffix means free and never treats missing pricing as free. An explicit `OPENROUTER_MODELS` allowlist is optional; when set, only those IDs are eligible. Paid IDs work only when they are explicitly listed there; missing IDs remain unavailable. Automatic fallback is always free-only, so adding paid IDs never creates a silent paid retry.
 
-The in-chat model menu groups these rows under "FREE MODELS", shows capability badges, and provides search across model names, providers, tags, and capabilities. OpenRouter takes precedence over the Ollama shared model (below); if no OpenRouter key is set, the Ollama shared model is used.
+The in-chat model menu groups free rows under "FREE MODELS" and explicitly enabled paid rows under "SHARED PAID MODELS", labels paid rows as using the shared server key, shows capability badges, and provides search across model names, providers, tags, and capabilities. OpenRouter takes precedence over the Ollama shared model (below); if no OpenRouter key is set, the Ollama shared model is used.
 
 Catalog results are cached in memory (`OPENROUTER_CATALOG_TTL_MS`, default five minutes). On a transient refresh failure the last catalog is served for up to `OPENROUTER_CATALOG_STALE_MS` (default 24 hours) and marked stale; a rejected server key (`401`/`403`) is reported as `unauthorized` instead of serving stale models. A configured default that disappears is replaced by the first currently free model, and `defaultUnavailable` is reported. If no free chat model is available, shared chat is blocked with a clear error rather than pretending to work.
 
@@ -212,7 +214,7 @@ Environment variables (set in the Render dashboard):
 | Variable | Value |
 | --- | --- |
 | `OPENROUTER_API_KEY` | your OpenRouter key (`sk-or-v1-...`). Server-side only; never commit it and never send it to the frontend. |
-| `OPENROUTER_MODELS` | optional comma-separated allowlist of shared model IDs. When unset, all zero-price text chat models from the live catalog are offered. Allowlisted models must still be free; paid/missing IDs are listed as unavailable and rejected before any upstream call. |
+| `OPENROUTER_MODELS` | optional comma-separated allowlist of shared model IDs. When unset, all zero-price text chat models from the live catalog are offered. When set, paid IDs become available (they consume the shared key's credits); missing IDs are rejected before any upstream call. Use exact IDs from the catalog. |
 | `OPENROUTER_DEFAULT_MODEL` | preferred default free model. Falls back to the first currently free chat model when missing. |
 | `OPENROUTER_FALLBACK_MODEL` | preferred fallback free model. Falls back to the first different available free model. |
 | `OPENROUTER_MODEL` | legacy alias for `OPENROUTER_DEFAULT_MODEL`; `OPENROUTER_DEFAULT_MODEL` wins when both are set. |
@@ -229,6 +231,9 @@ Behavior and safety:
 - Rate limits are distinguished: a model-specific rate limit returns `429 {"code":"shared_model_rate_limited"}` ("pick another shared model"), while account-wide free-quota exhaustion (OpenRouter `free-models-per-day` text or HTTP 402) returns `429 {"code":"shared_quota_exhausted"}` and explicitly says switching models will not help. Upstream key problems (401/403) map to `503 {"code":"shared_unavailable"}` and never instruct users to fix a personal key. No raw provider text or account details leak.
 - Free OpenRouter models are shared across the whole account (roughly 50 free requests/day for accounts with under $10 balance), so the per-user daily quota protects the shared pool.
 - Admins (`ADMIN_EMAILS`) can disable/re-enable the shared model at runtime: `POST /api/admin/shared-model {"enabled": false}`.
+- Admins can verify the Render key and endpoint without inference at `GET /api/admin/openrouter/diagnostics`. It calls `GET {base}/key`, returns only authentication status and safe usage/limit fields, and never returns the key or authorization header. `POST /api/admin/openrouter/test-model {"model":"exact/id"}` sends one minimal chat request with that key and exact catalog ID; unknown or disabled IDs are rejected before any upstream call.
+- In production, `OPENROUTER_BASE_URL` must be `https://openrouter.ai/api/v1`. Custom values are ignored unless `OPENROUTER_ALLOW_CUSTOM_BASE_URL=true`, preventing a wrong or unrelated upstream from being used accidentally.
+- **401 checklist:** open `GET /api/admin/openrouter/diagnostics` while signed in as an admin. Confirm `baseUrl` is exactly `https://openrouter.ai/api/v1`, `authentication.status` is `authenticated`, and the intended model is present. Then test that exact ID with `POST /api/admin/openrouter/test-model`. An upstream message such as `unauthorized client detected` is not an OpenRouter error; it usually means requests are reaching a different gateway, so check `OPENROUTER_BASE_URL` and the selected saved provider before replacing the key. Never send the key to a browser or third-party diagnostic site.
 - Automated tests cover zero-price filtering, missing/malformed pricing, cache refresh and stale fallback, unauthorized keys, explicit allowlists, non-streaming fallback, streaming fallback before headers, and no retries for account-wide quota failures. Live OpenRouter inference depends on the configured key, credits, and current provider availability; run the deployment check below before claiming a live success.
 - Live check on 2026-10-20: the catalog returned 20 zero-price chat models; the configured key was accepted as a free-tier key; the default (`nvidia/nemotron-3.5-lightning:free`) and fallback (`cohere/north-mini-code:free`) probes both returned `finish_reason: stop` with `OK`. This is a point-in-time result, not a guarantee of future availability.
 
@@ -237,6 +242,27 @@ For a deploy sanity check, `node scripts/verify-openrouter.mjs` (with `OPENROUTE
 **Long responses & truncation.** The shared output limit defaults to `4096` tokens (`OPENROUTER_MAX_OUTPUT_TOKENS`, clamped server-side to `8192`). Every streaming reply forwards the provider's `finish_reason` in the final `done` SSE event (`stop`, `length`, …), plus token `usage` when the provider sends it. When a reply is cut off by the limit, the client keeps the partial answer, shows “Response reached its length limit”, and offers “Continue generating” — which asks the model to continue without repeating previous text. Code-generation prompts are instructed to split large projects into files and generate them in manageable stages.
 
 **Error taxonomy.** Provider/model failures return safe, specific codes and are never labeled as database failures: `400` invalid request/model (`bad_request`, `not_found`, `invalid_model`), `401` bad credentials (`invalid_api_key`), `402` insufficient credits, `429` rate limits (`rate_limited`, `shared_model_rate_limited`, `shared_quota_exhausted`), `502` provider outage/endpoint rejection (`provider_unavailable`, `network_error`, `method_not_allowed` for upstream HTTP 405), `503` shared model unavailable (`shared_unavailable`, `shared_model_unavailable`), `504` timeout. Mid-stream provider errors arrive as `{ "type": "error" }` SSE events even though the HTTP status is already `200`. The database-unavailable message is only used for confirmed MongoDB connection/query failures.
+
+## Vups v3 Galax (built-in, optional)
+
+`Vups v3 Galax` (`vups-v3-galax`) is a first-party model served by this backend through an OpenAI-compatible upstream. It appears at the top of the in-chat model menu as a free, built-in default with no user API key; saved personal providers, shared OpenRouter models, and the OmniRoute gateway remain selectable in their own groups.
+
+- Browser requests go to `POST /api/chat/vups-v3-galax`, never directly to the upstream. The browser sees only the public model ID and a safe `Default` badge.
+- The system prompt is assembled server-side and cannot be supplied or replaced by the client. The `motion` mode appends a fixed motion-design instruction.
+- `VUPS_BASE_URL`, `VUPS_API_KEY`, and `VUPS_UNDERLYING_MODEL` are private backend values. When all three are set, they take precedence. When none are set, Vups v3 Galax reuses the existing shared OpenRouter configuration (`OPENROUTER_API_KEY`, optional `OPENROUTER_BASE_URL`, and `OPENROUTER_DEFAULT_MODEL`) so a deployment with working shared models does not need duplicate credentials. Partial VUPS configuration or neither configuration returns `503 {"code":"vups_not_configured"}`; invalid clients cannot choose a different underlying model.
+- Image input is forwarded only for the dedicated route and is rejected with `400 {"code":"vups_vision_unsupported"}` when `VUPS_VISION=false`. The server never generates images.
+- The route supports SSE streaming and non-streaming replies, persists normal conversation history, and uses the existing signed-in user, daily quota, and concurrency protections. Its rate limit defaults to 30 requests per minute per user and IP (`VUPS_CHAT_RATE_LIMIT_MAX`).
+- Streaming, vision, and free-tier availability depend on the configured upstream model. Verify those capabilities with the provider before advertising them; tests here use a fake provider.
+
+Environment variables (set in the Render dashboard, or omit all three to use the shared OpenRouter configuration):
+
+| Variable | Value |
+| --- | --- |
+| `VUPS_BASE_URL` | optional private OpenAI-compatible base URL, for example `https://provider.example.com/v1`. Server-side only. |
+| `VUPS_API_KEY` | optional private upstream key. Never expose, log, or commit it. |
+| `VUPS_UNDERLYING_MODEL` | optional exact upstream model ID that serves Vups v3 Galax. |
+| `VUPS_VISION` | optional `true` / `false`; unset lets the provider decide. |
+| `VUPS_CHAT_RATE_LIMIT_MAX` | optional requests per minute per user and IP; default `30`. |
 
 ## Shared Ollama model (optional)
 

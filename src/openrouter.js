@@ -15,6 +15,7 @@ export const OPENROUTER_CATALOG_TTL_DEFAULT = 300000;
 export const OPENROUTER_CATALOG_STALE_DEFAULT = 86400000;
 
 const MODELS_TIMEOUT_MS = 10000;
+const KEY_TIMEOUT_MS = 10000;
 const MAX_MODEL_ID_LENGTH = 200;
 let catalogCache = null;
 
@@ -41,7 +42,15 @@ export function openRouterBaseUrl() {
   }
   if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return null;
   if (parsed.username || parsed.password) return null;
-  return parsed.origin + parsed.pathname.replace(/\/+$/, "");
+  const normalized = parsed.origin + parsed.pathname.replace(/\/+$/, "");
+  if (
+    process.env.NODE_ENV === "production" &&
+    process.env.OPENROUTER_ALLOW_CUSTOM_BASE_URL !== "true" &&
+    normalized !== OPENROUTER_API_BASE
+  ) {
+    return null;
+  }
+  return normalized;
 }
 
 function configuredDefaultModel() {
@@ -126,10 +135,11 @@ function providerName(id) {
   return id.includes("/") ? id.split("/")[0] : "openrouter";
 }
 
-function modelRow(entry, id, overrides) {
+function modelRow(entry, id, overrides, { allowPaid = false } = {}) {
   const capabilities = modelCapabilities(entry, id, overrides);
   const free = openRouterModelIsFree(entry);
-  const available = Boolean(entry) && free && openRouterModelIsChat(entry);
+  const chat = openRouterModelIsChat(entry);
+  const available = Boolean(entry) && chat && (free || allowPaid);
   return {
     id,
     name: typeof entry?.name === "string" && entry.name.trim() ? entry.name.trim() : id,
@@ -137,7 +147,8 @@ function modelRow(entry, id, overrides) {
     provider: providerName(id),
     available,
     free,
-    ...(available ? {} : { reason: entry ? (free ? "not_chat" : "not_free") : "missing" }),
+    paid: Boolean(entry) && !free,
+    ...(available ? {} : { reason: entry ? (chat ? "not_free" : "not_chat") : "missing" }),
     vision: capabilities.vision,
     capabilities,
     contextLength: capabilities.contextLength,
@@ -153,6 +164,7 @@ function unavailableRows(ids, overrides) {
     provider: providerName(id),
     available: false,
     free: null,
+    paid: null,
     vision: overrides.has(id),
     capabilities: modelCapabilities(undefined, id, overrides),
     contextLength: null,
@@ -270,8 +282,9 @@ export async function checkOpenRouter({ forceRefresh = false } = {}) {
   }
 
   const byId = new Map(catalog.entries.map(entry => [entry.id, entry]));
+  const allowPaid = Boolean(allowlist);
   const checked = allowlist
-    ? allowlist.map(id => modelRow(byId.get(id), id, overrides))
+    ? allowlist.map(id => modelRow(byId.get(id), id, overrides, { allowPaid }))
     : catalog.entries
         .filter(entry => openRouterModelIsFree(entry) && openRouterModelIsChat(entry))
         .map(entry => modelRow(entry, entry.id, overrides))
@@ -290,11 +303,24 @@ export async function checkOpenRouter({ forceRefresh = false } = {}) {
   }
 
   const defaultReady = ready.some(model => model.id === requestedDefault);
-  const model = defaultReady ? requestedDefault : ready[0].id;
+  const model = defaultReady ? requestedDefault : ready.find(candidate => candidate.free)?.id || null;
+  if (!model) {
+    return {
+      status: "missing_model",
+      model: requestedDefault,
+      fallbackModel: null,
+      available: false,
+      freeOnly: !allowlist,
+      defaultUnavailable: true,
+      catalogStale: catalog.stale,
+      models: checked
+    };
+  }
+  const freeReady = ready.filter(candidate => candidate.free === true);
   const fallbackReady = configuredFallback && configuredFallback !== model
-    ? ready.find(candidate => candidate.id === configuredFallback)
+    ? freeReady.find(candidate => candidate.id === configuredFallback)
     : null;
-  const fallbackModel = fallbackReady?.id || ready.find(candidate => candidate.id !== model)?.id || null;
+  const fallbackModel = fallbackReady?.id || freeReady.find(candidate => candidate.id !== model)?.id || null;
   const orderedModels = [
     ...checked.filter(candidate => candidate.id === model),
     ...checked.filter(candidate => candidate.id !== model)
@@ -309,6 +335,56 @@ export async function checkOpenRouter({ forceRefresh = false } = {}) {
     defaultUnavailable: Boolean(configuredDefault && !defaultReady),
     catalogStale: catalog.stale,
     models: orderedModels
+  };
+}
+
+function safeNumber(value) {
+  if (value === undefined || value === null || value === "") return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+export async function checkOpenRouterKey() {
+  const key = openRouterApiKey();
+  const baseUrl = openRouterBaseUrl();
+  if (!key || !baseUrl) {
+    return { configured: false, authenticated: false, status: "not_configured", httpStatus: null };
+  }
+  let response;
+  try {
+    response = await fetch(`${baseUrl}/key`, {
+      headers: { Accept: "application/json", Authorization: `Bearer ${key}` },
+      signal: AbortSignal.timeout(KEY_TIMEOUT_MS)
+    });
+  } catch {
+    return { configured: true, authenticated: false, status: "unreachable", httpStatus: null };
+  }
+  if (response.status === 401 || response.status === 403) {
+    return { configured: true, authenticated: false, status: "unauthorized", httpStatus: response.status };
+  }
+  if (!response.ok) {
+    return { configured: true, authenticated: false, status: "error", httpStatus: response.status };
+  }
+  let payload;
+  try {
+    payload = await response.json();
+  } catch {
+    return { configured: true, authenticated: false, status: "invalid_response", httpStatus: response.status };
+  }
+  const data = payload?.data && typeof payload.data === "object" ? payload.data : null;
+  if (!data) {
+    return { configured: true, authenticated: false, status: "invalid_response", httpStatus: response.status };
+  }
+  return {
+    configured: true,
+    authenticated: true,
+    status: "authenticated",
+    httpStatus: response.status,
+    usage: safeNumber(data.usage),
+    limit: safeNumber(data.limit),
+    limitRemaining: safeNumber(data.limit_remaining),
+    isFreeTier: data.is_free_tier === true,
+    isProvisioningKey: data.is_provisioning_key === true
   };
 }
 
