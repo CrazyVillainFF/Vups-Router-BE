@@ -11,6 +11,10 @@ const userSchema = new mongoose.Schema({
   resetAuthHash: { type: String, default: undefined, select: false },
   resetAuthExpires: { type: Date, default: undefined, select: false },
   aiEnabled: { type: Boolean, default: true },
+  // Explicit model-picker preference. null means "not chosen yet"; the API
+  // derives a safe default from the user's saved configurations so an existing
+  // custom setup is never silently switched to the free catalogue.
+  modelType: { type: String, enum: ["custom", "free", null], default: null },
   aiUsage: {
     day: { type: String, default: "" },
     count: { type: Number, default: 0 }

@@ -1,5 +1,6 @@
 import { Router } from "express";
 import connectToDatabase from "../db.js";
+import User from "../user.js";
 import ProviderConfig, { ensureProviderIndexes, newConfigId, providerIdFromName } from "../providerConfig.js";
 import { decryptSecret, encryptSecret, maskApiKey } from "../encryption.js";
 import {
@@ -17,6 +18,8 @@ import {
 import { requireAuth, settingsRateLimiter } from "../middleware.js";
 import { SHARED_OWNER_LABEL, sharedModelStatus } from "../sharedModel.js";
 import { checkOmniRoute, omnirouteModelRows, publicOmniRouteStatus } from "../omniroute.js";
+import { freeModelCatalogForUser } from "../freeModelCatalog.js";
+import { modelTypeForUser, normalizeModelType, preserveFirstProviderModelType } from "../modelType.js";
 
 const router = Router();
 
@@ -249,6 +252,44 @@ async function storedApiKey(config) {
   }
 }
 
+// ─── Model type and universal free catalogue ────────────────────────────────
+
+router.put("/model-type", async (req, res, next) => {
+  try {
+    const modelType = normalizeModelType(req.body?.modelType);
+    if (!modelType) {
+      return res.status(400).json({ message: "Choose either the custom-provider model list or the all-free model catalogue.", code: "invalid_model_type" });
+    }
+    await connectToDatabase();
+    const updated = await User.findByIdAndUpdate(
+      req.userId,
+      { $set: { modelType } },
+      { returnDocument: "after", projection: "modelType" }
+    );
+    if (!updated) return res.status(404).json({ message: "Your account was not found." });
+    return res.json({
+      modelType,
+      message: modelType === "free"
+        ? "All Free Models is now used in chat. Your saved provider configuration is unchanged."
+        : "Your own provider models are now used in chat. The free catalogue remains available."
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.get("/free-models", async (req, res, next) => {
+  try {
+    await connectToDatabase();
+    const forceRefresh = String(req.query.refresh || "").toLowerCase() === "1" || req.query.refresh === "true";
+    const catalog = await freeModelCatalogForUser(req.userId, { forceRefresh });
+    const { modelType } = await modelTypeForUser(req.userId, catalog.providers.filter(provider => !provider.shared).length);
+    return res.json({ modelType, catalog });
+  } catch (error) {
+    return next(error);
+  }
+});
+
 // ─── Multi-configuration management ─────────────────────────────────────────
 
 router.get("/providers", async (req, res, next) => {
@@ -267,7 +308,8 @@ router.get("/providers", async (req, res, next) => {
       .slice()
       .sort((a, b) => Number(b.active) - Number(a.active) || new Date(b.updatedAt) - new Date(a.updatedAt))
       .map(publicConfig);
-    return res.json({ providers, activeProviderId: activeConfigId, activeConfigId });
+    const preference = await modelTypeForUser(req.userId, configs.length);
+    return res.json({ providers, activeProviderId: activeConfigId, activeConfigId, ...preference });
   } catch (error) {
     return next(error);
   }
@@ -279,7 +321,8 @@ router.post("/providers", async (req, res, next) => {
   try {
     const input = req.body || {};
     await connectToDatabase();
-    await ensureProviderIds(req.userId);
+    const configs = await ensureProviderIds(req.userId);
+    await preserveFirstProviderModelType(req.userId, configs.length);
     const built = buildProviderUpdate(input, null);
     if (built.error) return res.status(400).json({ message: built.error });
     const configId = newConfigId();
@@ -311,8 +354,9 @@ router.put("/providers/:identifier", async (req, res, next) => {
     }
     const input = req.body || {};
     await connectToDatabase();
-    await ensureProviderIds(req.userId);
+    const configs = await ensureProviderIds(req.userId);
     const existing = await resolveStoredConfig(req.userId, identifier);
+    if (!existing) await preserveFirstProviderModelType(req.userId, configs.length);
     const built = buildProviderUpdate(input, existing);
     if (built.error) return res.status(400).json({ message: built.error });
 
@@ -548,9 +592,10 @@ router.put("/providers/:identifier/models", async (req, res, next) => {
 router.get("/provider", async (req, res, next) => {
   try {
     await connectToDatabase();
-    await ensureProviderIds(req.userId);
+    const configs = await ensureProviderIds(req.userId);
     const config = await loadActiveConfig(req.userId);
-    return res.json({ config: publicConfig(config) });
+    const preference = await modelTypeForUser(req.userId, configs.length);
+    return res.json({ config: publicConfig(config), ...preference });
   } catch (error) {
     return next(error);
   }
@@ -560,10 +605,11 @@ router.put("/provider", async (req, res, next) => {
   try {
     const input = req.body || {};
     await connectToDatabase();
-    await ensureProviderIds(req.userId);
+    const configs = await ensureProviderIds(req.userId);
     // Legacy single-provider clients edit "their" configuration in place:
     // renaming a provider must keep the saved key and never create a duplicate.
     const existing = await loadActiveConfig(req.userId);
+    if (!existing) await preserveFirstProviderModelType(req.userId, configs.length);
     const apiKey = typeof input.apiKey === "string" ? input.apiKey.trim() : "";
     const validationError = validateProviderFields(
       { provider: input.provider, baseUrl: input.baseUrl, apiKey, model: input.model ?? "" },

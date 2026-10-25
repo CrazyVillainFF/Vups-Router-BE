@@ -31,6 +31,11 @@ const providerConfigSchema = new mongoose.Schema({
   baseUrl: { type: String, required: true, trim: true, maxlength: 500 },
   model: { type: String, trim: true, maxlength: 200, default: "" },
   models: { type: [String], default: [] },
+  // Models whose zero price was verified from provider metadata during free
+  // catalogue discovery. This lets the free picker route a model the user has
+  // not explicitly saved, without trusting a client-supplied model ID.
+  freeModels: { type: [String], default: [] },
+  freeModelsAt: { type: Date, default: null },
   defaultModel: { type: String, trim: true, maxlength: 200, default: "" },
   enabled: { type: Boolean, default: true },
   active: { type: Boolean, default: false },

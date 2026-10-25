@@ -3,6 +3,14 @@ import mongoose from "mongoose";
 import connectToDatabase, { isDatabaseFailure } from "../db.js";
 import ProviderConfig from "../providerConfig.js";
 import Conversation from "../conversation.js";
+import Artifact from "../artifact.js";
+import {
+  ArtifactError,
+  applyContinuationFile,
+  buildCodeArtifact,
+  continuationPlan,
+  mergeContinuation
+} from "../codeArtifacts.js";
 import { decryptSecret } from "../encryption.js";
 import {
   ProviderError,
@@ -32,7 +40,7 @@ import {
 const router = Router();
 
 const SYSTEM_PROMPT =
-  "You are the VupsRouter AI assistant. VupsRouter helps developers and users explore AI models — hosted providers, OpenAI-compatible APIs, and locally-run open-weight models. Be concise, helpful, and honest about model limitations. Use markdown when it improves clarity. Do not pretend to know real-time facts you do not have. For large projects or multi-file code (for example a full marketplace app), organize the answer into named files/modules and generate them in manageable stages instead of promising an entire complex project in one reply. When the output limit is near, stop at a natural boundary and tell the user which files remain so they can continue. For downloadable multi-file projects, put a line in the exact form `FILE: relative/path.ext` immediately before each fenced code block so the client can package the real files; use safe relative paths and never invent files.";
+  "You are the VupsRouter AI assistant. VupsRouter helps developers and users explore AI models ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â hosted providers, OpenAI-compatible APIs, and locally-run open-weight models. Be concise, helpful, and honest about model limitations. Use markdown when it improves clarity. Do not pretend to know real-time facts you do not have. For large projects or multi-file code (for example a full marketplace app), organize the answer into named files/modules and generate them in manageable stages instead of promising an entire complex project in one reply. When the output limit is near, stop at a natural boundary and tell the user which files remain so they can continue. For downloadable multi-file projects, put a line in the exact form `FILE: relative/path.ext` immediately before each fenced code block so the client can package the real files; use safe relative paths and never invent files.";
 
 const MOTION_DESIGN_SYSTEM_PROMPT = `${SYSTEM_PROMPT}
 
@@ -55,9 +63,12 @@ const CHAT_MODES = new Map([
 const MAX_MESSAGES = 60;
 const MAX_TOTAL_CHARS = 120000;
 const MAX_STORED_MESSAGES = 200;
+const MAX_ASSISTANT_MESSAGE_CHARS = 100000;
+const MAX_STORED_CHARS = 4_000_000;
+const FILE_MARKER_RE = /\b(?:file|filename)\s*:\s*[`"'*]*([^\s`"'*]+)/gi;
 const MAX_UPSTREAM_TEXT_CHARS = 2_000_000;
 
-function validateMessages(value) {
+function validateMessages(value, { allowAssistantLast = false } = {}) {
   if (!Array.isArray(value) || value.length === 0) return "messages must be a non-empty array.";
   if (value.length > MAX_MESSAGES) return `A request can contain at most ${MAX_MESSAGES} messages.`;
   const messages = [];
@@ -66,8 +77,12 @@ function validateMessages(value) {
     const entry = value[index];
     const role = entry?.role;
     const content = typeof entry?.content === "string" ? entry.content : "";
+    const messageId = typeof entry?.messageId === "string" && /^[A-Za-z0-9_-]{1,80}$/.test(entry.messageId.trim())
+      ? entry.messageId.trim()
+      : undefined;
     if (role !== "user" && role !== "assistant") return "Every message needs a role of user or assistant.";
-    if (content.length > 32000) return "A single message cannot exceed 32000 characters.";
+    if (role === "user" && content.length > 32000) return "A single message cannot exceed 32000 characters.";
+    if (role === "assistant" && content.length > MAX_ASSISTANT_MESSAGE_CHARS) return "A single assistant message is too large to replay. Start a new chat or continue from the saved code artifact.";
     const images = validateImages(entry?.images);
     if (images.error) return images.error;
     if (images.images.length > 0) {
@@ -78,13 +93,31 @@ function validateMessages(value) {
     total += content.length;
     if (total > MAX_TOTAL_CHARS) return "The conversation is too large. Start a new chat or shorten your messages.";
     if (images.images.length > 0) {
-      messages.push({ role, content, images: images.images, attachmentMeta: attachmentMetadata(images.images) });
+      messages.push({ role, content, images: images.images, attachmentMeta: attachmentMetadata(images.images), ...(messageId ? { messageId } : {}) });
     } else {
-      messages.push({ role, content });
+      messages.push({ role, content, ...(messageId ? { messageId } : {}) });
     }
   }
-  if (messages[messages.length - 1].role !== "user") return "The last message must come from the user.";
+  if (!allowAssistantLast && messages[messages.length - 1].role !== "user") return "The last message must come from the user.";
   return { messages };
+}
+
+function parseMessageId(value) {
+  return typeof value === "string" && /^[A-Za-z0-9_-]{1,80}$/.test(value.trim()) ? value.trim() : "";
+}
+
+function generatedArtifactTitle(messages) {
+  const firstUser = messages.find(message => message.role === "user");
+  const text = String(firstUser?.content || "").replace(/\s+/g, " ").trim();
+  return text ? text.slice(0, 80) : "Generated code";
+}
+function parseContinuation(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const messageId = parseMessageId(value.messageId);
+  if (!messageId) {
+    throw new ProviderError("Choose a saved partial response to continue.", 400, "invalid_continuation");
+  }
+  return { messageId };
 }
 
 const SHARED_UNAVAILABLE_MESSAGES = {
@@ -180,6 +213,7 @@ function sharedRoute(shared, requestedModel = "") {
 function configOffersModel(config, model) {
   if (!model) return true;
   if (config.model === model) return true;
+  if (Array.isArray(config.freeModels) && config.freeModels.includes(model)) return true;
   const savedModels = Array.isArray(config.models) ? config.models : [];
   if (savedModels.length === 0) return true;
   return savedModels.includes(model);
@@ -309,9 +343,16 @@ async function resolveProvider(userId, requestedModel, requestedConfigId, reques
     );
   }
   const savedModelIds = Array.isArray(config.models) ? config.models : [];
-  if (requestedModel && savedModelIds.length > 0 && !savedModelIds.includes(requestedModel) && requestedModel !== config.model) {
+  const verifiedFreeIds = Array.isArray(config.freeModels) ? config.freeModels : [];
+  if (
+    requestedModel &&
+    savedModelIds.length > 0 &&
+    !savedModelIds.includes(requestedModel) &&
+    !verifiedFreeIds.includes(requestedModel) &&
+    requestedModel !== config.model
+  ) {
     throw new ProviderError(
-      `"${requestedModel.slice(0, 80)}" is not one of your saved models for ${config.provider}. Add it in Models settings or choose a saved model.`,
+      `"${requestedModel.slice(0, 80)}" is not one of your saved or verified free models for ${config.provider}. Add it in Models settings or choose a saved model.`,
       400,
       "invalid_model"
     );
@@ -355,42 +396,293 @@ async function sharedModelStatusSafely() {
   }
 }
 
-// Chat history keeps attachment metadata only — image bytes are never stored.
-function storedMessage(message) {
-  if (Array.isArray(message.attachmentMeta) && message.attachmentMeta.length > 0) {
-    return { role: message.role, content: message.content, attachments: message.attachmentMeta };
-  }
-  return { role: message.role, content: message.content };
+function artifactMeta(artifact) {
+  return {
+    id: String(artifact._id),
+    title: artifact.title,
+    status: artifact.status,
+    fileCount: artifact.files.length,
+    bytes: artifact.files.reduce((total, file) => total + Number(file.bytes || 0), 0)
+  };
 }
 
-async function persistConversation(userId, conversationId, messages, assistantText) {
-  const storedMessages = [...messages.map(storedMessage), { role: "assistant", content: assistantText }].slice(-MAX_STORED_MESSAGES);
-  const firstUser = storedMessages.find(message => message.role === "user");
-  const titleSource = (firstUser?.content ?? "").replace(/\s+/g, " ").trim();
-  const fallbackTitle = Array.isArray(firstUser?.attachments) && firstUser.attachments.length > 0 ? "Image attachment" : "New chat";
-  const title = (titleSource || fallbackTitle).slice(0, 60);
+function artifactPayload(artifact) {
+  return {
+    ...artifactMeta(artifact),
+    messageId: artifact.messageId || null,
+    finishReason: artifact.finishReason || null,
+    files: artifact.files.map(file => ({
+      path: file.path,
+      language: file.language,
+      content: file.content,
+      bytes: file.bytes,
+      complete: file.complete !== false
+    }))
+  };
+}
+
+function storedMessage(message, prior = null) {
+  const entry = {
+    role: message.role,
+    content: message.content
+  };
+  const messageId = message.messageId || prior?.messageId;
+  if (messageId) entry.messageId = messageId;
+  const attachments = Array.isArray(message.attachmentMeta) && message.attachmentMeta.length > 0
+    ? message.attachmentMeta
+    : prior?.attachments;
+  if (Array.isArray(attachments) && attachments.length > 0) entry.attachments = attachments;
+  if (Array.isArray(prior?.artifacts) && prior.artifacts.length > 0) entry.artifacts = prior.artifacts;
+  return entry;
+}
+
+function trimStoredMessages(messages) {
+  const kept = messages.slice(-MAX_STORED_MESSAGES);
+  let total = kept.reduce((sum, message) => sum + String(message.content || "").length, 0);
+  while (kept.length > 2 && total > MAX_STORED_CHARS) {
+    const removed = kept.shift();
+    total -= String(removed?.content || "").length;
+  }
+  return kept;
+}
+async function persistConversation(userId, conversationId, messages, assistantText, assistant = {}) {
   let conversation = null;
   if (conversationId && mongoose.isValidObjectId(conversationId)) {
     conversation = await Conversation.findOne({ _id: conversationId, userId });
   }
+  const previous = conversation?.messages ?? [];
+  const byMessageId = new Map(previous.filter(message => message.messageId).map(message => [message.messageId, message]));
+  const storedMessages = messages.map((message, index) => {
+    const prior = (message.messageId && byMessageId.get(message.messageId)) ||
+      (previous[index]?.role === message.role ? previous[index] : null);
+    return storedMessage(message, prior);
+  });
+  const assistantEntry = storedMessage(
+    { role: "assistant", content: assistantText, messageId: assistant.messageId },
+    null
+  );
+  if (Array.isArray(assistant.artifacts) && assistant.artifacts.length > 0) {
+    assistantEntry.artifacts = assistant.artifacts;
+  }
+  storedMessages.push(assistantEntry);
+  const kept = trimStoredMessages(storedMessages);
+  const firstUser = kept.find(message => message.role === "user");
+  const titleSource = (firstUser?.content ?? "").replace(/\s+/g, " ").trim();
+  const fallbackTitle = Array.isArray(firstUser?.attachments) && firstUser.attachments.length > 0 ? "Image attachment" : "New chat";
+  const title = (titleSource || fallbackTitle).slice(0, 60);
   if (!conversation) {
     const reuseId = conversationId && mongoose.isValidObjectId(conversationId) ? { _id: conversationId } : {};
-    conversation = new Conversation({ ...reuseId, userId, title, messages: storedMessages });
+    conversation = new Conversation({ ...reuseId, userId, title, messages: kept });
   } else {
-    conversation.messages = storedMessages;
+    conversation.messages = kept;
     if (!conversation.title) conversation.title = title;
   }
   try {
     await conversation.save();
   } catch (error) {
     if (error?.code === 11000 && conversation.isNew) {
-      conversation = new Conversation({ userId, title, messages: storedMessages });
+      conversation = new Conversation({ userId, title, messages: kept });
       await conversation.save();
     } else {
       throw error;
     }
   }
+
+  const referenced = kept
+    .flatMap(message => Array.isArray(message.artifacts) ? message.artifacts.map(artifact => artifact.id) : [])
+    .filter(id => mongoose.isValidObjectId(id));
+  try {
+    await Artifact.deleteMany({
+      userId,
+      conversationId: conversation._id,
+      ...(referenced.length > 0 ? { _id: { $nin: referenced } } : {})
+    });
+  } catch {
+    /* orphaned artifacts are harmless and are hidden by conversation ownership */
+  }
   return conversation;
+}
+
+function generatedArtifactStatus(finishReason, failure) {
+  if (failure || (finishReason && finishReason !== "stop" && finishReason !== "end_turn" && finishReason !== "stop_sequence")) {
+    return "partial";
+  }
+  return "complete";
+}
+
+async function persistGeneratedTurn({
+  userId,
+  conversationId,
+  messages,
+  fullText,
+  messageId,
+  finishReason,
+  failure,
+  title,
+  requestId
+}) {
+  const status = generatedArtifactStatus(finishReason, failure);
+  const targetConversationId = conversationId && mongoose.isValidObjectId(conversationId)
+    ? conversationId
+    : new mongoose.Types.ObjectId();
+  const saved = await saveGeneratedArtifact({
+    userId,
+    conversationId: targetConversationId,
+    messageId,
+    fullText,
+    status,
+    finishReason,
+    title,
+    requestId
+  });
+  let summary = fullText;
+  if (saved.artifact) summary = saved.summary || "Generated a code artifact.";
+  else if (saved.error) {
+    summary = fullText.length <= MAX_ASSISTANT_MESSAGE_CHARS
+      ? fullText
+      : "Generated code is available in this response, but it could not be saved to your history. Copy or download it now.";
+  }
+  const artifacts = saved.artifact ? [artifactMeta(saved.artifact)] : [];
+  const conversation = await persistConversation(
+    userId,
+    String(targetConversationId),
+    messages,
+    summary,
+    { messageId, artifacts }
+  );
+  return { conversation, artifact: saved.artifact, artifactError: saved.error, summary };
+}
+async function prepareContinuation(userId, conversationId, continuation, messages) {
+  if (!conversationId || !mongoose.isValidObjectId(conversationId)) {
+    throw new ProviderError("Open the saved conversation before continuing its response.", 400, "continuation_unavailable");
+  }
+  const conversation = await Conversation.findOne({ _id: conversationId, userId });
+  if (!conversation) {
+    throw new ProviderError("That conversation was not found. Reload it and try again.", 404, "conversation_not_found");
+  }
+  const last = messages[messages.length - 1];
+  if (last?.role !== "assistant" || last.messageId !== continuation.messageId) {
+    throw new ProviderError("Reload the conversation before continuing this response.", 400, "invalid_continuation");
+  }
+  const target = conversation.messages.find(message => message.messageId === continuation.messageId && message.role === "assistant");
+  if (!target) {
+    throw new ProviderError("That partial response is no longer available. Retry the original request instead.", 404, "continuation_unavailable");
+  }
+  const artifact = await Artifact.findOne({
+    userId,
+    conversationId,
+    messageId: continuation.messageId
+  });
+  if (artifact) {
+    const plan = continuationPlan(artifact);
+    return { conversation, target, artifact, plan, kind: "artifact" };
+  }
+  const content = String(target.content || last.content || "");
+  if (!content.trim()) {
+    throw new ProviderError("There is no partial response to continue. Retry the original request instead.", 400, "continuation_unavailable");
+  }
+  const excerpt = content.length > 12000 ? content.slice(-12000) : content;
+  return {
+    conversation,
+    target,
+    artifact: null,
+    kind: "text",
+    plan: {
+      targetPath: "",
+      prompt: [
+        "Continue the incomplete assistant response exactly from where it stopped.",
+        "Return only the missing continuation. Do not repeat existing content, do not add markdown fences around the whole answer, and do not add commentary about continuing.",
+        "",
+        "--- BEGIN EXISTING RESPONSE ---",
+        excerpt,
+        "--- END EXISTING RESPONSE ---"
+      ].join("\n")
+    }
+  };
+}
+
+async function persistContinuation({ conversation, target, artifact, plan, kind, fullText, complete, finishReason }) {
+  if (kind === "artifact") {
+    const updated = applyContinuationFile(artifact, plan.targetPath, fullText, { complete });
+    artifact.files = updated.files;
+    artifact.status = complete ? "complete" : "partial";
+    artifact.finishReason = finishReason || null;
+    await artifact.save();
+    const meta = artifactMeta(artifact);
+    target.artifacts = [meta];
+    conversation.markModified("messages");
+    await conversation.save();
+    return {
+      artifact: artifactPayload(artifact),
+      continuedFile: {
+        path: updated.file.path,
+        content: updated.file.content,
+        complete: updated.file.complete
+      }
+    };
+  }
+  const merged = mergeContinuation(target.content, fullText, plan.targetPath);
+  if (merged.length > 32000) {
+    throw new ArtifactError(
+      "This response is too large to continue in a normal chat message. Retry the original request so the code can be saved as an artifact.",
+      "continuation_too_large"
+    );
+  }
+  target.content = merged;
+  conversation.markModified("messages");
+  await conversation.save();
+  return { content: merged };
+}
+
+async function saveGeneratedArtifact({
+  userId,
+  conversationId,
+  messageId,
+  fullText,
+  status,
+  finishReason,
+  title,
+  requestId
+}) {
+  let built;
+  try {
+    built = buildCodeArtifact(fullText, { status, finishReason });
+  } catch (error) {
+    if (error instanceof ArtifactError) {
+      return { artifact: null, summary: "", error };
+    }
+    throw error;
+  }
+  if (!built) return { artifact: null, summary: null, error: null };
+  try {
+    const artifact = await Artifact.findOneAndUpdate(
+      { userId, conversationId, messageId },
+      {
+        $set: {
+          title: String(title || "Generated code").slice(0, 120),
+          status: built.status,
+          finishReason: finishReason || null,
+          files: built.files
+        }
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true, runValidators: true }
+    );
+    return { artifact, summary: built.summary, error: null };
+  } catch (error) {
+    console.error("Artifact persistence failed", {
+      requestId,
+      messageId,
+      code: error?.code || error?.name || "unknown"
+    });
+    return {
+      artifact: null,
+      summary: built.summary,
+      error: new ArtifactError(
+        "The generated code could not be saved to your history. Copy or download it now, then retry if you need it preserved.",
+        "artifact_persist_failed"
+      )
+    };
+  }
 }
 
 function sendEvent(res, payload) {
@@ -398,6 +690,37 @@ function sendEvent(res, payload) {
   res.write(`data: ${JSON.stringify(payload)}\n\n`);
 }
 
+function createStreamProgress(res, messageId) {
+  let codeStarted = false;
+  let currentFile = "";
+  let preparing = false;
+  let markerTail = "";
+  return {
+    onText(text) {
+      const combined = `${markerTail}${text}`;
+      markerTail = combined.slice(-40);
+      if (!codeStarted && /```|~~~/.test(combined)) {
+        codeStarted = true;
+        sendEvent(res, { type: "progress", messageId, phase: "generating_code", message: "Generating your code�?�" });
+      }
+      if (!codeStarted) return;
+      FILE_MARKER_RE.lastIndex = 0;
+      let match;
+      while ((match = FILE_MARKER_RE.exec(combined))) {
+        const path = match[1];
+        if (path && path !== currentFile) {
+          currentFile = path;
+          sendEvent(res, { type: "progress", messageId, phase: "generating_file", message: `Generating ${path.slice(0, 80)}�?�` });
+        }
+      }
+    },
+    preparing() {
+      if (!codeStarted || preparing) return;
+      preparing = true;
+      sendEvent(res, { type: "progress", messageId, phase: "preparing_files", message: "Preparing filesÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦" });
+    }
+  };
+}
 function sendSseHeartbeat(res) {
   if (res.writableEnded) return;
   res.write(": keepalive\n\n");
@@ -493,13 +816,25 @@ function providerFailureStatus(error) {
   return 502;
 }
 
-function sendProviderFailure(res, failure, error, requestId = null, diagnostic = null) {
+function resetMetadata(error) {
+  if (!Number.isFinite(error?.retryAfter) || error.retryAfter < 0) return {};
+  const retryAfterSeconds = Math.floor(error.retryAfter);
+  return {
+    retryAfterSeconds,
+    resetAt: new Date(Date.now() + retryAfterSeconds * 1000).toISOString(),
+    resetSource: "retry-after"
+  };
+}
+
+function sendProviderFailure(res, failure, error, requestId = null, diagnostic = null, model = null) {
   if (Number.isInteger(error?.retryAfter) && error.retryAfter >= 0) {
     res.setHeader("Retry-After", String(error.retryAfter));
   }
   return res.status(failure.status).json({
     message: failure.message,
     code: failure.code,
+    ...(model ? { model } : {}),
+    ...resetMetadata(error),
     ...(requestId ? { requestId } : {}),
     ...(diagnostic ? { diagnostic } : {})
   });
@@ -562,7 +897,7 @@ function providerFailure(provider, error) {
         return {
           status: 429,
           message:
-            "The shared free-model quota is temporarily exhausted for the whole account. Switching models will not help until it resets — try again later, or connect your own provider in API settings.",
+            "The shared free-model quota is temporarily exhausted for the whole account. Switching models will not help until it resets ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â try again later, or connect your own provider in API settings.",
           code: "shared_quota_exhausted"
         };
       }
@@ -754,7 +1089,7 @@ function vupsFailure(error, { hasImages = false } = {}) {
   if (code === "stream_interrupted" || code === "stream_error") {
     return {
       status: 502,
-      message: "Vups v3 Galax's response stream ended before the answer was complete. Any generated text has been kept — use Continue generating to finish it, or try again.",
+      message: "Vups v3 Galax's response stream ended before the answer was complete. Any generated text has been kept ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â use Continue generating to finish it, or try again.",
       code: "vups_stream_interrupted"
     };
   }
@@ -841,8 +1176,16 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
   const requestId = req.requestId || null;
   try {
     const body = req.body || {};
-    const validated = validateMessages(body.messages);
+    let continuation;
+    try {
+      continuation = parseContinuation(body.continuation);
+    } catch (error) {
+      if (error instanceof ProviderError) return res.status(error.status ?? 400).json({ message: error.message, code: error.code });
+      throw error;
+    }
+    const validated = validateMessages(body.messages, { allowAssistantLast: Boolean(continuation) });
     if (typeof validated === "string") return res.status(400).json({ message: validated });
+    const assistantMessageId = parseMessageId(body.assistantMessageId) || continuation?.messageId || String(new mongoose.Types.ObjectId());
 
     if (body.model !== undefined && body.model !== VUPS_MODEL_ID) {
       return res.status(400).json({ message: "This route only serves Vups v3 Galax.", code: "invalid_model" });
@@ -903,7 +1246,22 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
     }
 
     const conversationId = typeof body.conversationId === "string" ? body.conversationId : null;
-    const upstreamMessages = [{ role: "system", content: buildVupsSystemPrompt(mode) }, ...validated.messages];
+    let continuationState = null;
+    if (continuation) {
+      try {
+        continuationState = await prepareContinuation(req.userId, conversationId, continuation, validated.messages);
+      } catch (error) {
+        if (error instanceof ProviderError) {
+          return res.status(error.status ?? 400).json({ message: error.message, code: error.code });
+        }
+        throw error;
+      }
+    }
+    const upstreamMessages = [
+      { role: "system", content: buildVupsSystemPrompt(mode) },
+      ...validated.messages,
+      ...(continuationState ? [{ role: "user", content: continuationState.plan.prompt }] : [])
+    ];
     const execution = vupsExecutionConfiguration();
 
     if (!stream) {
@@ -956,7 +1314,7 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
           error,
           finalCode: failure.code
         });
-        return sendProviderFailure(res, failure, error, requestId, vupsSafeDiagnostic(error));
+        return sendProviderFailure(res, failure, error, requestId, vupsSafeDiagnostic(error), VUPS_MODEL_ID);
       }
       if (attempts > 1) {
         logVupsOutcome({
@@ -968,12 +1326,55 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
           totalDurationMs: Date.now() - startedAt
         });
       }
-      const conversation = await persistConversation(req.userId, conversationId, validated.messages, result.content);
+      if (continuationState) {
+        try {
+          const continued = await persistContinuation({
+            conversation: continuationState.conversation,
+            target: continuationState.target,
+            artifact: continuationState.artifact,
+            plan: continuationState.plan,
+            kind: continuationState.kind,
+            fullText: result.content,
+            finishReason: result.finishReason,
+            complete: generatedArtifactStatus(result.finishReason, null) === "complete"
+          });
+          return res.json({
+            conversationId: String(continuationState.conversation._id),
+            model: VUPS_MODEL_ID,
+            message: {
+              role: "assistant",
+              content: continued.content ?? continuationState.target.content,
+              messageId: continuationState.target.messageId
+            },
+            finishReason: result.finishReason,
+            ...(continued.artifact ? { artifact: continued.artifact } : {}),
+            ...(continued.continuedFile ? { continuedFile: continued.continuedFile } : {})
+          });
+        } catch (error) {
+          if (error instanceof ArtifactError) {
+            return res.status(error.code === "artifact_too_large" || error.code === "continuation_too_large" ? 413 : 422).json({ message: error.message, code: error.code });
+          }
+          throw error;
+        }
+      }
+      const turn = await persistGeneratedTurn({
+        userId: req.userId,
+        conversationId,
+        messages: validated.messages,
+        fullText: result.content,
+        messageId: assistantMessageId,
+        finishReason: result.finishReason,
+        failure: null,
+        title: generatedArtifactTitle(validated.messages),
+        requestId
+      });
       return res.json({
-        conversationId: String(conversation._id),
+        conversationId: String(turn.conversation._id),
         model: VUPS_MODEL_ID,
-        message: { role: "assistant", content: result.content },
-        finishReason: result.finishReason
+        message: { role: "assistant", content: turn.summary, messageId: assistantMessageId },
+        finishReason: result.finishReason,
+        ...(turn.artifact ? { artifacts: [artifactMeta(turn.artifact)] } : {}),
+        ...(turn.artifactError ? { artifactError: { code: turn.artifactError.code, message: turn.artifactError.message } } : {})
       });
     }
 
@@ -1042,7 +1443,7 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
           error,
           finalCode: failure.code
         });
-        return sendProviderFailure(res, failure, error, requestId, vupsSafeDiagnostic(error, { phase: "start" }));
+        return sendProviderFailure(res, failure, error, requestId, vupsSafeDiagnostic(error, { phase: "start" }), VUPS_MODEL_ID);
       }
       return next(error);
     }
@@ -1063,7 +1464,8 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
     res.setHeader("Connection", "keep-alive");
     res.setHeader("X-Accel-Buffering", "no");
     if (typeof res.flushHeaders === "function") res.flushHeaders();
-    sendEvent(res, { type: "meta", conversationId: prospectiveId, model: VUPS_MODEL_ID });
+    sendEvent(res, { type: "meta", conversationId: prospectiveId, messageId: assistantMessageId, model: VUPS_MODEL_ID });
+    const progress = createStreamProgress(res, assistantMessageId);
     const heartbeatTimer = setInterval(() => sendSseHeartbeat(res), execution.heartbeatMs);
     heartbeatTimer.unref?.();
     res.on("close", () => clearInterval(heartbeatTimer));
@@ -1165,6 +1567,7 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
           return;
         }
         sendEvent(res, { type: "delta", content: text });
+        progress.onText(text);
       }
     };
 
@@ -1223,24 +1626,92 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
       }
     }
 
+    let savedArtifact = null;
+    let savedContinuation = null;
+    let savedContent = null;
+    let artifactError = null;
+    let savedConversationId = prospectiveId;
     if (fullText.length > 0) {
+      progress.preparing();
       try {
-        const conversation = await persistConversation(req.userId, prospectiveId, validated.messages, fullText);
-        if (!failure && !clientAborted) {
+        if (continuationState) {
+          const complete = !failure && !clientAborted && generatedArtifactStatus(finishReason, null) === "complete";
+          const continued = await persistContinuation({
+            conversation: continuationState.conversation,
+            target: continuationState.target,
+            artifact: continuationState.artifact,
+            plan: continuationState.plan,
+            kind: continuationState.kind,
+            fullText,
+            finishReason,
+            complete
+          });
+          savedArtifact = continued.artifact || null;
+          savedContinuation = continued.continuedFile || null;
+          savedContent = continued.content ?? null;
+          savedConversationId = String(continuationState.conversation._id);
+        } else {
+          const turn = await persistGeneratedTurn({
+            userId: req.userId,
+            conversationId: prospectiveId,
+            messages: validated.messages,
+            fullText,
+            messageId: assistantMessageId,
+            finishReason,
+            failure: failure || (clientAborted ? { code: "client_aborted" } : null),
+            title: generatedArtifactTitle(validated.messages),
+            requestId
+          });
+          savedConversationId = String(turn.conversation._id);
+          savedContent = turn.summary;
+          savedArtifact = turn.artifact ? artifactPayload(turn.artifact) : null;
+          artifactError = turn.artifactError;
+        }
+        if (!failure && !artifactError && !clientAborted) {
           sendEvent(res, {
             type: "done",
-            conversationId: String(conversation._id),
+            conversationId: savedConversationId,
+            messageId: assistantMessageId,
             finishReason: finishReason ?? "stop",
             model: VUPS_MODEL_ID,
+            ...(savedContent ? { message: { role: "assistant", content: savedContent, messageId: assistantMessageId } } : {}),
+            ...(savedArtifact ? { artifact: savedArtifact, artifacts: [savedArtifact] } : {}),
+            ...(savedContinuation ? { continuedFile: savedContinuation } : {}),
             ...(usage ? { usage } : {})
           });
         }
-      } catch {
-        if (!failure) {
+      } catch (error) {
+        if (error instanceof ArtifactError) artifactError = error;
+        else if (!failure) {
           failure = new ProviderError("The response was generated but could not be saved to your history.", null, "persist_failed");
           failureReason = "persist_failed";
         }
       }
+    }
+
+    if (artifactError && !failure && !clientAborted) {
+      logVupsOutcome({
+        outcome: "failed",
+        requestId,
+        model: provider.model,
+        providerHost,
+        attempts: streamAttempts || 1,
+        totalDurationMs: Date.now() - streamStartedAt,
+        error: artifactError,
+        finalCode: artifactError.code
+      });
+      sendEvent(res, {
+        type: "error",
+        message: artifactError.message,
+        code: artifactError.code,
+        model: VUPS_MODEL_ID,
+        ...(requestId ? { requestId } : {}),
+        messageId: assistantMessageId,
+        conversationId: savedConversationId,
+        partial: fullText.length > 0,
+        ...(savedArtifact ? { artifact: savedArtifact, artifacts: [savedArtifact] } : {}),
+        ...(savedContinuation ? { continuedFile: savedContinuation } : {})
+      });
     }
 
     if (failure) {
@@ -1260,8 +1731,14 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
           type: "error",
           message: safe.message,
           code: safe.code,
+          model: VUPS_MODEL_ID,
+          ...resetMetadata(failure),
           ...(requestId ? { requestId } : {}),
+          messageId: assistantMessageId,
+          conversationId: savedConversationId,
           partial: fullText.length > 0,
+          ...(savedArtifact ? { artifact: savedArtifact, artifacts: [savedArtifact] } : {}),
+          ...(savedContinuation ? { continuedFile: savedContinuation } : {}),
           diagnostic: vupsSafeDiagnostic(failure, {
             phase: "stream",
             reason: failureReason || (idleTimedOut ? "idle_timeout" : "stream_interrupted"),
@@ -1291,8 +1768,16 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
 router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
   try {
     const body = req.body || {};
-    const validated = validateMessages(body.messages);
+    let continuation;
+    try {
+      continuation = parseContinuation(body.continuation);
+    } catch (error) {
+      if (error instanceof ProviderError) return res.status(error.status ?? 400).json({ message: error.message, code: error.code });
+      throw error;
+    }
+    const validated = validateMessages(body.messages, { allowAssistantLast: Boolean(continuation) });
     if (typeof validated === "string") return res.status(400).json({ message: validated });
+    const assistantMessageId = parseMessageId(body.assistantMessageId) || continuation?.messageId || String(new mongoose.Types.ObjectId());
 
     const stream = body.stream !== false;
     const mode = typeof body.mode === "string" ? body.mode.trim().toLowerCase() || "general" : "general";
@@ -1355,7 +1840,22 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
     }
 
     const conversationId = typeof body.conversationId === "string" ? body.conversationId : null;
-    const upstreamMessages = [{ role: "system", content: CHAT_MODES.get(mode) }, ...validated.messages];
+    let continuationState = null;
+    if (continuation) {
+      try {
+        continuationState = await prepareContinuation(req.userId, conversationId, continuation, validated.messages);
+      } catch (error) {
+        if (error instanceof ProviderError) {
+          return res.status(error.status ?? 400).json({ message: error.message, code: error.code });
+        }
+        throw error;
+      }
+    }
+    const upstreamMessages = [
+      { role: "system", content: CHAT_MODES.get(mode) },
+      ...validated.messages,
+      ...(continuationState ? [{ role: "user", content: continuationState.plan.prompt }] : [])
+    ];
 
     if (!stream) {
       let result;
@@ -1377,14 +1877,57 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
             continue;
           }
           const failure = providerFailure(provider, error);
-          return sendProviderFailure(res, failure, error);
+          return sendProviderFailure(res, failure, error, null, null, usedModel);
         }
       }
-      const conversation = await persistConversation(req.userId, conversationId, validated.messages, result.content);
-      return res.json({
-        conversationId: String(conversation._id),
-        message: { role: "assistant", content: result.content },
+      if (continuationState) {
+        try {
+          const continued = await persistContinuation({
+            conversation: continuationState.conversation,
+            target: continuationState.target,
+            artifact: continuationState.artifact,
+            plan: continuationState.plan,
+            kind: continuationState.kind,
+            fullText: result.content,
+            finishReason: result.finishReason,
+            complete: generatedArtifactStatus(result.finishReason, null) === "complete"
+          });
+          return res.json({
+            conversationId: String(continuationState.conversation._id),
+            message: {
+              role: "assistant",
+              content: continued.content ?? continuationState.target.content,
+              messageId: continuationState.target.messageId
+            },
+            finishReason: result.finishReason,
+            ...(continued.artifact ? { artifact: continued.artifact, artifacts: [continued.artifact] } : {}),
+            ...(continued.continuedFile ? { continuedFile: continued.continuedFile } : {}),
+            ...(fallbackUsed ? { model: usedModel, fallbackUsed: true } : {})
+          });
+        } catch (error) {
+          if (error instanceof ArtifactError) {
+            return res.status(error.code === "artifact_too_large" || error.code === "continuation_too_large" ? 413 : 422).json({ message: error.message, code: error.code });
+          }
+          throw error;
+        }
+      }
+      const turn = await persistGeneratedTurn({
+        userId: req.userId,
+        conversationId,
+        messages: validated.messages,
+        fullText: result.content,
+        messageId: assistantMessageId,
         finishReason: result.finishReason,
+        failure: null,
+        title: generatedArtifactTitle(validated.messages),
+        requestId: req.requestId
+      });
+      return res.json({
+        conversationId: String(turn.conversation._id),
+        message: { role: "assistant", content: turn.summary, messageId: assistantMessageId },
+        finishReason: result.finishReason,
+        ...(turn.artifact ? { artifact: artifactPayload(turn.artifact), artifacts: [artifactPayload(turn.artifact)] } : {}),
+        ...(turn.artifactError ? { artifactError: { code: turn.artifactError.code, message: turn.artifactError.message } } : {}),
         ...(fallbackUsed ? { model: usedModel, fallbackUsed: true } : {})
       });
     }
@@ -1420,7 +1963,7 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
             continue;
           }
           const failure = providerFailure(provider, error);
-          return sendProviderFailure(res, failure, error);
+          return sendProviderFailure(res, failure, error, null, null, usedModel);
         }
         return next(error);
       }
@@ -1435,8 +1978,10 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
     sendEvent(res, {
       type: "meta",
       conversationId: prospectiveId,
+      messageId: assistantMessageId,
       ...(fallbackUsed ? { model: usedModel, fallbackUsed: true } : {})
     });
+    const progress = createStreamProgress(res, assistantMessageId);
 
     const reader = upstream.body.getReader();
     const decoder = new TextDecoder();
@@ -1530,6 +2075,7 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
               break;
             }
             sendEvent(res, { type: "delta", content: text });
+            progress.onText(text);
           }
         }
       }
@@ -1551,25 +2097,98 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
         : new ProviderError("The provider returned an empty response. Check the model ID and try again.", null, "empty_response");
     }
 
+    let savedArtifact = null;
+    let savedContinuation = null;
+    let savedContent = null;
+    let artifactError = null;
+    let savedConversationId = prospectiveId;
     if (fullText.length > 0) {
+      progress.preparing();
       try {
-        const conversation = await persistConversation(req.userId, prospectiveId, validated.messages, fullText);
-        if (!failure && !controller.signal.aborted) {
+        if (continuationState) {
+          const complete = !failure && !controller.signal.aborted && generatedArtifactStatus(finishReason, null) === "complete";
+          const continued = await persistContinuation({
+            conversation: continuationState.conversation,
+            target: continuationState.target,
+            artifact: continuationState.artifact,
+            plan: continuationState.plan,
+            kind: continuationState.kind,
+            fullText,
+            finishReason,
+            complete
+          });
+          savedArtifact = continued.artifact || null;
+          savedContinuation = continued.continuedFile || null;
+          savedContent = continued.content ?? continuationState.target.content;
+          savedConversationId = String(continuationState.conversation._id);
+        } else {
+          const turn = await persistGeneratedTurn({
+            userId: req.userId,
+            conversationId: prospectiveId,
+            messages: validated.messages,
+            fullText,
+            messageId: assistantMessageId,
+            finishReason,
+            failure: failure || (clientAborted ? { code: "client_aborted" } : null),
+            title: generatedArtifactTitle(validated.messages),
+            requestId: req.requestId
+          });
+          savedConversationId = String(turn.conversation._id);
+          savedContent = turn.summary;
+          savedArtifact = turn.artifact ? artifactPayload(turn.artifact) : null;
+          artifactError = turn.artifactError;
+        }
+        if (!failure && !artifactError && !controller.signal.aborted) {
           sendEvent(res, {
             type: "done",
-            conversationId: String(conversation._id),
+            conversationId: savedConversationId,
+            messageId: assistantMessageId,
             finishReason: finishReason ?? "stop",
+            ...(savedContent ? { message: { role: "assistant", content: savedContent, messageId: assistantMessageId } } : {}),
+            ...(savedArtifact ? { artifact: savedArtifact, artifacts: [savedArtifact] } : {}),
+            ...(savedContinuation ? { continuedFile: savedContinuation } : {}),
             ...(usage ? { usage } : {})
           });
         }
       } catch (error) {
-        if (!failure) failure = new ProviderError("The response was generated but could not be saved to your history.", null, "persist_failed");
+        if (error instanceof ArtifactError) artifactError = error;
+        else if (!failure) failure = new ProviderError("The response was generated but could not be saved to your history.", null, "persist_failed");
       }
+    }
+
+    if (artifactError && !failure && !controller.signal.aborted) {
+      logProviderFailure(provider, artifactError);
+      sendEvent(res, {
+        type: "error",
+        message: artifactError.message,
+        code: artifactError.code,
+        model: usedModel,
+        ...(req.requestId ? { requestId: req.requestId } : {}),
+        messageId: assistantMessageId,
+        conversationId: savedConversationId,
+        partial: fullText.length > 0,
+        ...(savedArtifact ? { artifact: savedArtifact, artifacts: [savedArtifact] } : {}),
+        ...(savedContinuation ? { continuedFile: savedContinuation } : {})
+      });
     }
 
     if (failure) {
       logProviderFailure(provider, failure);
-      if (!controller.signal.aborted) sendEvent(res, { type: "error", message: failure.message, code: failure.code });
+      if (!controller.signal.aborted) {
+        sendEvent(res, {
+          type: "error",
+          message: failure.message,
+          code: failure.code,
+          model: usedModel,
+          ...resetMetadata(failure),
+          ...(req.requestId ? { requestId: req.requestId } : {}),
+          messageId: assistantMessageId,
+          conversationId: savedConversationId,
+          partial: fullText.length > 0,
+          ...(savedArtifact ? { artifact: savedArtifact, artifacts: [savedArtifact] } : {}),
+          ...(savedContinuation ? { continuedFile: savedContinuation } : {})
+        });
+      }
     }
     if (!res.writableEnded) res.end();
   } catch (error) {

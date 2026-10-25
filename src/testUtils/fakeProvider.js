@@ -49,6 +49,7 @@ export async function startFakeProvider() {
       usageChunk: false,
       emptyDeltaFirst: false,
       emptyStream: false,
+      chatResponseText: null,
       extraModels: []
     },
     set(partial) {
@@ -78,6 +79,7 @@ export async function startFakeProvider() {
       state.behavior.usageChunk = false;
       state.behavior.emptyDeltaFirst = false;
       state.behavior.emptyStream = false;
+      state.behavior.chatResponseText = null;
       state.behavior.extraModels = [];
     }
   };
@@ -177,10 +179,11 @@ export async function startFakeProvider() {
       const model = body.model;
 
       if (!body.stream) {
+        const content = state.behavior.chatResponseText ?? `Echo from ${model}: ${body.messages.at(-1)?.content ?? ""}`;
         return json(res, 200, {
           id: "chatcmpl-fake",
           model,
-          choices: [{ index: 0, message: { role: "assistant", content: `Echo from ${model}: ${body.messages.at(-1)?.content ?? ""}` }, finish_reason: state.behavior.finishReason }]
+          choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: state.behavior.finishReason }]
         });
       }
 
@@ -196,7 +199,9 @@ export async function startFakeProvider() {
         res.end();
         return;
       }
-      const chunks = ["Hello ", "from ", `${model}`, "!"];
+      const chunks = state.behavior.chatResponseText
+        ? state.behavior.chatResponseText.match(/[\s\S]{1,240}/g) || [""]
+        : ["Hello ", "from ", `${model}`, "!"];
       if (state.behavior.emptyDeltaFirst) {
         res.write(`data: ${JSON.stringify({ id: "chatcmpl-fake", model, choices: [{ delta: { role: "assistant" }, finish_reason: null }] })}\n\n`);
       }

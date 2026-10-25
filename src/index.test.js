@@ -15,6 +15,8 @@ process.env.MONGODB_URI = mongod.getUri("vupsrouter_test");
 
 const { default: app, resolveTrustProxy } = await import("./index.js");
 const { resetOpenRouterCache } = await import("./openrouter.js");
+const { resetFreeModelCatalogCache } = await import("./freeModelCatalog.js");
+const { default: ProviderConfig } = await import("./providerConfig.js");
 const { default: mongoose } = await import("mongoose");
 const { startFakeProvider, FAKE_API_KEY, FAKE_MODELS } = await import("./testUtils/fakeProvider.js");
 const fakeProvider = await startFakeProvider();
@@ -2366,4 +2368,349 @@ test("CORS allows Vite preview origins and pattern-configured Vercel aliases", a
   } finally {
     delete process.env.CLIENT_ORIGIN_PATTERNS;
   }
+});
+
+// --- Model type and universal free catalogue ---------------------------------
+
+test("model type is persisted explicitly and rejects unknown values", async () => {
+  const { cookie } = await signupUser();
+  const initial = await api("/api/settings/providers", { cookie });
+  assert.equal(initial.status, 200);
+  assert.equal(initial.body.modelType, "free");
+  assert.equal(initial.body.explicit, false);
+
+  const invalid = await api("/api/settings/model-type", {
+    method: "PUT",
+    cookie,
+    body: { modelType: "everything" }
+  });
+  assert.equal(invalid.status, 400);
+  assert.equal(invalid.body.code, "invalid_model_type");
+
+  const saved = await api("/api/settings/model-type", {
+    method: "PUT",
+    cookie,
+    body: { modelType: "custom" }
+  });
+  assert.equal(saved.status, 200);
+  assert.equal(saved.body.modelType, "custom");
+
+  const after = await api("/api/settings/providers", { cookie });
+  assert.equal(after.body.modelType, "custom");
+  assert.equal(after.body.explicit, true);
+
+  const catalog = await api("/api/settings/free-models", { cookie });
+  assert.equal(catalog.status, 200);
+  assert.equal(catalog.body.modelType, "custom");
+});
+
+test("the first saved provider preserves the free default without changing existing choices", async () => {
+  const { cookie } = await signupUser();
+  const first = await configureProvider(cookie);
+  assert.equal(first.status, 200);
+  const providers = await api("/api/settings/providers", { cookie });
+  assert.equal(providers.body.modelType, "free");
+  assert.equal(providers.body.explicit, true);
+
+  const custom = await api("/api/settings/model-type", {
+    method: "PUT",
+    cookie,
+    body: { modelType: "custom" }
+  });
+  assert.equal(custom.status, 200);
+
+  const edited = await configureProvider(cookie, { provider: "Fake Renamed" });
+  assert.equal(edited.status, 200);
+  const after = await api("/api/settings/providers", { cookie });
+  assert.equal(after.body.modelType, "custom");
+  assert.equal(after.body.explicit, true);
+});
+
+test("the free catalogue only includes verified free models and persists them for routing", async () => {
+  fakeProvider.state.reset();
+  resetFreeModelCatalogCache();
+  const { cookie, body: account } = await signupUser();
+  const configured = await configureProvider(cookie);
+  const configId = configured.body.config.configId;
+  assert.ok(configId);
+
+  fakeProvider.state.set({
+    extraModels: [
+      {
+        id: "fake-paid-model",
+        name: "fake-paid-model",
+        owned_by: "fake",
+        pricing: { prompt: "0.0001", completion: "0.0002", request: "0.01" }
+      },
+      {
+        id: "misleading-free-name",
+        name: "free-model-that-is-not-free",
+        owned_by: "fake",
+        pricing: { prompt: "0.0001", completion: "0.0002", request: "0.01" }
+      }
+    ]
+  });
+
+  const savedModels = await api(`/api/settings/providers/${encodeURIComponent(configId)}/models`, {
+    method: "PUT",
+    cookie,
+    body: { models: ["fake-model-mini"], defaultModel: "fake-model-mini" }
+  });
+  assert.equal(savedModels.status, 200);
+
+  const response = await api("/api/settings/free-models?refresh=1", { cookie });
+  assert.equal(response.status, 200);
+  const catalog = response.body.catalog;
+  assert.ok(catalog.models.length >= 3);
+  assert.ok(catalog.models.every(model => model.free === true));
+  assert.ok(catalog.models.every(model => model.verifiedFree === true));
+  const ids = catalog.models.map(model => model.id);
+  assert.ok(ids.includes("fake-model-pro"));
+  assert.equal(ids.includes("fake-paid-model"), false);
+  assert.equal(ids.includes("misleading-free-name"), false);
+  assert.ok(catalog.counts.personalModels >= 3);
+
+  const stored = await ProviderConfig.findOne({ userId: account.user.id, configId });
+  assert.ok(stored.freeModels.includes("fake-model-pro"));
+  assert.equal(stored.freeModels.includes("fake-paid-model"), false);
+
+  const discoveries = fakeProvider.state.modelsRequests;
+  const cachedResponse = await api("/api/settings/free-models", { cookie });
+  assert.equal(cachedResponse.status, 200);
+  assert.equal(cachedResponse.body.catalog.cached, true);
+  assert.equal(fakeProvider.state.modelsRequests, discoveries);
+
+
+  const chat = await api("/api/chat", {
+    method: "POST",
+    cookie,
+    body: {
+      messages: [{ role: "user", content: "Use a verified free model." }],
+      model: "fake-model-pro",
+      configId,
+      stream: false
+    }
+  });
+  assert.equal(chat.status, 200);
+  assert.equal(fakeProvider.state.chatRequests.at(-1).body.model, "fake-model-pro");
+
+  const rejected = await api("/api/chat", {
+    method: "POST",
+    cookie,
+    body: {
+      messages: [{ role: "user", content: "Use an unverified model." }],
+      model: "unverified-not-free",
+      configId,
+      stream: false
+    }
+  });
+  assert.equal(rejected.status, 400);
+  assert.equal(rejected.body.code, "invalid_model");
+});
+
+test("chat errors include the affected model and only a reliable Retry-After reset", async () => {
+  fakeProvider.state.reset();
+  const { cookie } = await signupUser();
+  await configureProvider(cookie);
+
+  fakeProvider.state.set({ chatStatus: 429, chatRetryAfter: "17" });
+  const started = Date.now();
+  const limited = await api("/api/chat", {
+    method: "POST",
+    cookie,
+    body: {
+      messages: [{ role: "user", content: "Rate limit me." }],
+      model: "fake-model-mini",
+      stream: false
+    }
+  });
+  assert.equal(limited.status, 429);
+  assert.equal(limited.body.code, "rate_limited");
+  assert.equal(limited.body.model, "fake-model-mini");
+  assert.equal(limited.body.retryAfterSeconds, 17);
+  assert.equal(limited.headers.get("retry-after"), "17");
+  const resetAt = new Date(limited.body.resetAt).getTime();
+  assert.ok(resetAt >= started + 16000 && resetAt <= started + 19000);
+  assert.equal(limited.body.resetSource, "retry-after");
+
+  fakeProvider.state.reset();
+  fakeProvider.state.set({
+    chatStatus: 429,
+    chatStatusText: "Rate limit reached for free-models-per-day. Add credits to continue."
+  });
+  const quota = await api("/api/chat", {
+    method: "POST",
+    cookie,
+    body: {
+      messages: [{ role: "user", content: "Exhaust the quota." }],
+      model: "fake-model-mini",
+      stream: false
+    }
+  });
+  assert.equal(quota.status, 429);
+  assert.equal(quota.body.code, "quota_exhausted");
+  assert.equal(quota.body.resetAt, undefined);
+  assert.equal(quota.body.resetSource, undefined);
+  assert.equal(quota.headers.get("retry-after"), null);
+});
+
+test("long coding responses persist an exact artifact and keep the conversation summary small", async () => {
+  fakeProvider.state.reset();
+  const { cookie } = await signupUser();
+  await configureProvider(cookie);
+
+  const source = `<html>\n<body>\n${"A".repeat(36000)}\n</body>\n</html>`;
+  fakeProvider.state.set({
+    chatResponseText: `Here is the page you asked for.\n\n\`\`\`html\n${source}\n\`\`\``
+  });
+
+  const chat = await api("/api/chat", {
+    method: "POST",
+    cookie,
+    body: {
+      messages: [{ role: "user", content: "Build a long page." }],
+      model: "fake-model-mini",
+      stream: false
+    }
+  });
+  assert.equal(chat.status, 200);
+  assert.equal(chat.body.message.content, "Here is the page you asked for.");
+  assert.ok(chat.body.artifact, "a large single file should become an artifact");
+  assert.equal(chat.body.artifact.files.length, 1);
+  assert.equal(chat.body.artifact.files[0].path, "index.html");
+  assert.equal(chat.body.artifact.files[0].content, `${source}\n`);
+  assert.equal(chat.body.artifact.status, "complete");
+
+  const conversation = await api(`/api/conversations/${chat.body.conversationId}`, { cookie });
+  assert.equal(conversation.status, 200);
+  const assistant = conversation.body.conversation.messages.at(-1);
+  assert.equal(assistant.content, "Here is the page you asked for.");
+  assert.equal(assistant.artifacts.length, 1);
+  assert.equal(assistant.artifacts[0].fileCount, 1);
+  assert.ok(assistant.content.length < 200);
+  assert.ok(!assistant.content.includes("A".repeat(100)));
+
+  const artifacts = await api(`/api/conversations/${chat.body.conversationId}/artifacts`, { cookie });
+  assert.equal(artifacts.status, 200);
+  assert.equal(artifacts.body.artifacts.length, 1);
+  assert.equal(artifacts.body.artifacts[0].files[0].content, `${source}\n`);
+});
+
+test("streaming multi-file code emits truthful progress and a complete artifact", async () => {
+  fakeProvider.state.reset();
+  const { cookie } = await signupUser();
+  await configureProvider(cookie);
+
+  const html = `<main>\n${"H".repeat(1300)}\n</main>`;
+  const css = `body { color: #111; }\n${"C".repeat(200)}`;
+  const js = `console.log("artifact ready");`;
+  const responseText = [
+    "I built the page and separated the source by file.",
+    "FILE: index.html",
+    "```html",
+    html,
+    "```",
+    "FILE: styles.css",
+    "```css",
+    css,
+    "```",
+    "FILE: app.js",
+    "```js",
+    js,
+    "```"
+  ].join("\n");
+  fakeProvider.state.set({ chatResponseText: responseText });
+
+  const response = await fetch(`${baseURL}/api/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Cookie: cookie },
+    body: JSON.stringify({
+      messages: [{ role: "user", content: "Build a three-file page." }],
+      model: "fake-model-mini",
+      stream: true
+    })
+  });
+  assert.equal(response.status, 200);
+  const events = (await response.text())
+    .split("\n")
+    .filter(line => line.startsWith("data: "))
+    .map(line => JSON.parse(line.slice(6)));
+  assert.equal(events.filter(event => event.type === "delta").map(event => event.content).join(""), responseText);
+  assert.ok(events.some(event => event.type === "progress" && event.phase === "generating_code"));
+  assert.ok(events.some(event => event.type === "progress" && event.phase === "generating_file" && /index\.html/.test(event.message)));
+  assert.ok(events.some(event => event.type === "progress" && event.phase === "preparing_files"));
+  const done = events.find(event => event.type === "done");
+  assert.ok(done?.artifact);
+  assert.deepEqual(done.artifact.files.map(file => file.path), ["index.html", "styles.css", "app.js"]);
+  assert.equal(done.artifact.files[0].content, `${html}\n`);
+  assert.equal(done.artifact.files[1].content, `${css}\n`);
+  assert.equal(done.artifact.files[2].content, `${js}\n`);
+  assert.equal(done.message.content, "I built the page and separated the source by file.");
+  assert.equal(done.artifact.status, "complete");
+});
+
+test("an interrupted artifact can be continued without duplicating the assistant turn", async () => {
+  fakeProvider.state.reset();
+  const { cookie } = await signupUser();
+  await configureProvider(cookie);
+
+  const partialText = [
+    "Here is the app.",
+    "FILE: index.html",
+    "```html",
+    "<main>Hello</main>",
+    "```",
+    "FILE: app.js",
+    "```js",
+    "const message = \"hello"
+  ].join("\n");
+  fakeProvider.state.set({ chatResponseText: partialText, finishReason: "length" });
+
+  const first = await api("/api/chat", {
+    method: "POST",
+    cookie,
+    body: {
+      messages: [{ role: "user", content: "Build the app and keep going." }],
+      model: "fake-model-mini",
+      stream: false
+    }
+  });
+  assert.equal(first.status, 200);
+  assert.equal(first.body.artifact.status, "partial");
+  assert.equal(first.body.artifact.files.length, 2);
+  assert.equal(first.body.artifact.files[1].complete, false);
+  const messageId = first.body.message.messageId;
+  assert.ok(messageId);
+
+  fakeProvider.state.set({ chatResponseText: ' world";', finishReason: "stop" });
+  const continued = await api("/api/chat", {
+    method: "POST",
+    cookie,
+    body: {
+      conversationId: first.body.conversationId,
+      messages: [
+        { role: "user", content: "Build the app and keep going." },
+        { role: "assistant", content: first.body.message.content, messageId }
+      ],
+      continuation: { messageId },
+      model: "fake-model-mini",
+      stream: false
+    }
+  });
+  assert.equal(continued.status, 200);
+  assert.equal(continued.body.artifact.files.length, 2);
+  assert.equal(continued.body.artifact.files[1].content, 'const message = "hello world";');
+  assert.equal(continued.body.artifact.files[1].complete, true);
+  assert.equal(continued.body.artifact.status, "complete");
+
+  const conversation = await api(`/api/conversations/${first.body.conversationId}`, { cookie });
+  assert.equal(conversation.status, 200);
+  assert.equal(conversation.body.conversation.messages.length, 2);
+  assert.equal(conversation.body.conversation.messages.at(-1).messageId, messageId);
+  assert.equal(conversation.body.conversation.messages.at(-1).artifacts.length, 1);
+
+  const artifacts = await api(`/api/conversations/${first.body.conversationId}/artifacts`, { cookie });
+  assert.equal(artifacts.body.artifacts.length, 1);
+  assert.equal(artifacts.body.artifacts[0].messageId, messageId);
+  assert.equal(artifacts.body.artifacts[0].files[1].content, 'const message = "hello world";');
 });

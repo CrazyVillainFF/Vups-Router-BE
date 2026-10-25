@@ -7,10 +7,20 @@ const attachmentSchema = new mongoose.Schema({
   bytes: { type: Number, min: 0, default: 0 }
 }, { _id: false });
 
+const artifactRefSchema = new mongoose.Schema({
+  id: { type: String, required: true, maxlength: 80 },
+  title: { type: String, default: "", maxlength: 120 },
+  status: { type: String, enum: ["partial", "complete"], default: "complete" },
+  fileCount: { type: Number, min: 0, default: 0 },
+  bytes: { type: Number, min: 0, default: 0 }
+}, { _id: false });
+
 const messageSchema = new mongoose.Schema({
+  messageId: { type: String, maxlength: 80 },
   role: { type: String, enum: ["user", "assistant"], required: true },
-  content: { type: String, default: "", maxlength: 32000 },
+  content: { type: String, default: "", maxlength: 100000 },
   attachments: { type: [attachmentSchema], default: undefined },
+  artifacts: { type: [artifactRefSchema], default: undefined },
   createdAt: { type: Date, default: Date.now }
 }, { _id: false });
 
