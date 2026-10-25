@@ -167,6 +167,32 @@ test("validateImages accepts PNG, JPEG, GIF, and WebP payloads", () => {
   }
 });
 
+test("validateImages accepts public https image URLs without fetching them", () => {
+  const result = validateImages([{ name: "cat.png", url: "https://example.com/images/cat.png#preview" }]);
+  assert.equal(result.error, undefined);
+  assert.equal(result.images.length, 1);
+  assert.equal(result.images[0].url, "https://example.com/images/cat.png");
+  assert.equal(result.images[0].mimeType, "image/png");
+  assert.equal(result.images[0].bytes, 0);
+
+  const inferredName = validateImages([{ url: "https://cdn.example.com/photo.jpeg" }]);
+  assert.equal(inferredName.error, undefined);
+  assert.equal(inferredName.images[0].name, "photo.jpeg");
+  assert.equal(inferredName.images[0].mimeType, "image/jpeg");
+});
+
+test("validateImages rejects unsafe or ambiguous image URLs", () => {
+  assert.match(validateImages([{ url: "http://example.com/cat.png" }]).error, /https/);
+  assert.match(validateImages([{ url: "https://127.0.0.1/cat.png" }]).error, /public host/);
+  assert.match(validateImages([{ url: "https://[::1]/cat.png" }]).error, /public host/);
+  assert.match(validateImages([{ url: "https://user:pass@example.com/cat.png" }]).error, /credentials/);
+  assert.match(validateImages([{ url: "not a url" }]).error, /not valid/);
+  assert.match(
+    validateImages([{ url: "https://example.com/cat.png", mimeType: "image/png", data: PNG_DATA }]).error,
+    /either base64 data or a URL/
+  );
+});
+
 test("validateImages rejects unknown types, bad base64, and mismatched magic bytes", () => {
   const svg = validateImages([{ mimeType: "image/svg+xml", data: PNG_DATA }]);
   assert.match(svg.error, /PNG, JPEG, GIF, WEBP/);
@@ -235,6 +261,30 @@ test("image-only messages are accepted and omit the text part", async () => {
   const last = lastChatRequest().body.messages.at(-1);
   assert.equal(last.content.length, 1);
   assert.equal(last.content[0].type, "image_url");
+});
+
+test("remote image URLs are forwarded as OpenAI content parts and stored as metadata only", async () => {
+  const user = await signupUser();
+  await configureProvider(user.cookie);
+  fakeProvider.state.chatRequests.length = 0;
+  const imageUrl = "https://cdn.example.com/images/cat.png";
+
+  const response = await chatWith(user.cookie, {
+    model: "fake-model-reasoning",
+    stream: false,
+    messages: [{ role: "user", content: "What is in this image?", images: [{ url: imageUrl }] }]
+  });
+
+  assert.equal(response.status, 200);
+  const last = lastChatRequest().body.messages.at(-1);
+  assert.deepEqual(last.content[1], { type: "image_url", image_url: { url: imageUrl } });
+
+  const conversation = await api(`/api/conversations/${response.body.conversationId}`, { cookie: user.cookie });
+  assert.equal(conversation.status, 200);
+  const [userMessage] = conversation.body.conversation.messages;
+  assert.deepEqual(userMessage.attachments, [
+    { name: "cat.png", mimeType: "image/png", bytes: 0 }
+  ]);
 });
 
 test("text-only messages still send a plain string payload", async () => {
@@ -388,6 +438,79 @@ test("Vups v3 Galax keeps text on the text model and routes images to the vision
         { name: "cat.png", mimeType: "image/png", bytes: PNG_BYTES.length }
       ]);
       assert.ok(!JSON.stringify(conversation.body).includes(PNG_DATA.slice(0, 24)));
+    }
+  );
+  fakeProvider.state.reset();
+});
+
+test("Vups streaming image requests use the configured vision model", async () => {
+  const user = await signupUser();
+  await withEnv(
+    {
+      VUPS_BASE_URL: undefined,
+      VUPS_API_KEY: undefined,
+      VUPS_UNDERLYING_MODEL: undefined,
+      VUPS_VISION: undefined,
+      VUPS_VISION_MODEL: "fake-model-mini",
+      OPENROUTER_DEFAULT_MODEL: "fake-model-pro"
+    },
+    async () => {
+      fakeProvider.state.reset();
+      const response = await fetch(`${baseURL}/api/chat/vups-v3-galax`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: user.cookie },
+        body: JSON.stringify({
+          stream: true,
+          model: "vups-v3-galax",
+          messages: [{ role: "user", content: "describe this", images: [pngImage()] }]
+        })
+      });
+      assert.equal(response.status, 200);
+      assert.match(response.headers.get("content-type"), /text\/event-stream/);
+      const events = (await response.text())
+        .split("\n")
+        .filter(line => line.startsWith("data: "))
+        .map(line => JSON.parse(line.slice(6)));
+      assert.ok(events.some(event => event.type === "done"));
+
+      const upstream = lastChatRequest();
+      assert.equal(upstream.body.model, "fake-model-mini");
+      assert.deepEqual(upstream.body.reasoning, { enabled: false });
+      const sent = upstream.body.messages.at(-1);
+      assert.ok(Array.isArray(sent.content));
+      assert.equal(sent.content[1].image_url.url, `data:image/png;base64,${PNG_DATA}`);
+    }
+  );
+  fakeProvider.state.reset();
+});
+
+test("a missing Vups vision model is reported as model unavailable, not an unreadable image", async () => {
+  const user = await signupUser();
+  await withEnv(
+    {
+      VUPS_BASE_URL: undefined,
+      VUPS_API_KEY: undefined,
+      VUPS_UNDERLYING_MODEL: undefined,
+      VUPS_VISION: undefined,
+      VUPS_VISION_MODEL: "fake-model-mini",
+      OPENROUTER_DEFAULT_MODEL: "fake-model-pro"
+    },
+    async () => {
+      fakeProvider.state.reset();
+      fakeProvider.state.set({
+        failModel: "fake-model-mini",
+        failModelStatus: 404,
+        failModelMessage: "No endpoints found for model fake-model-mini"
+      });
+      const response = await vupsChat(user.cookie, {
+        stream: false,
+        model: "vups-v3-galax",
+        messages: [{ role: "user", content: "look", images: [pngImage()] }]
+      });
+      assert.equal(response.status, 503);
+      assert.equal(response.body.code, "vups_model_unavailable");
+      assert.match(response.body.message, /VUPS_VISION_MODEL/);
+      assert.ok(!/could not read that image/i.test(response.body.message));
     }
   );
   fakeProvider.state.reset();

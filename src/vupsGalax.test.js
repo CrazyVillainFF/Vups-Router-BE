@@ -3,7 +3,7 @@ import { test } from "node:test";
 
 process.env.NODE_ENV = "test";
 
-const { vupsProviderForChat, DEFAULT_VUPS_VISION_MODEL } = await import("./vupsGalax.js");
+const { vupsProviderForChat, vupsVisionConfiguration, DEFAULT_VUPS_VISION_MODEL } = await import("./vupsGalax.js");
 
 const ENV_KEYS = [
   "VUPS_BASE_URL",
@@ -200,6 +200,63 @@ test("partial VUPS configuration fails instead of mixing it with OpenRouter", ()
       );
     }
   );
+});
+
+test("vision configuration reports the active model without exposing credentials", () => {
+  assert.equal(DEFAULT_VUPS_VISION_MODEL, "nvidia/nemotron-3.5-super-vl:free");
+
+  withEnv(
+    {
+      VUPS_BASE_URL: undefined,
+      VUPS_API_KEY: undefined,
+      VUPS_UNDERLYING_MODEL: undefined,
+      VUPS_VISION: undefined,
+      VUPS_VISION_MODEL: "nvidia/nemotron-3.5-super-vl:free",
+      OPENROUTER_API_KEY: "openrouter-key",
+      OPENROUTER_BASE_URL: "https://openrouter.ai/api/v1",
+      OPENROUTER_DEFAULT_MODEL: "text/model:free"
+    },
+    () => {
+      assert.deepEqual(vupsVisionConfiguration(), {
+        enabled: true,
+        model: "nvidia/nemotron-3.5-super-vl:free",
+        source: "VUPS_VISION_MODEL"
+      });
+    }
+  );
+
+  withEnv(
+    {
+      VUPS_BASE_URL: undefined,
+      VUPS_API_KEY: undefined,
+      VUPS_UNDERLYING_MODEL: undefined,
+      VUPS_VISION: "false",
+      VUPS_VISION_MODEL: "nvidia/nemotron-3.5-super-vl:free",
+      OPENROUTER_API_KEY: "openrouter-key"
+    },
+    () => {
+      assert.equal(vupsVisionConfiguration().enabled, false);
+    }
+  );
+});
+
+test("a VUPS_VISION_MODEL change takes effect without reloading the module", () => {
+  const base = {
+    VUPS_BASE_URL: undefined,
+    VUPS_API_KEY: undefined,
+    VUPS_UNDERLYING_MODEL: undefined,
+    VUPS_VISION: undefined,
+    OPENROUTER_API_KEY: "openrouter-key",
+    OPENROUTER_BASE_URL: "https://openrouter.ai/api/v1",
+    OPENROUTER_DEFAULT_MODEL: "text/model:free"
+  };
+
+  withEnv({ ...base, VUPS_VISION_MODEL: "first/vision:free" }, () => {
+    assert.equal(vupsProviderForChat({ images: true }).model, "first/vision:free");
+  });
+  withEnv({ ...base, VUPS_VISION_MODEL: "second/vision:free" }, () => {
+    assert.equal(vupsProviderForChat({ images: true }).model, "second/vision:free");
+  });
 });
 
 test("an invalid dedicated VUPS endpoint never falls back to OpenRouter", () => {

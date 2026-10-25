@@ -3,7 +3,7 @@ import { openRouterApiKey, openRouterBaseUrl, openRouterModel } from "./openrout
 
 export const VUPS_MODEL_ID = "vups-v3-galax";
 export const VUPS_MODEL_NAME = "Vups v3 Galax";
-export const DEFAULT_VUPS_VISION_MODEL = "google/gemma-4-26b-a4b-it:free";
+export const DEFAULT_VUPS_VISION_MODEL = "nvidia/nemotron-3.5-super-vl:free";
 
 export const VUPS_BASE_PROMPT = `You are Vups v3 Galax, an AI model created by Vups and available for free on VupsRouter AI.
 
@@ -49,6 +49,25 @@ function envText(name) {
   return typeof process.env[name] === "string" ? process.env[name].trim() : "";
 }
 
+export function vupsVisionConfiguration() {
+  const configuredModel = envText("VUPS_VISION_MODEL");
+  const vision = visionSetting(process.env.VUPS_VISION);
+  const dedicated = ["VUPS_BASE_URL", "VUPS_API_KEY", "VUPS_UNDERLYING_MODEL"]
+    .some(name => Boolean(envText(name)));
+
+  if (configuredModel) {
+    return { enabled: vision !== false, model: configuredModel, source: "VUPS_VISION_MODEL" };
+  }
+  if (dedicated) {
+    return {
+      enabled: vision !== false,
+      model: vision === true ? envText("VUPS_UNDERLYING_MODEL") || null : null,
+      source: vision === true ? "VUPS_UNDERLYING_MODEL" : "unconfigured"
+    };
+  }
+  return { enabled: vision !== false, model: DEFAULT_VUPS_VISION_MODEL, source: "default" };
+}
+
 export function vupsProviderForChat({ images = false } = {}) {
   const dedicated = {
     baseUrlValue: envText("VUPS_BASE_URL"),
@@ -91,7 +110,7 @@ export function vupsProviderForChat({ images = false } = {}) {
         requestVision = true;
       } else {
         throw new ProviderError(
-          "Vups v3 Galax image requests need a vision-capable model. Set VUPS_VISION_MODEL to an image model available at VUPS_BASE_URL, or set VUPS_VISION=true if that dedicated model supports images.",
+          "Vups v3 Galax image requests need a vision-capable model. Set VUPS_VISION_MODEL to an image model available at VUPS_BASE_URL, or set VUPS_VISION=true if that dedicated model supports images. The server's check:vups-vision command lists valid model IDs.",
           400,
           "vups_vision_unsupported"
         );

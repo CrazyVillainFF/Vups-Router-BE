@@ -4,20 +4,27 @@ import http from "node:http";
 import {
   ProviderError,
   buildChatRequestBody,
+  buildProviderFailureDiagnostic,
   buildProviderFailureLog,
   chatCompletion,
+  classifyProviderFailure,
   describeProviderError,
   extractResponseText,
   extractStreamText,
   isGoogleGeminiBase,
   isOpenCodeZenBase,
   isOpenCodeZenFreeModel,
+  isQuotaExhaustedError,
+  isRetryableProviderError,
   listProviderModels,
   normalizeBaseUrl,
+  parseRetryAfter,
   resolveChatEndpoint,
+  retryDelayMs,
   startChatCompletionStream,
   testProviderConnection,
-  testProviderModel
+  testProviderModel,
+  withProviderRetry
 } from "./providerClient.js";
 
 function readBody(req) {
@@ -55,6 +62,81 @@ test("keeps other provider base URLs unchanged", () => {
   assert.equal(normalizeBaseUrl("https://api.deepseek.com/"), "https://api.deepseek.com");
   assert.equal(normalizeBaseUrl("https://api.openai.com/v1/chat/completions/"), "https://api.openai.com/v1");
   assert.equal(normalizeBaseUrl("http://localhost:11434/v1/"), "http://localhost:11434/v1");
+});
+
+test("Retry-After headers are parsed as bounded integer seconds", () => {
+  assert.equal(parseRetryAfter("120"), 120);
+  assert.equal(parseRetryAfter("1.9"), null);
+  assert.equal(parseRetryAfter("-1"), null);
+  assert.equal(parseRetryAfter("999999"), 86400);
+  assert.equal(parseRetryAfter("Wed, 21 Oct 2015 07:28:00 GMT", Date.parse("Wed, 21 Oct 2015 07:27:30 GMT")), 30);
+  assert.equal(parseRetryAfter("Wed, 21 Oct 2015 07:28:00 GMT", Date.parse("Wed, 21 Oct 2015 07:29:00 GMT")), 0);
+  assert.equal(parseRetryAfter("not-a-date"), null);
+});
+
+test("classifies transient limits separately from exhausted free quotas", () => {
+  const limited = new ProviderError("Too many requests. Please retry later.", 429, "rate_limited");
+  limited.retryAfter = 3;
+  const quota = new ProviderError(
+    "Rate limit reached for free-models-per-day. Add 10 credits to continue.",
+    429,
+    "rate_limited"
+  );
+  const overloaded = new ProviderError("Provider overloaded.", 503, "provider_unavailable");
+
+  assert.equal(isQuotaExhaustedError(limited), false);
+  assert.equal(isQuotaExhaustedError(quota), true);
+  assert.equal(isRetryableProviderError(limited), true);
+  assert.equal(isRetryableProviderError(quota), false);
+  assert.equal(isRetryableProviderError(overloaded), true);
+  assert.equal(retryDelayMs(limited, 0, { baseDelayMs: 500, maxDelayMs: 8000, random: () => 0 }), 3000);
+  assert.equal(
+    retryDelayMs(limited, 0, { baseDelayMs: 500, maxDelayMs: 8000, maxRetryAfterMs: 1000, random: () => 0 }),
+    null,
+    "a Retry-After longer than the configured cap must not be retried"
+  );
+  assert.equal(
+    retryDelayMs(limited, 0, { baseDelayMs: 500, maxDelayMs: 8000, maxRetryAfterMs: 0, random: () => 0 }),
+    null,
+    "a zero Retry-After cap must reject every positive upstream delay"
+  );
+});
+
+test("retries transient failures with bounded backoff but never retries quota exhaustion", async () => {
+  let calls = 0;
+  const delays = [];
+  const result = await withProviderRetry(
+    async () => {
+      calls += 1;
+      if (calls < 3) throw new ProviderError("Provider overloaded.", 503, "provider_unavailable");
+      return "ok";
+    },
+    {
+      maxRetries: 2,
+      baseDelayMs: 1,
+      maxDelayMs: 4,
+      random: () => 0,
+      sleep: async (delay) => { delays.push(delay); }
+    }
+  );
+
+  assert.equal(result, "ok");
+  assert.equal(calls, 3);
+  assert.equal(delays.length, 2);
+  assert.ok(delays.every(delay => delay >= 1 && delay <= 4));
+
+  let quotaCalls = 0;
+  await assert.rejects(
+    withProviderRetry(
+      async () => {
+        quotaCalls += 1;
+        throw new ProviderError("free-models-per-day quota exhausted", 429, "rate_limited");
+      },
+      { maxRetries: 3, sleep: async () => {} }
+    ),
+    /quota exhausted/
+  );
+  assert.equal(quotaCalls, 1);
 });
 
 test("AgentRouter GPT models resolve to /responses and other models keep /chat/completions", () => {
@@ -432,6 +514,98 @@ test("OpenCode Zen rejects native-only model families before sending a request",
   }
 });
 
+test("classifies provider 429s by structured quota, token, concurrency, and shared-pool signals", () => {
+  assert.equal(
+    classifyProviderFailure({
+      status: 429,
+      payload: {
+        error: {
+          message: "Provider returned error",
+          code: 429,
+          metadata: {
+            provider_name: "Google AI Studio",
+            provider_error_code: "429",
+            limit_source: "upstream_provider_shared_pool",
+            raw: "google/gemma-4-26b-a4b-it:free is temporarily rate-limited upstream. Please retry shortly."
+          }
+        }
+      }
+    }).category,
+    "rate_limit_requests"
+  );
+  assert.equal(
+    classifyProviderFailure({
+      status: 429,
+      payload: { error: { message: "Rate limit reached for tokens per minute (TPM)." } }
+    }).category,
+    "rate_limit_tokens"
+  );
+  assert.equal(
+    classifyProviderFailure({
+      status: 429,
+      payload: { error: { message: "Too many concurrent requests for this model." } }
+    }).category,
+    "concurrency_limit"
+  );
+  assert.equal(
+    classifyProviderFailure({
+      status: 429,
+      payload: { error: { message: "You exceeded your current quota. Check billing." } }
+    }).category,
+    "quota_exhausted"
+  );
+});
+
+test("provider failure diagnostics expose safe classification and upstream metadata", () => {
+  const diagnostic = buildProviderFailureDiagnostic({
+    url: "https://openrouter.ai/api/v1/chat/completions?key=sk-query-secret",
+    status: 429,
+    payload: {
+      error: {
+        message: "Rate limit reached for free-models-per-day.",
+        code: 429,
+        metadata: {
+          provider_name: "Google AI Studio",
+          provider_error_code: "429",
+          limit_source: "upstream_provider_shared_pool",
+          raw: "Rate limited; Authorization Bearer abc.def.secret"
+        }
+      }
+    },
+    headers: {
+      "cf-ray": "abc123",
+      "x-request-id": "upstream-request-9",
+      "x-ratelimit-remaining-requests": "0",
+      "set-cookie": "session=secret"
+    },
+    retryAfter: 8,
+    retryAfterRaw: "8",
+    context: { requestId: "req-test-429", attempt: 2, model: "google/gemma-4-26b-a4b-it:free" }
+  });
+
+  assert.equal(diagnostic.event, "provider_upstream_failure");
+  assert.equal(diagnostic.requestId, "req-test-429");
+  assert.equal(diagnostic.attempt, 2);
+  assert.equal(diagnostic.providerHost, "openrouter.ai");
+  assert.equal(diagnostic.endpoint, "/api/v1/chat/completions");
+  assert.equal(diagnostic.model, "google/gemma-4-26b-a4b-it:free");
+  assert.equal(diagnostic.providerName, "Google AI Studio");
+  assert.equal(diagnostic.providerErrorCode, "429");
+  assert.equal(diagnostic.limitSource, "upstream_provider_shared_pool");
+  assert.match(diagnostic.providerDetail, /Rate limited/);
+  assert.match(diagnostic.providerDetail, /Bearer \[redacted\]/);
+  assert.equal(diagnostic.category, "quota_exhausted");
+  assert.equal(diagnostic.classification, "permanent");
+  assert.equal(diagnostic.retryable, false);
+  assert.equal(diagnostic.retryAfter, 8);
+  assert.equal(diagnostic.responseHeaders["x-request-id"], "upstream-request-9");
+  assert.equal(diagnostic.responseHeaders["x-ratelimit-remaining-requests"], "0");
+  assert.ok(!JSON.stringify(diagnostic).includes("?key="));
+  assert.ok(!JSON.stringify(diagnostic).includes("sk-query-secret"));
+  assert.ok(!JSON.stringify(diagnostic).includes("abc.def.secret"));
+  assert.ok(!JSON.stringify(diagnostic).includes("set-cookie"));
+});
+
 test("provider failure diagnostics include only safe request context and a truncated body", () => {
   const payload = `Gateway challenge ${"x".repeat(2200)} sk-live-secret-123456 oc_sk_opencode-secret-123456 Bearer abc.def.secret`;
   const log = buildProviderFailureLog({
@@ -484,13 +658,17 @@ test("propagates HTTP 405 with safe diagnostics for both request modes", async (
       baseUrl,
       apiKey: "sk-test-secret-123456",
       model: "gpt-5.6-sol",
-      messages: [{ role: "user", content: "Hello" }]
+      messages: [{ role: "user", content: "Hello" }],
+      requestId: "req-test-405",
+      attempt: 1
     });
     const runStream = () => startChatCompletionStream({
       baseUrl,
       apiKey: "sk-test-secret-123456",
       model: "gpt-5.6-sol",
-      messages: [{ role: "user", content: "Hello" }]
+      messages: [{ role: "user", content: "Hello" }],
+      requestId: "req-test-405",
+      attempt: 2
     });
 
     for (const request of [run, runStream]) {
@@ -508,13 +686,21 @@ test("propagates HTTP 405 with safe diagnostics for both request modes", async (
     assert.equal(requests.length, 2);
     assert.ok(requests.every(request => request.method === "POST"));
     assert.equal(warnings.length, 2);
-    for (const warning of warnings) {
-      assert.match(warning, /POST http:\/\/127\.0\.0\.1:\d+\/v1\/chat\/completions -> HTTP 405/);
-      assert.match(warning, /content-type=application\/json/);
-      assert.match(warning, /GPT models must use \/v1\/responses/);
-      assert.ok(!warning.includes("sk-test-secret-123456"));
-      assert.ok(!warning.includes("abc.def.secret"));
-      assert.match(warning, /Bearer \[redacted\]/);
+    const diagnostics = warnings.map(warning => JSON.parse(warning));
+    for (const [index, diagnostic] of diagnostics.entries()) {
+      assert.equal(diagnostic.event, "provider_upstream_failure");
+      assert.equal(diagnostic.requestId, "req-test-405");
+      assert.equal(diagnostic.attempt, index + 1);
+      assert.equal(diagnostic.providerHost, "127.0.0.1");
+      assert.equal(diagnostic.endpoint, "/v1/chat/completions");
+      assert.equal(diagnostic.model, "gpt-5.6-sol");
+      assert.equal(diagnostic.httpStatus, 405);
+      assert.equal(diagnostic.category, "unknown");
+      assert.equal(diagnostic.classification, "permanent");
+      assert.match(diagnostic.providerMessage, /GPT models must use \/v1\/responses/);
+      assert.match(diagnostic.providerMessage, /Bearer \[redacted\]/);
+      assert.ok(!JSON.stringify(diagnostic).includes("sk-test-secret-123456"));
+      assert.ok(!JSON.stringify(diagnostic).includes("abc.def.secret"));
     }
   } finally {
     console.warn = originalWarn;

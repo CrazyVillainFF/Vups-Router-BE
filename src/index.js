@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { randomUUID } from "node:crypto";
 import express from "express";
 import cors from "cors";
 import cookieParser from "cookie-parser";
@@ -14,6 +15,7 @@ import imageRoutes from "./routes/images.js";
 import adminRoutes from "./routes/admin.js";
 import { requireJsonBody, verifyOrigin } from "./middleware.js";
 import { chatJsonBodyLimit } from "./chatImages.js";
+import { vupsVisionConfiguration } from "./vupsGalax.js";
 
 const app = express();
 const port = Number(process.env.PORT || 4000);
@@ -70,9 +72,23 @@ function originAllowed(origin) {
   return exact.has(normalized) || patterns.some(pattern => pattern.test(normalized));
 }
 
-if (process.env.NODE_ENV === "production") app.set("trust proxy", 1);
+export function resolveTrustProxy(value = process.env.TRUST_PROXY) {
+  const raw = typeof value === "string" ? value.trim() : "";
+  if (!raw) return process.env.NODE_ENV === "production" ? 1 : false;
+  if (raw === "true") return true;
+  if (raw === "false") return false;
+  if (/^\d+$/.test(raw)) return Number(raw);
+  return raw;
+}
+
+app.set("trust proxy", resolveTrustProxy());
 
 app.disable("x-powered-by");
+app.use((req, res, next) => {
+  req.requestId = randomUUID();
+  res.setHeader("X-Request-Id", req.requestId);
+  next();
+});
 app.use(helmet());
 app.use(cors({
   origin(origin, callback) {
@@ -109,11 +125,20 @@ app.get("/api/health", async (_req, res) => {
   try {
     await connectToDatabase();
     await mongoose.connection.db.admin().ping();
+    const vision = vupsVisionConfiguration();
     return res.json({
       success: true,
       service: "VupsRouter",
       status: "online",
-      database: "connected"
+      database: "connected",
+      release: (process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || "unknown").slice(0, 40),
+      features: {
+        vupsRetry: true,
+        vupsDiagnostics: true,
+        vupsImageGeneration: vision.enabled,
+        vupsVisionModel: vision.model,
+        vupsVisionModelSource: vision.source
+      }
     });
   } catch (error) {
     const { reason, hint } = describeDatabaseError(error);
@@ -150,7 +175,7 @@ app.use((_req, res) => {
   return res.status(404).json({ message: "That API route does not exist." });
 });
 
-app.use((error, _req, res, _next) => {
+app.use((error, req, res, _next) => {
   if (res.headersSent) return;
   const name = error?.name || "UnknownError";
   if (isDatabaseFailure(error)) {
@@ -178,7 +203,7 @@ app.use((error, _req, res, _next) => {
   if (name === "Error" && /Origin not allowed/i.test(error?.message || "")) {
     return res.status(403).json({ message: "Request blocked: origin not allowed." });
   }
-  console.error("API request failed:", name);
+  console.error("API request failed:", name, "| requestId:", req.requestId || "-");
   return res.status(500).json({ message: "Something went wrong. Please try again." });
 });
 

@@ -9,6 +9,7 @@
     "start": "node src/index.js",
     "test": "node --test",
     "verify": "node scripts/verify-backend.mjs",
+    "check:vups-vision": "node scripts/check-vups-vision.mjs",
     "rotate-provider-keys": "node scripts/rotate-provider-keys.mjs"
   },
   "dependencies": {

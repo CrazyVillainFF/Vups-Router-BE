@@ -1,5 +1,6 @@
-import jwt from "jsonwebtoken";
+﻿import jwt from "jsonwebtoken";
 import { ipKeyGenerator, rateLimit } from "express-rate-limit";
+import connectToDatabase from "./db.js";
 import User from "./user.js";
 import { SESSION_COOKIE, SESSION_TTL_MS } from "./session.js";
 
@@ -51,19 +52,48 @@ export function extractBearerToken(req) {
   return scheme?.toLowerCase() === "bearer" && token ? token : null;
 }
 
+function sessionCookieTokens(req) {
+  const tokens = [];
+  const raw = req.get("cookie") || req.headers?.cookie || "";
+  for (const part of String(raw).split(";")) {
+    const separator = part.indexOf("=");
+    if (separator < 0 || part.slice(0, separator).trim() !== SESSION_COOKIE) continue;
+    const value = part.slice(separator + 1).trim();
+    if (!value) continue;
+    try {
+      tokens.push(decodeURIComponent(value));
+    } catch {
+      tokens.push(value);
+    }
+  }
+  const parsed = req.cookies?.[SESSION_COOKIE];
+  if (Array.isArray(parsed)) tokens.push(...parsed);
+  else if (parsed) tokens.push(parsed);
+  return [...new Set(tokens.filter(Boolean))];
+}
+
 export async function requireAuth(req, res, next) {
-  const token = req.cookies?.[SESSION_COOKIE] || extractBearerToken(req);
-  if (!token) return res.status(401).json({ message: "Sign in to continue." });
+  const tokens = [...new Set([extractBearerToken(req), ...sessionCookieTokens(req)].filter(Boolean))];
+  if (tokens.length === 0) return res.status(401).json({ message: "Sign in to continue." });
   const secret = getJwtSecret();
   if (!secret) return res.status(500).json({ message: "Authentication is not configured on the server." });
-  let payload;
-  try {
-    payload = jwt.verify(token, secret);
-  } catch {
+
+  let payload = null;
+  for (const token of tokens) {
+    try {
+      payload = jwt.verify(token, secret);
+      break;
+    } catch {
+      // Try any remaining duplicate cookie before treating the session as expired.
+    }
+  }
+  if (!payload) {
     clearSessionCookie(res);
     return res.status(401).json({ message: "Your session expired. Please sign in again." });
   }
+
   try {
+    await connectToDatabase();
     const user = await User.findById(payload.sub).select("name email aiEnabled passwordChangedAt");
     if (!user) {
       clearSessionCookie(res);
@@ -75,6 +105,7 @@ export async function requireAuth(req, res, next) {
     }
     req.user = user;
     req.userId = user.id;
+    req.sessionPayload = payload;
     return next();
   } catch (error) {
     return next(error);

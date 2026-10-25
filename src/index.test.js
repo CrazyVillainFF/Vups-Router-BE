@@ -13,7 +13,7 @@ const { MongoMemoryServer } = await import("mongodb-memory-server");
 const mongod = await MongoMemoryServer.create();
 process.env.MONGODB_URI = mongod.getUri("vupsrouter_test");
 
-const { default: app } = await import("./index.js");
+const { default: app, resolveTrustProxy } = await import("./index.js");
 const { resetOpenRouterCache } = await import("./openrouter.js");
 const { default: mongoose } = await import("mongoose");
 const { startFakeProvider, FAKE_API_KEY, FAKE_MODELS } = await import("./testUtils/fakeProvider.js");
@@ -87,6 +87,23 @@ async function signupUser() {
   return { email, cookie: sessionCookie(response), body: response.body };
 }
 
+async function withEnv(values, operation) {
+  const previous = new Map();
+  for (const [name, value] of Object.entries(values)) {
+    previous.set(name, process.env[name]);
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
+  try {
+    return await operation();
+  } finally {
+    for (const [name, value] of previous) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+}
+
 async function configureProvider(cookie, overrides = {}) {
   const response = await api("/api/settings/provider", {
     method: "PUT",
@@ -104,6 +121,15 @@ async function configureProvider(cookie, overrides = {}) {
 
 // ─── Service basics ─────────────────────────────────────────────────────────
 
+test("trust proxy accepts explicit Express values instead of hardcoding production", () => {
+  assert.equal(resolveTrustProxy("1"), 1);
+  assert.equal(resolveTrustProxy("3"), 3);
+  assert.equal(resolveTrustProxy("true"), true);
+  assert.equal(resolveTrustProxy("false"), false);
+  assert.equal(resolveTrustProxy("loopback"), "loopback");
+  assert.equal(resolveTrustProxy(""), process.env.NODE_ENV === "production" ? 1 : false);
+});
+
 test("GET / returns the backend online response", async () => {
   const response = await api("/");
   assert.equal(response.status, 200);
@@ -115,10 +141,26 @@ test("GET / returns the backend online response", async () => {
   });
 });
 
-test("GET /api/health reports MongoDB as connected", async () => {
+test("GET /api/health reports MongoDB, release metadata, features, and a request ID", async () => {
   const response = await api("/api/health");
   assert.equal(response.status, 200);
   assert.equal(response.body.database, "connected");
+  assert.equal(typeof response.body.release, "string");
+  assert.equal(response.body.features.vupsRetry, true);
+  assert.equal(response.body.features.vupsDiagnostics, true);
+  assert.equal(typeof response.body.features.vupsImageGeneration, "boolean");
+  assert.match(response.headers.get("x-request-id"), /^[0-9a-f-]{36}$/);
+});
+
+test("GET /api/health reports the active vision model without credentials", async () => {
+  await withEnv({ VUPS_VISION: undefined, VUPS_VISION_MODEL: "nvidia/nemotron-3.5-super-vl:free" }, async () => {
+    const response = await api("/api/health");
+    assert.equal(response.status, 200);
+    assert.equal(response.body.features.vupsImageGeneration, true);
+    assert.equal(response.body.features.vupsVisionModel, "nvidia/nemotron-3.5-super-vl:free");
+    assert.equal(response.body.features.vupsVisionModelSource, "VUPS_VISION_MODEL");
+    assert.ok(!JSON.stringify(response.body).includes(FAKE_API_KEY));
+  });
 });
 
 test("unknown API routes return a JSON 404", async () => {
@@ -273,6 +315,15 @@ test("a session survives repeated requests, as when the page is refreshed", asyn
   assert.equal(reload.status, 200);
   assert.equal(first.body.user.email, email);
   assert.equal(reload.body.user.email, email);
+});
+
+test("a valid duplicate session cookie is accepted when an older cookie is expired", async () => {
+  const { cookie, email } = await signupUser();
+  const response = await api("/api/auth/me", {
+    cookie: `vr_session=invalid.legacy.token; ${cookie}`
+  });
+  assert.equal(response.status, 200);
+  assert.equal(response.body.user.email, email);
 });
 
 // ─── Provider configuration ─────────────────────────────────────────────────
@@ -656,6 +707,205 @@ test("Vups v3 Galax fails safely when its server configuration is missing", asyn
   }
 });
 
+test("Vups retries a transient upstream 503 once and then succeeds", async () => {
+  const { cookie } = await signupUser();
+  fakeProvider.state.reset();
+  fakeProvider.state.set({ chatStatus: 503, chatFailuresRemaining: 1 });
+  try {
+    await withEnv(
+      { VUPS_MAX_RETRIES: "1", VUPS_RETRY_BASE_MS: "1", VUPS_RETRY_MAX_MS: "2" },
+      async () => {
+        const response = await api("/api/chat/vups-v3-galax", {
+          method: "POST",
+          cookie,
+          body: { stream: false, messages: [{ role: "user", content: "Retry please" }] }
+        });
+        assert.equal(response.status, 200);
+        assert.match(response.body.message.content, /Echo from fake-model-mini/);
+        assert.equal(fakeProvider.state.chatRequests.length, 2);
+      }
+    );
+  } finally {
+    fakeProvider.state.reset();
+  }
+});
+
+test("Vups preserves an exhausted upstream 503 after bounded retries", async () => {
+  const { cookie } = await signupUser();
+  fakeProvider.state.reset();
+  fakeProvider.state.set({ chatStatus: 503 });
+  try {
+    await withEnv(
+      { VUPS_MAX_RETRIES: "1", VUPS_RETRY_BASE_MS: "1", VUPS_RETRY_MAX_MS: "2" },
+      async () => {
+        const response = await api("/api/chat/vups-v3-galax", {
+          method: "POST",
+          cookie,
+          body: { stream: false, messages: [{ role: "user", content: "Overloaded" }] }
+        });
+        assert.equal(response.status, 503);
+        assert.equal(response.body.code, "vups_upstream_unavailable");
+        assert.doesNotMatch(response.body.message, /too many requests|rate.limit/i);
+        assert.equal(fakeProvider.state.chatRequests.length, 2);
+      }
+    );
+  } finally {
+    fakeProvider.state.reset();
+  }
+});
+
+test("Vups does not retry an exhausted free-model daily quota", async () => {
+  const { cookie } = await signupUser();
+  fakeProvider.state.reset();
+  fakeProvider.state.set({
+    chatStatus: 429,
+    chatStatusText: "Rate limit reached for free-models-per-day. Add credits to continue."
+  });
+  try {
+    await withEnv(
+      { VUPS_MAX_RETRIES: "3", VUPS_RETRY_BASE_MS: "1", VUPS_RETRY_MAX_MS: "2" },
+      async () => {
+        const response = await api("/api/chat/vups-v3-galax", {
+          method: "POST",
+          cookie,
+          body: { stream: false, messages: [{ role: "user", content: "Quota" }] }
+        });
+        assert.equal(response.status, 429);
+        assert.equal(response.body.code, "vups_quota_exhausted");
+        assert.match(response.body.message, /quota is exhausted/i);
+        assert.equal(fakeProvider.state.chatRequests.length, 1);
+      }
+    );
+  } finally {
+    fakeProvider.state.reset();
+  }
+});
+
+test("Vups forwards upstream Retry-After and does not wait beyond the configured cap", async () => {
+  const { cookie } = await signupUser();
+  fakeProvider.state.reset();
+  fakeProvider.state.set({
+    chatStatus: 429,
+    chatRetryAfter: 17,
+    chatStatusText: "Too many requests. Please retry later."
+  });
+  try {
+    await withEnv(
+      {
+        VUPS_MAX_RETRIES: "3",
+        VUPS_RETRY_BASE_MS: "1",
+        VUPS_RETRY_MAX_MS: "2",
+        VUPS_RETRY_MAX_RETRY_AFTER_MS: "1000"
+      },
+      async () => {
+        const response = await api("/api/chat/vups-v3-galax", {
+          method: "POST",
+          cookie,
+          body: { stream: false, messages: [{ role: "user", content: "Rate limited" }] }
+        });
+        assert.equal(response.status, 429);
+        assert.equal(response.body.code, "vups_rate_limited");
+        assert.equal(response.headers.get("retry-after"), "17");
+        assert.equal(fakeProvider.state.chatRequests.length, 1);
+      }
+    );
+  } finally {
+    fakeProvider.state.reset();
+  }
+});
+
+test("Vups returns safe structured upstream diagnostics and a request ID", async () => {
+  const { cookie } = await signupUser();
+  fakeProvider.state.reset();
+  fakeProvider.state.set({
+    chatStatus: 429,
+    chatRetryAfter: 7,
+    chatErrorPayload: {
+      error: {
+        message: "Provider returned error",
+        code: 429,
+        metadata: {
+          provider_name: "Google AI Studio",
+          provider_error_code: "429",
+          limit_source: "upstream_provider_shared_pool",
+          raw: "google/gemma-4-26b-a4b-it:free is temporarily rate-limited upstream. Key sk-leak-123456 was never sent."
+        }
+      }
+    }
+  });
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = message => warnings.push(String(message));
+  try {
+    const response = await withEnv(
+      { VUPS_MAX_RETRIES: "0", VUPS_RETRY_BASE_MS: "1", VUPS_RETRY_MAX_MS: "2" },
+      async () => api("/api/chat/vups-v3-galax", {
+        method: "POST",
+        cookie,
+        body: { stream: false, messages: [{ role: "user", content: "Rate limited" }] }
+      })
+    );
+    assert.equal(response.status, 429);
+    assert.equal(response.body.code, "vups_rate_limited");
+    assert.equal(response.headers.get("retry-after"), "7");
+    assert.equal(response.body.requestId, response.headers.get("x-request-id"));
+    assert.equal(fakeProvider.state.chatRequests.length, 1);
+
+    const logs = warnings
+      .filter(message => message.startsWith("{"))
+      .map(message => JSON.parse(message));
+    const failure = logs.find(entry => entry.event === "provider_upstream_failure");
+    assert.equal(failure.requestId, response.body.requestId);
+    assert.equal(failure.attempt, 1);
+    assert.equal(failure.model, "fake-model-mini");
+    assert.equal(failure.httpStatus, 429);
+    assert.equal(failure.providerName, "Google AI Studio");
+    assert.equal(failure.providerErrorCode, "429");
+    assert.equal(failure.limitSource, "upstream_provider_shared_pool");
+    assert.match(failure.providerDetail, /rate-limited upstream/);
+    assert.equal(failure.category, "rate_limit_requests");
+    assert.equal(failure.retryable, true);
+    assert.equal(failure.retryAfter, 7);
+    const outcome = logs.find(entry => entry.event === "vups_provider_outcome");
+    assert.equal(outcome.outcome, "failed");
+    assert.equal(outcome.requestId, response.body.requestId);
+    assert.equal(outcome.finalCode, "vups_rate_limited");
+    assert.ok(!warnings.join("\n").includes("sk-leak-123456"));
+    assert.ok(!response.text.includes("sk-leak-123456"));
+  } finally {
+    console.warn = originalWarn;
+    fakeProvider.state.reset();
+  }
+});
+
+test("Vups reports a mid-stream failure without retrying or faking success", async () => {
+  const { cookie } = await signupUser();
+  fakeProvider.state.reset();
+  fakeProvider.state.set({ failStreamMidway: true });
+  try {
+    await withEnv(
+      { VUPS_MAX_RETRIES: "3", VUPS_RETRY_BASE_MS: "1", VUPS_RETRY_MAX_MS: "2" },
+      async () => {
+        const response = await fetch(`${baseURL}/api/chat/vups-v3-galax`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Cookie: cookie },
+          body: JSON.stringify({ stream: true, messages: [{ role: "user", content: "Break" }] })
+        });
+        assert.equal(response.status, 200);
+        const events = (await response.text())
+          .split("\n")
+          .filter(line => line.startsWith("data: "))
+          .map(line => JSON.parse(line.slice(6)));
+        assert.equal(events.some(event => event.type === "done"), false);
+        assert.equal(events.find(event => event.type === "error")?.code, "vups_upstream_error");
+        assert.equal(fakeProvider.state.chatRequests.length, 1);
+      }
+    );
+  } finally {
+    fakeProvider.state.reset();
+  }
+});
+
 test("Vups v3 Galax streams SSE and enforces configured vision support", async () => {
   const { cookie } = await signupUser();
   fakeProvider.state.reset();
@@ -760,7 +1010,7 @@ test("chat surfaces provider errors clearly (invalid key, rate limit, unavailabl
   assert.match(badKey.body.message, /API key/i);
 
   fakeProvider.state.reset();
-  fakeProvider.state.set({ chatStatus: 429 });
+  fakeProvider.state.set({ chatStatus: 429, chatRetryAfter: "17" });
   const rateLimited = await api("/api/chat", {
     method: "POST",
     cookie,
@@ -768,6 +1018,7 @@ test("chat surfaces provider errors clearly (invalid key, rate limit, unavailabl
   });
   assert.equal(rateLimited.status, 429);
   assert.match(rateLimited.body.message, /Rate limit/i);
+  assert.equal(rateLimited.headers.get("retry-after"), "17", "upstream Retry-After must reach the browser");
 
   fakeProvider.state.reset();
   const unavailable = await api("/api/chat", {

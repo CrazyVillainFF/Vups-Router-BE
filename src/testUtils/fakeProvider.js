@@ -33,6 +33,10 @@ export async function startFakeProvider() {
       keyStatus: 200,
       chatStatus: 200,
       chatStatusText: "",
+      chatFailuresRemaining: null,
+      chatRetryAfter: null,
+      chatErrorPayload: null,
+      chatResponseHeaders: null,
       failStreamMidway: false,
       failModel: null,
       failModelStatus: 404,
@@ -55,6 +59,10 @@ export async function startFakeProvider() {
       state.behavior.keyStatus = 200;
       state.behavior.chatStatus = 200;
       state.behavior.chatStatusText = "";
+      state.behavior.chatFailuresRemaining = null;
+      state.behavior.chatRetryAfter = null;
+      state.behavior.chatErrorPayload = null;
+      state.behavior.chatResponseHeaders = null;
       state.behavior.failStreamMidway = false;
       state.behavior.failModel = null;
       state.behavior.failModelStatus = 404;
@@ -127,13 +135,34 @@ export async function startFakeProvider() {
           }
         });
       }
-      if (state.behavior.chatStatus !== 200) {
-        if (state.behavior.chatStatus === 429) {
-          return json(res, 429, { error: { message: state.behavior.chatStatusText || "Rate limit reached for this model." } });
+      let chatStatus = state.behavior.chatStatus;
+      if (Number.isInteger(state.behavior.chatFailuresRemaining)) {
+        if (state.behavior.chatFailuresRemaining > 0) {
+          state.behavior.chatFailuresRemaining -= 1;
+          chatStatus = state.behavior.chatStatus === 200 ? 503 : state.behavior.chatStatus;
+        } else {
+          chatStatus = 200;
         }
-        if (state.behavior.chatStatus === 402) return json(res, 402, { error: { message: "Insufficient credits." } });
-        if (state.behavior.chatStatus === 404) return json(res, 404, { error: { message: "The model does not exist." } });
-        return json(res, state.behavior.chatStatus, { error: { message: "Provider failure." } });
+      }
+      if (chatStatus !== 200) {
+        if (state.behavior.chatErrorPayload) {
+          res.writeHead(chatStatus, {
+            "Content-Type": "application/json",
+            ...(state.behavior.chatRetryAfter ? { "Retry-After": String(state.behavior.chatRetryAfter) } : {}),
+            ...(state.behavior.chatResponseHeaders || {})
+          });
+          return res.end(JSON.stringify(state.behavior.chatErrorPayload));
+        }
+        if (chatStatus === 429) {
+          res.writeHead(429, {
+            "Content-Type": "application/json",
+            ...(state.behavior.chatRetryAfter ? { "Retry-After": String(state.behavior.chatRetryAfter) } : {})
+          });
+          return res.end(JSON.stringify({ error: { message: state.behavior.chatStatusText || "Rate limit reached for this model." } }));
+        }
+        if (chatStatus === 402) return json(res, 402, { error: { message: "Insufficient credits." } });
+        if (chatStatus === 404) return json(res, 404, { error: { message: "The model does not exist." } });
+        return json(res, chatStatus, { error: { message: "Provider failure." } });
       }
       const knownModels = [...FAKE_MODELS, ...state.behavior.extraModels.map(entry => entry.id)];
       if (!body.model || !knownModels.includes(body.model)) {

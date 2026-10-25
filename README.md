@@ -118,7 +118,7 @@ All admin routes return `403` unless the signed-in user's email is listed in `AD
 
 | Method | Path | Notes |
 | --- | --- | --- |
-| `POST` | `/api/chat` | `{ conversationId?, messages, model?, configId?, providerId?, source?, mode?, temperature?, stream? }`. `configId` selects the exact saved configuration; `providerId` prevents a saved-model request from falling through to another provider; omit both for the shared model. `mode` is `general` (default) or `motion`. An unknown `configId` returns `404 config_not_found`. The final message may carry `images: [{ name?, mimeType, data }]` (base64, PNG/JPEG/WebP/GIF). Proxies to `{baseUrl}/chat/completions` (AgentRouter `gpt-*` models: `{baseUrl}/responses`; OpenCode Zen routes each model to its documented chat, Responses, or Anthropic Messages endpoint). Streams SSE (`meta`, `delta`, `done`, `error` events) by default |
+| `POST` | `/api/chat` | `{ conversationId?, messages, model?, configId?, providerId?, source?, mode?, temperature?, stream? }`. `configId` selects the exact saved configuration; `providerId` prevents a saved-model request from falling through to another provider; omit both for the shared model. `mode` is `general` (default) or `motion`. An unknown `configId` returns `404 config_not_found`. The final message may carry `images: [{ name?, mimeType?, data }]` (base64, PNG/JPEG/WebP/GIF) or `images: [{ name?, mimeType?, url }]` (public HTTPS URL). Proxies to `{baseUrl}/chat/completions` (AgentRouter `gpt-*` models: `{baseUrl}/responses`; OpenCode Zen routes each model to its documented chat, Responses, or Anthropic Messages endpoint). Streams SSE (`meta`, `delta`, `done`, `error` events) by default |
 | `GET` | `/api/conversations` | Lists the user's conversations |
 | `GET` | `/api/conversations/:id` | Full conversation with messages |
 | `DELETE` | `/api/conversations/:id` | Deletes one conversation |
@@ -147,6 +147,7 @@ Environment variables to set in the Render dashboard (Environment tab):
 | `ENCRYPTION_SECRET` | a second, different value from the same command |
 | `CLIENT_ORIGIN` | `https://vups-router-three.vercel.app` |
 | `NODE_ENV` | `production` (required: enables Secure cookies and strict startup checks) |
+| `TRUST_PROXY` | optional; defaults to `1` in production for Render/Vercel. Set to `false`, a hop count, or an Express trust-proxy value only when your proxy topology differs. |
 
 Do **not** set `PORT`; Render provides it automatically. `SERVER` is not needed either. The service exits at startup if `JWT_SECRET` or `ENCRYPTION_SECRET` is missing, so set them before deploying.
 
@@ -250,11 +251,16 @@ For a deploy sanity check, `node scripts/verify-openrouter.mjs` (with `OPENROUTE
 - Browser requests go to `POST /api/chat/vups-v3-galax`, never directly to the upstream. The browser sees only the public model ID and a safe `Default` badge.
 - The system prompt is assembled server-side and cannot be supplied or replaced by the client. The `motion` mode appends a fixed motion-design instruction.
 - `VUPS_BASE_URL`, `VUPS_API_KEY`, and `VUPS_UNDERLYING_MODEL` are private backend values. When all three are set, they take precedence. When none are set, Vups v3 Galax reuses the existing shared OpenRouter configuration (`OPENROUTER_API_KEY`, optional `OPENROUTER_BASE_URL`, and `OPENROUTER_DEFAULT_MODEL`) so a deployment with working shared models does not need duplicate credentials. Partial VUPS configuration or neither configuration returns `503 {"code":"vups_not_configured"}`; invalid clients cannot choose a different underlying model.
-- Image requests route to `VUPS_VISION_MODEL` when it is set. With the shared OpenRouter fallback, the default is the free, vision-capable `google/gemma-4-26b-a4b-it:free`, while text-only chats keep using `OPENROUTER_DEFAULT_MODEL`/`OPENROUTER_MODEL`. This prevents the text-only default model from rejecting images. A dedicated `VUPS_*` deployment must set `VUPS_VISION_MODEL` to an image-capable model available at `VUPS_BASE_URL`, or set `VUPS_VISION=true` to explicitly mark the dedicated model itself as vision-capable. `VUPS_VISION=false` disables image requests; a dedicated image request without either setting returns `400 {"code":"vups_vision_unsupported"}` instead of assuming text models can see images. Vups chat itself never generates images; prompt-based generation is a separate, optional Cloudflare Workers AI endpoint described below.
+- Image requests route to `VUPS_VISION_MODEL` when it is set. With the shared OpenRouter fallback, the default is the free, vision-capable `nvidia/nemotron-3.5-super-vl:free`, while text-only chats keep using `OPENROUTER_DEFAULT_MODEL`/`OPENROUTER_MODEL`. This prevents the text-only default model from rejecting images. A dedicated `VUPS_*` deployment must set `VUPS_VISION_MODEL` to an image-capable model available at `VUPS_BASE_URL`, or set `VUPS_VISION=true` to explicitly mark the dedicated model itself as vision-capable. `VUPS_VISION=false` disables image requests; a dedicated image request without either setting returns `400 {"code":"vups_vision_unsupported"}` instead of assuming text models can see images. Vups chat itself never generates images; prompt-based generation is a separate, optional Cloudflare Workers AI endpoint described below.
 - The route supports SSE streaming and non-streaming replies, persists normal conversation history, and uses the existing signed-in user, daily quota, and concurrency protections. Its rate limit defaults to 30 requests per minute per user and IP (`VUPS_CHAT_RATE_LIMIT_MAX`).
+- Transient upstream `429`/`5xx`/network failures are retried at most `VUPS_MAX_RETRIES` times (default 2) with bounded exponential backoff and jitter. Retries apply only before an SSE stream starts; a partial stream is never restarted. Upstream `Retry-After` is honored only when it fits `VUPS_RETRY_MAX_RETRY_AFTER_MS` (default 15000); otherwise the `429` is returned immediately with its original header.
+- Every upstream HTTP failure emits one structured `provider_upstream_failure` JSON log line. It includes the backend request ID, attempt, provider host and endpoint path, model, HTTP status, safe provider fields (`provider_name`, `provider_error_code`, `limit_source`), a truncated and redacted provider detail, category, and retry decision. Retry and final-outcome lines use `vups_provider_retry` and `vups_provider_outcome`. Query strings, API keys, cookies, and raw request bodies are never logged.
+- Every response includes `X-Request-Id`; Vups failures also include `requestId` in the JSON body (and SSE error event). Use it to find the matching Render log line. `GET /api/health` returns the deployed `release` commit, the active `features.vupsVisionModel` and `features.vupsVisionModelSource`, and feature flags so a stale deployment or wrong vision override is visible without exposing credentials.
+- Exhausted free-model daily quotas or account credits are not retried and return `429 {"code":"vups_quota_exhausted"}` with guidance to wait for quota reset or configure a funded model. Ordinary request-rate `429` responses return `vups_rate_limited`, token-per-minute limits return `vups_token_rate_limited`, concurrency limits return `vups_concurrency_limited`, and upstream `503` responses remain `503 {"code":"vups_upstream_unavailable"}` instead of being reported as rate limits. Shared upstream saturation is never “fixed” by silently switching the user's selected model.
 - Streaming, vision, and free-tier availability depend on the configured upstream model. The OpenRouter vision default is verified against the live catalog, but free-tier capacity can still be rate-limited; provide `VUPS_VISION_MODEL` to choose another compatible model.
+- Run `npm run check:vups-vision` with the same environment to verify the configured image model against the endpoint's live `/models` catalog. It prints image-capable IDs, prioritizes free models, and never prints the API key. For dedicated deployments, set `VUPS_VISION_MODEL` to one of those IDs, or set `VUPS_VISION=true` only when the dedicated text model itself accepts images.
 
-Environment variables (set in the Render dashboard, or omit all three to use the shared OpenRouter configuration):
+Environment variables (set in the Render dashboard, or omit the three upstream values to use the shared OpenRouter configuration):
 
 | Variable | Value |
 | --- | --- |
@@ -262,8 +268,20 @@ Environment variables (set in the Render dashboard, or omit all three to use the
 | `VUPS_API_KEY` | optional private upstream key. Never expose, log, or commit it. |
 | `VUPS_UNDERLYING_MODEL` | optional exact upstream model ID that serves Vups v3 Galax. |
 | `VUPS_VISION` | optional `true` / `false` for a dedicated model. `true` marks the dedicated model as vision-capable; `false` disables image requests; unset requires `VUPS_VISION_MODEL`. |
-| `VUPS_VISION_MODEL` | optional exact model ID for image requests. Defaults to `google/gemma-4-26b-a4b-it:free` when using the shared OpenRouter fallback. |
+| `VUPS_VISION_MODEL` | optional exact model ID for image requests. Defaults to `nvidia/nemotron-3.5-super-vl:free` when using the shared OpenRouter fallback. |
 | `VUPS_CHAT_RATE_LIMIT_MAX` | optional requests per minute per user and IP; default `30`. |
+| `VUPS_MAX_RETRIES` | optional retries for transient upstream failures before a stream starts; default `2`, capped at `5`. |
+| `VUPS_RETRY_BASE_MS` | optional base delay for exponential retry backoff; default `500`. |
+| `VUPS_RETRY_MAX_MS` | optional maximum single backoff delay; default `8000`. |
+| `VUPS_RETRY_MAX_RETRY_AFTER_MS` | optional maximum accepted upstream `Retry-After`; longer values fail immediately; default `15000`. |
+
+### Production diagnosis checklist
+
+1. Call `GET /api/health` and compare `release` with the commit that contains the behavior you expect. If `features.vupsDiagnostics` is absent or false, the backend is running an older build; redeploy before drawing conclusions from its error text.
+2. Reproduce the Vups request and read the response's `X-Request-Id`. Find `provider_upstream_failure` with the same `requestId` in the Render logs.
+3. Check `providerHost`, `model`, `httpStatus`, `providerName`, `providerErrorCode`, `limitSource`, `providerDetail`, and `category`. Do not infer quota from `429` alone; quota has a separate category and is not retried.
+4. If `limitSource` is `upstream_provider_shared_pool`, the upstream provider is shared and saturated. Retry later, use a different configured model, or fund a dedicated model. VupsRouter cannot raise an upstream provider's pool limit.
+5. For OpenRouter, admin diagnostics (`GET /api/admin/openrouter/diagnostics` and `/test-model`) verify the key and exact model without exposing the key. A production error body that does not match the current source tree means the deployment is stale.
 
 ## Image generation (Cloudflare Workers AI, optional)
 
@@ -425,16 +443,24 @@ How a request flows:
 
 1. The client validates type and size, reads each file to a base64 data URL,
    and sends `images` **on the final message only**: `{ name, mimeType, data }`
-   (no data-URL prefix). Earlier messages must stay text-only (`400` otherwise).
+   (no data-URL prefix). API clients may instead send `{ name?, mimeType?, url }`
+   with a public HTTPS image URL. Earlier messages must stay text-only (`400`
+   otherwise).
 2. The server re-validates everything: allowed types, base64 charset, per-image
    and total size limits, and the decoded bytes must match a real image
-   signature (magic-byte sniffing — the declared MIME type is never trusted).
+   signature (magic-byte sniffing �?" the declared MIME type is never trusted).
+   URL attachments must use HTTPS, cannot contain credentials, and cannot target
+   localhost, private, link-local, or metadata hosts. The server never fetches
+   remote URLs; the upstream provider does.
 3. Validated messages are serialized once in `providerClient.js` as
-   `[{ type: "text" }, { type: "image_url", image_url: { url: "data:…" } }]`,
-   which works for OpenRouter, personal OpenAI-compatible providers, and the
-   shared Ollama server's `/v1` compatibility endpoint.
+   `[{ type: "text" }, { type: "image_url", image_url: { url } }]`, where `url`
+   is a data URL or the validated remote HTTPS URL. This works for OpenRouter,
+   personal OpenAI-compatible providers, and the shared Ollama server's `/v1`
+   compatibility endpoint. Anthropic receives native base64 or URL image
+   sources, and Responses-compatible endpoints receive `input_image` parts.
 4. Message content may be empty when at least one image is attached
-   (image-only messages are supported).
+   (image-only messages are supported). Remote URL attachments store metadata
+   with `bytes: 0` and never download or persist the image.
 
 Limits (defaults; configurable via env shown in `.env.example`):
 
@@ -458,7 +484,7 @@ Vision capability is enforced server-side:
 - **Personal providers**: unknown, so requests are allowed and no capability
   claim is made; the provider's own error surfaces if it rejects the image.
 - **Vups v3 Galax via OpenRouter fallback**: image requests use
-  `VUPS_VISION_MODEL` or the free default `google/gemma-4-26b-a4b-it:free`;
+  `VUPS_VISION_MODEL` or the free default `nvidia/nemotron-3.5-super-vl:free`;
   text requests keep the configured text model. Dedicated `VUPS_*` deployments
   must set `VUPS_VISION_MODEL` (or `VUPS_VISION=true` for the dedicated model).
   A provider response saying no endpoint supports image input is returned as

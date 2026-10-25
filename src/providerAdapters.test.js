@@ -233,6 +233,22 @@ test("Anthropic image parts use base64 sources", () => {
   assert.equal(body.max_tokens, 4096);
 });
 
+test("Anthropic image parts use URL sources for remote HTTPS images", () => {
+  const body = buildAnthropicRequestBody({
+    model: MODEL,
+    stream: false,
+    messages: [{
+      role: "user",
+      content: "Describe this",
+      images: [{ mimeType: "image/png", url: "https://cdn.example.com/cat.png", bytes: 0 }]
+    }]
+  });
+  assert.deepEqual(body.messages[0].content[1], {
+    type: "image",
+    source: { type: "url", url: "https://cdn.example.com/cat.png" }
+  });
+});
+
 test("Anthropic streaming surfaces text deltas and finish reason", async () => {
   const upstream = await startChatCompletionStream({
     baseUrl,

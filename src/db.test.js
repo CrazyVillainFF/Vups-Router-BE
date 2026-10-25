@@ -90,7 +90,11 @@ test("classifies only confirmed database failures as database failures", () => {
 
   const duplicate = new Error("E11000 duplicate key error collection: vupsrouter.users index: email_1");
   duplicate.name = "MongoServerError";
-  assert.equal(isDatabaseFailure(duplicate), true);
+  assert.equal(isDatabaseFailure(duplicate), false, "a duplicate key is an application conflict, not an outage");
+
+  const shutdown = new Error("connection to server closed");
+  shutdown.name = "MongoServerError";
+  assert.equal(isDatabaseFailure(shutdown), true, "a lost server connection is an outage");
 
   const buffering = new Error("Operation `appsettings.findOne()` buffering timed out after 10000ms");
   buffering.name = "MongooseError";

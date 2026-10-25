@@ -1,7 +1,8 @@
-import { Router } from "express";
+﻿import { Router } from "express";
 import { createToken, hashPassword, passwordMatches, validateSignin, validateSignup } from "../auth.js";
 import connectToDatabase from "../db.js";
 import User from "../user.js";
+import { SESSION_TTL_MS } from "../session.js";
 import {
   authRateLimiter,
   clearSessionCookie,
@@ -65,6 +66,11 @@ router.post("/logout", (req, res) => {
 });
 
 router.get("/me", requireAuth, (req, res) => {
+  const issuedAt = Number(req.sessionPayload?.iat || 0) * 1000;
+  if (issuedAt && Date.now() - issuedAt > SESSION_TTL_MS / 2) {
+    const secret = getJwtSecret();
+    if (secret) setSessionCookie(res, createToken(req.user, secret));
+  }
   return res.json({ user: publicUser(req.user) });
 });
 

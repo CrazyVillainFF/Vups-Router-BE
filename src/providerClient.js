@@ -1,5 +1,5 @@
 import dns from "node:dns/promises";
-import { imageDataUrl } from "./chatImages.js";
+import { imageSourceUrl } from "./chatImages.js";
 import { freeFromPricing, geminiCapabilities, normalizeCapabilities, visionFromCapabilities } from "./modelCapabilities.js";
 
 function envMillis(name, fallback) {
@@ -12,11 +12,16 @@ const STREAM_TIMEOUT_MS = envMillis("PROVIDER_STREAM_TIMEOUT_MS", 300000);
 const MAX_ERROR_LENGTH = 400;
 
 export class ProviderError extends Error {
-  constructor(message, status = null, code = "provider_error") {
+  constructor(message, status = null, code = "provider_error", retryAfter = null, diagnostics = null) {
     super(message);
     this.name = "ProviderError";
     this.status = status;
     this.code = code;
+    this.retryAfter = retryAfter;
+    this.category = null;
+    this.classification = null;
+    this.retryable = null;
+    this.diagnostics = diagnostics;
   }
 }
 
@@ -353,19 +358,28 @@ function safeHost(url) {
   }
 }
 
-function networkError(error, url) {
+function networkError(error, url, context = {}) {
   const host = safeHost(url);
   const causeCode = error?.cause?.code || error?.code || "";
+  let providerError;
   if (causeCode === "ENOTFOUND" || causeCode === "EAI_AGAIN") {
-    return new ProviderError(`DNS lookup failed for "${host}". Check the API base URL hostname and that the provider is online.`, null, "dns_error");
+    providerError = new ProviderError(`DNS lookup failed for "${host}". Check the API base URL hostname and that the provider is online.`, null, "dns_error");
+  } else if (causeCode === "ECONNREFUSED") {
+    providerError = new ProviderError(`Connection refused by "${host}". The endpoint may be offline, the port closed, or the URL wrong.`, null, "connection_refused");
+  } else if (causeCode === "ECONNRESET" || causeCode === "EPIPE") {
+    providerError = new ProviderError(`The connection to "${host}" was reset before a response arrived. Try again.`, null, "network_error");
+  } else {
+    providerError = new ProviderError(`Could not reach "${host}". Check the API base URL and your network.`, null, "network_error");
   }
-  if (causeCode === "ECONNREFUSED") {
-    return new ProviderError(`Connection refused by "${host}". The endpoint may be offline, the port closed, or the URL wrong.`, null, "connection_refused");
-  }
-  if (causeCode === "ECONNRESET" || causeCode === "EPIPE") {
-    return new ProviderError(`The connection to "${host}" was reset before a response arrived. Try again.`, null, "network_error");
-  }
-  return new ProviderError(`Could not reach "${host}". Check the API base URL and your network.`, null, "network_error");
+  return attachProviderDiagnostic(providerError, {
+    url,
+    context,
+    classification: {
+      category: "network_error",
+      classification: "transient",
+      retryable: true
+    }
+  });
 }
 
 export function validateProviderFields({ provider, baseUrl, apiKey, model }, { requireKey = true } = {}) {
@@ -428,20 +442,13 @@ export function buildProviderFailureLog({ url, method = "POST", status, contentT
   return `Provider request failed: ${method} ${target} -> HTTP ${status}; content-type=${contentType || "unknown"}; body=${body || "(empty)"}`;
 }
 
-function logProviderFailure(url, response, payload) {
-  console.warn(buildProviderFailureLog({
-    url,
-    method: "POST",
-    status: response.status,
-    contentType: response.headers.get("content-type"),
-    payload
-  }));
-}
-
 // Upstream error bodies are third-party data. Never surface HTML error pages or
 // markup: summarize them instead, and keep JSON/message details short.
 function sanitizedErrorDetail(payload) {
-  const raw = payload?.error?.message || payload?.message || (typeof payload === "string" ? payload : "");
+  const raw = payload?.error?.message
+    || (typeof payload?.error === "string" ? payload.error : "")
+    || payload?.message
+    || (typeof payload === "string" ? payload : "");
   if (typeof raw !== "string") return "";
   const text = raw.trim();
   if (!text) return "";
@@ -449,6 +456,200 @@ function sanitizedErrorDetail(payload) {
     return "The provider returned an HTML error page instead of an API response. Check the API base URL and try again.";
   }
   return redactSecrets(truncate(text));
+}
+
+function diagnosticObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+}
+
+function diagnosticText(value, limit = 120) {
+  if (typeof value === "number" && Number.isFinite(value)) value = String(value);
+  return typeof value === "string" ? redactSecrets(truncate(value, limit)) : "";
+}
+
+export function providerErrorFields(payload) {
+  const root = diagnosticObject(payload) || {};
+  const error = diagnosticObject(root.error) || {};
+  const metadata = diagnosticObject(error.metadata) || diagnosticObject(root.metadata) || {};
+  const details = Array.isArray(error.details) ? error.details : Array.isArray(root.details) ? root.details : [];
+  const reasons = details
+    .map(entry => diagnosticText(diagnosticObject(entry)?.reason, 80))
+    .filter(Boolean)
+    .slice(0, 5);
+  return {
+    code: diagnosticText(error.code ?? root.code ?? error.error_code ?? root.error_code, 80),
+    type: diagnosticText(error.type ?? root.type ?? error.error_type ?? root.error_type, 80),
+    status: diagnosticText(error.status ?? root.error_status, 80),
+    providerName: diagnosticText(metadata.provider_name ?? metadata.provider ?? root.provider_name, 80),
+    providerCode: diagnosticText(metadata.provider_error_code, 80),
+    limitSource: diagnosticText(metadata.limit_source, 80),
+    remedyHint: diagnosticText(metadata.remedy_hint, 240),
+    detail: diagnosticText(metadata.raw, 300),
+    reasons,
+    message: sanitizedErrorDetail(payload)
+  };
+}
+
+const QUOTA_ERROR_CODE = /insufficient_quota|billing_hard_limit|credit_balance|insufficient_credits|payment_required|quota_exceeded/i;
+const QUOTA_ERROR_TEXT = /quota|credit|billing|spend(?:ing)? limit|free-models-per-day|free models per day|per[- ]day|daily limit|requests per day|tokens per day|\bRPD\b|\bTPD\b|monthly limit|exceeded your current quota/i;
+const CONCURRENCY_ERROR_TEXT = /concurren|parallel|simultaneous|in.?flight/i;
+const TOKEN_RATE_ERROR_TEXT = /tokens? per min|\bTPM\b|token[- ]rate|tokens?.*(?:minute|min\b)/i;
+const REQUEST_RATE_ERROR_TEXT = /requests? per min|\bRPM\b|too many requests|rate.?limit|request rate/i;
+const INVALID_MODEL_ERROR_TEXT = /model.*(?:not found|does not exist|not available|invalid)|invalid model|unknown model|no endpoints found/i;
+const CREDENTIAL_ERROR_TEXT = /invalid.*(?:api.?key|token|credential)|unauthorized|authentication|api key.*(?:invalid|expired|disabled)/i;
+
+export function classifyProviderFailure({ status = null, payload = null, message = "" } = {}) {
+  const fields = providerErrorFields(payload);
+  const signal = [
+    fields.code,
+    fields.type,
+    fields.status,
+    fields.providerCode,
+    fields.providerName,
+    fields.limitSource,
+    fields.detail,
+    fields.reasons.join(" "),
+    message || fields.message
+  ].filter(Boolean).join(" ");
+  const statusCode = Number(status ?? fields.status ?? fields.code);
+  const hasStatus = Number.isFinite(statusCode) && statusCode >= 100 && statusCode <= 599;
+  const quota = QUOTA_ERROR_CODE.test(`${fields.code} ${fields.type} ${fields.providerCode}`)
+    || QUOTA_ERROR_TEXT.test(signal);
+  const concurrency = CONCURRENCY_ERROR_TEXT.test(signal);
+  const tokenRate = TOKEN_RATE_ERROR_TEXT.test(signal);
+  const requestRate = REQUEST_RATE_ERROR_TEXT.test(signal);
+  const invalidModel = INVALID_MODEL_ERROR_TEXT.test(signal);
+  const credentials = CREDENTIAL_ERROR_TEXT.test(signal);
+
+  const result = (category, classification, retryable) => ({
+    category,
+    classification,
+    retryable,
+    providerCode: fields.code,
+    providerType: fields.type,
+    providerStatus: fields.status,
+    providerName: fields.providerName,
+    providerErrorCode: fields.providerCode,
+    limitSource: fields.limitSource
+  });
+
+  if (statusCode === 401 || (statusCode === 403 && credentials && !quota)) return result("invalid_credentials", "permanent", false);
+  if (statusCode === 402 || quota) return result("quota_exhausted", "permanent", false);
+  if (statusCode === 403) return result("forbidden", "permanent", false);
+  if (statusCode === 404 || (statusCode === 400 && invalidModel)) return result("invalid_model", "permanent", false);
+  if (statusCode === 400 && credentials) return result("invalid_credentials", "permanent", false);
+  if ((statusCode === 429 || fields.code === "429" || fields.status === "429")) {
+    if (concurrency) return result("concurrency_limit", "transient", true);
+    if (tokenRate) return result("rate_limit_tokens", "transient", true);
+    if (requestRate) return result("rate_limit_requests", "transient", true);
+    return result("ambiguous_rate_limit", "ambiguous", true);
+  }
+  if (statusCode === 409 && concurrency) return result("concurrency_limit", "transient", true);
+  if (statusCode === 408) return result("timeout", "transient", true);
+  if (statusCode >= 500) {
+    if (/overload|capacity|temporar/i.test(signal)) return result("overloaded", "transient", true);
+    return result("upstream_unavailable", "transient", true);
+  }
+  if (statusCode === 413) return result("request_too_large", "permanent", false);
+  if (statusCode === 400 || statusCode === 422) return result("invalid_request", "permanent", false);
+  return result("unknown", hasStatus ? "permanent" : "ambiguous", false);
+}
+
+function responseHeader(headers, name) {
+  if (!headers) return "";
+  if (typeof headers.get === "function") return headers.get(name) || "";
+  const match = Object.keys(headers).find(key => key.toLowerCase() === name.toLowerCase());
+  return match ? String(headers[match] ?? "") : "";
+}
+
+function responseDiagnostics(headers) {
+  if (!headers) return {};
+  const selected = [
+    "server",
+    "cf-ray",
+    "x-request-id",
+    "request-id",
+    "via",
+    "x-envoy-upstream-service-time",
+    "x-ratelimit-limit",
+    "x-ratelimit-remaining",
+    "x-ratelimit-reset",
+    "x-ratelimit-limit-requests",
+    "x-ratelimit-remaining-requests",
+    "x-ratelimit-reset-requests",
+    "x-ratelimit-limit-tokens",
+    "x-ratelimit-remaining-tokens",
+    "x-ratelimit-reset-tokens"
+  ];
+  const result = {};
+  for (const name of selected) {
+    const value = diagnosticText(responseHeader(headers, name), 120);
+    if (value) result[name] = value;
+  }
+  return result;
+}
+
+function diagnosticTarget(url) {
+  try {
+    const parsed = new URL(url);
+    return { providerHost: parsed.hostname, endpoint: parsed.pathname };
+  } catch {
+    return { providerHost: "unresolved", endpoint: "unresolved" };
+  }
+}
+
+export function buildProviderFailureDiagnostic({
+  url,
+  status = null,
+  payload = null,
+  headers = null,
+  retryAfter = null,
+  retryAfterRaw = "",
+  context = {},
+  classification = null
+} = {}) {
+  const target = diagnosticTarget(url);
+  const fields = providerErrorFields(payload);
+  const classified = classification ?? classifyProviderFailure({ status, payload, message: fields.message });
+  return {
+    event: "provider_upstream_failure",
+    timestamp: new Date().toISOString(),
+    requestId: diagnosticText(context.requestId, 80) || null,
+    attempt: Number.isInteger(context.attempt) ? context.attempt : null,
+    providerHost: target.providerHost,
+    endpoint: target.endpoint,
+    model: diagnosticText(context.model, 200) || null,
+    httpStatus: Number.isInteger(status) ? status : null,
+    providerCode: fields.code || null,
+    providerType: fields.type || null,
+    providerStatus: fields.status || null,
+    providerName: fields.providerName || null,
+    providerErrorCode: fields.providerCode || null,
+    limitSource: fields.limitSource || null,
+    providerReasons: fields.reasons,
+    providerMessage: fields.message || fields.detail || null,
+    providerDetail: fields.detail || null,
+    remedyHint: fields.remedyHint || null,
+    category: classified.category,
+    classification: classified.classification,
+    retryable: classified.retryable,
+    retryAfter: Number.isFinite(retryAfter) ? retryAfter : null,
+    retryAfterRaw: diagnosticText(retryAfterRaw, 80) || null,
+    responseHeaders: responseDiagnostics(headers)
+  };
+}
+
+function attachProviderDiagnostic(error, options) {
+  const diagnostic = buildProviderFailureDiagnostic(options);
+  error.category = diagnostic.category;
+  error.classification = diagnostic.classification;
+  error.retryable = diagnostic.retryable;
+  error.diagnostics = diagnostic;
+  if (diagnostic.category === "quota_exhausted" && error.code === "rate_limited") error.code = "quota_exhausted";
+  if (diagnostic.category === "invalid_model" && error.code === "bad_request") error.code = "invalid_model";
+  if (diagnostic.category === "invalid_credentials" && error.code === "bad_request") error.code = "invalid_api_key";
+  console.warn(JSON.stringify(diagnostic));
+  return error;
 }
 
 export function describeProviderError(status, payload) {
@@ -459,7 +660,7 @@ export function describeProviderError(status, payload) {
   if (status === 402) return new ProviderError(`Your provider account has insufficient credits (HTTP 402).${suffix}`, status, "insufficient_credits");
   if (status === 403) return new ProviderError(`The provider denied access (HTTP 403). Your key may lack permission for this model.${suffix}`, status, "forbidden");
   if (status === 404) return new ProviderError(`The provider returned HTTP 404. The API base URL or model ID is likely wrong.${suffix}`, status, "not_found");
-  if (status === 405) return new ProviderError(`The provider rejected the request method or endpoint (HTTP 405). The base URL may point at the wrong API path, or the model may require a different endpoint.${suffix}`, status, "method_not_allowed");
+  if (status === 405) return new ProviderError(`The provider rejected the request method or endpoint (HTTP 405). Check the API base URL, and in Settings choose OpenAI-compatible for /chat/completions or OpenAI Responses for /responses.${suffix}`, status, "method_not_allowed");
   if (status === 408) return new ProviderError(`The provider timed out (HTTP 408).${suffix}`, status, "timeout");
   if (status === 413) return new ProviderError(`The conversation is too large for this provider (HTTP 413).${suffix}`, status, "too_large");
   if (status === 422) return new ProviderError(`The provider could not process the request (HTTP 422). Check the model ID.${suffix}`, status, "unprocessable");
@@ -495,13 +696,115 @@ function googleGeminiError(status, payload) {
   return describeProviderError(status, payload);
 }
 
-function providerHttpError(url, status, payload) {
+export function parseRetryAfter(value, now = Date.now()) {
+  if (value === null || value === undefined) return null;
+  const text = String(value).trim();
+  if (!text) return null;
+  if (/^\d+$/.test(text)) {
+    const seconds = Number(text);
+    return Number.isFinite(seconds) ? Math.min(Math.max(Math.floor(seconds), 0), 86400) : null;
+  }
+  if (!/^[A-Za-z]{3}, \d{2} [A-Za-z]{3} \d{4} \d{2}:\d{2}:\d{2} GMT$/.test(text)) return null;
+  const timestamp = Date.parse(text);
+  if (!Number.isFinite(timestamp)) return null;
+  return Math.min(Math.max(Math.ceil((timestamp - now) / 1000), 0), 86400);
+}
+
+const QUOTA_EXHAUSTED_PATTERN =
+  /free-models-per-day|free models per day|per[- ]day|daily|requests per day|\bRPD\b|quota is exhausted|free[- ]tier|insufficient credits|credit balance/i;
+
+export function isQuotaExhaustedError(error) {
+  if (!(error instanceof ProviderError)) return false;
+  if (error.category === "quota_exhausted") return true;
+  if (["free_quota_exhausted", "quota_exhausted", "insufficient_credits"].includes(error.code)) return true;
+  return error.code === "rate_limited" && QUOTA_EXHAUSTED_PATTERN.test(String(error.message || ""));
+}
+
+export function isRetryableProviderError(error) {
+  if (!(error instanceof ProviderError)) return false;
+  if (typeof error.retryable === "boolean") return error.retryable;
+  if (error.code === "cancelled" || error.code === "free_quota_exhausted" || error.code === "quota_exhausted") return false;
+  if (isQuotaExhaustedError(error)) return false;
+  if (error.code === "rate_limited") return true;
+  if (error.code === "timeout") return true;
+  if (["network_error", "connection_refused", "provider_unavailable"].includes(error.code)) return true;
+  if (error.status === 408 || error.status === 429) return true;
+  return typeof error.status === "number" && [500, 502, 503, 504].includes(error.status);
+}
+
+export function retryDelayMs(error, attempt, options = {}) {
+  const baseDelayMs = Math.max(1, Number(options.baseDelayMs) || 500);
+  const maxDelayMs = Math.max(baseDelayMs, Number(options.maxDelayMs) || 8000);
+  const configuredRetryAfterCap = Number(options.maxRetryAfterMs);
+  const maxRetryAfterMs = Number.isFinite(configuredRetryAfterCap) && configuredRetryAfterCap >= 0
+    ? configuredRetryAfterCap
+    : 15000;
+  const random = typeof options.random === "function" ? options.random : Math.random;
+  const exponential = Math.min(maxDelayMs, baseDelayMs * 2 ** Math.max(0, Math.floor(attempt)));
+  const jitter = Math.floor(random() * Math.max(1, Math.floor(exponential * 0.25)));
+  const backoff = Math.min(maxDelayMs, exponential + jitter);
+  if (Number.isFinite(error?.retryAfter) && error.retryAfter >= 0) {
+    const retryAfterMs = Math.floor(error.retryAfter * 1000);
+    if (retryAfterMs > maxRetryAfterMs) return null;
+    return Math.min(maxRetryAfterMs, Math.max(backoff, retryAfterMs));
+  }
+  return backoff;
+}
+
+function waitForRetry(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new ProviderError("Request cancelled.", null, "cancelled"));
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", cancel);
+      resolve();
+    }, ms);
+    function cancel() {
+      clearTimeout(timer);
+      reject(new ProviderError("Request cancelled.", null, "cancelled"));
+    }
+    signal?.addEventListener("abort", cancel, { once: true });
+  });
+}
+
+export async function withProviderRetry(operation, options = {}) {
+  const requested = Number(options.maxRetries);
+  const maxRetries = Number.isFinite(requested) ? Math.min(Math.max(Math.floor(requested), 0), 5) : 0;
+  const sleep = typeof options.sleep === "function" ? options.sleep : waitForRetry;
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await operation(attempt);
+    } catch (error) {
+      if (!isRetryableProviderError(error) || attempt >= maxRetries) throw error;
+      const delay = retryDelayMs(error, attempt, options);
+      if (delay === null) throw error;
+      if (options.signal?.aborted) throw new ProviderError("Request cancelled.", null, "cancelled");
+      options.onRetry?.({ attempt: attempt + 1, delay, error });
+      await sleep(delay, options.signal);
+    }
+  }
+}
+
+function providerHttpError(url, status, payload, retryAfter = null, headers = null, context = {}) {
+  let error;
   try {
-    if (isGoogleGeminiHost(new URL(url).hostname)) return googleGeminiError(status, payload);
+    if (isGoogleGeminiHost(new URL(url).hostname)) error = googleGeminiError(status, payload);
   } catch {
     /* fall through to the generic mapping */
   }
-  return describeProviderError(status, payload);
+  if (!error) error = describeProviderError(status, payload);
+  if (retryAfter !== null) error.retryAfter = retryAfter;
+  return attachProviderDiagnostic(error, {
+    url,
+    status,
+    payload,
+    headers,
+    retryAfter,
+    retryAfterRaw: responseHeader(headers, "retry-after"),
+    context
+  });
 }
 
 const MAX_PROVIDER_RESPONSE_BYTES = 4 * 1024 * 1024;
@@ -689,7 +992,13 @@ export async function listProviderModels({ baseUrl, apiKey, providerType = "open
       );
     }
     const payload = await readJsonSafely(response);
-    throw providerHttpError(url, response.status, payload);
+    throw providerHttpError(
+      url,
+      response.status,
+      payload,
+      parseRetryAfter(response.headers.get("retry-after")),
+      response.headers
+    );
   }
   const payload = await readJsonSafely(response);
   if (google) {
@@ -752,8 +1061,8 @@ export async function listProviderModels({ baseUrl, apiKey, providerType = "open
 // Converts normalized messages into the OpenAI chat format used by every
 // provider we support (OpenRouter, personal OpenAI-compatible APIs, and the
 // shared Ollama server's /v1 compatibility layer). Messages carrying images
-// become content-parts arrays with base64 data URLs; everything else is
-// passed through untouched.
+// become content-parts arrays with base64 data URLs or remote https URLs;
+// everything else is passed through untouched.
 export function serializeMessages(messages) {
   return messages.map(message => {
     const images = Array.isArray(message?.images) ? message.images : [];
@@ -763,7 +1072,7 @@ export function serializeMessages(messages) {
       parts.push({ type: "text", text: message.content });
     }
     for (const image of images) {
-      parts.push({ type: "image_url", image_url: { url: imageDataUrl(image) } });
+      parts.push({ type: "image_url", image_url: { url: imageSourceUrl(image) } });
     }
     return { role: message.role, content: parts };
   });
@@ -798,8 +1107,10 @@ function serializeAnthropicMessages(messages) {
         parts.push({ type: "text", text: message.content });
       }
       for (const image of Array.isArray(message.images) ? message.images : []) {
-        const parsed = parseImageDataUrl(imageDataUrl(image));
+        const sourceUrl = imageSourceUrl(image);
+        const parsed = parseImageDataUrl(sourceUrl);
         if (parsed) parts.push({ type: "image", source: { type: "base64", media_type: parsed.mediaType, data: parsed.data } });
+        else if (/^https:\/\//i.test(sourceUrl)) parts.push({ type: "image", source: { type: "url", url: sourceUrl } });
       }
       return {
         role: message.role === "assistant" ? "assistant" : "user",
@@ -883,12 +1194,13 @@ function responsesFinishReason(payload) {
   return payload?.status === "completed" ? "stop" : null;
 }
 
-export async function chatCompletion({ baseUrl, apiKey, model, messages, temperature, maxTokens, providerType = "openai_compatible", reasoning }, signal) {
+export async function chatCompletion({ baseUrl, apiKey, model, messages, temperature, maxTokens, providerType = "openai_compatible", reasoning, requestId = null, attempt = null }, signal) {
   const type = normalizeProviderType(providerType);
   const anthropic = usesAnthropicApi(baseUrl, model, type);
   const watsonx = !isOpenCodeZenBase(baseUrl) && type === "watsonx";
   const responses = !anthropic && !watsonx && usesResponsesApi(baseUrl, model, type);
   const url = resolveChatEndpoint(baseUrl, model, type);
+  const context = { requestId, attempt, model };
   const body = anthropic
     ? buildAnthropicRequestBody({ model, messages, temperature, maxTokens, stream: false })
     : watsonx
@@ -905,20 +1217,32 @@ export async function chatCompletion({ baseUrl, apiKey, model, messages, tempera
     });
   } catch (error) {
     if (error?.name === "TimeoutError" || error?.name === "AbortError") {
-      throw new ProviderError("Timed out while waiting for the provider.", null, "timeout");
+      throw attachProviderDiagnostic(
+        new ProviderError("Timed out while waiting for the provider.", null, "timeout"),
+        { url, context, classification: { category: "timeout", classification: "transient", retryable: true } }
+      );
     }
     if (error instanceof ProviderError) throw error;
-    throw networkError(error, url);
+    throw networkError(error, url, context);
   }
   if (!response.ok) {
     const failure = await readJsonSafely(response);
-    logProviderFailure(url, response, failure);
-    throw providerHttpError(url, response.status, failure);
+    throw providerHttpError(
+      url,
+      response.status,
+      failure,
+      parseRetryAfter(response.headers.get("retry-after")),
+      response.headers,
+      context
+    );
   }
   const payload = await readJsonSafely(response);
   const content = anthropic ? extractAnthropicText(payload) : extractResponseText(payload);
   if (content.length === 0) {
-    throw new ProviderError("The provider returned an empty or unexpected response.", response.status, "empty_response");
+    throw attachProviderDiagnostic(
+      new ProviderError("The provider returned an empty or unexpected response.", response.status, "empty_response"),
+      { url, status: response.status, context, headers: response.headers, classification: { category: "empty_response", classification: "permanent", retryable: false } }
+    );
   }
   return {
     content,
@@ -928,12 +1252,13 @@ export async function chatCompletion({ baseUrl, apiKey, model, messages, tempera
   };
 }
 
-export async function startChatCompletionStream({ baseUrl, apiKey, model, messages, temperature, maxTokens, providerType = "openai_compatible", reasoning }, signal) {
+export async function startChatCompletionStream({ baseUrl, apiKey, model, messages, temperature, maxTokens, providerType = "openai_compatible", reasoning, requestId = null, attempt = null }, signal) {
   const type = normalizeProviderType(providerType);
   const anthropic = usesAnthropicApi(baseUrl, model, type);
   const watsonx = !isOpenCodeZenBase(baseUrl) && type === "watsonx";
   const responses = !anthropic && !watsonx && usesResponsesApi(baseUrl, model, type);
   const url = resolveChatEndpoint(baseUrl, model, type, { stream: true });
+  const context = { requestId, attempt, model };
   const body = anthropic
     ? buildAnthropicRequestBody({ model, messages, temperature, maxTokens, stream: true })
     : watsonx
@@ -951,18 +1276,30 @@ export async function startChatCompletionStream({ baseUrl, apiKey, model, messag
   } catch (error) {
     if (error?.name === "TimeoutError" || error?.name === "AbortError") {
       if (signal?.aborted) throw new ProviderError("Request cancelled.", null, "cancelled");
-      throw new ProviderError("Timed out while waiting for the provider's stream.", null, "timeout");
+      throw attachProviderDiagnostic(
+        new ProviderError("Timed out while waiting for the provider's stream.", null, "timeout"),
+        { url, context, classification: { category: "timeout", classification: "transient", retryable: true } }
+      );
     }
     if (error instanceof ProviderError) throw error;
-    throw networkError(error, url);
+    throw networkError(error, url, context);
   }
   if (!response.ok) {
     const failure = await readJsonSafely(response);
-    logProviderFailure(url, response, failure);
-    throw providerHttpError(url, response.status, failure);
+    throw providerHttpError(
+      url,
+      response.status,
+      failure,
+      parseRetryAfter(response.headers.get("retry-after")),
+      response.headers,
+      context
+    );
   }
   if (!response.body) {
-    throw new ProviderError("The provider did not return a response stream.", response.status, "empty_stream");
+    throw attachProviderDiagnostic(
+      new ProviderError("The provider did not return a response stream.", response.status, "empty_stream"),
+      { url, status: response.status, context, headers: response.headers, classification: { category: "empty_stream", classification: "permanent", retryable: false } }
+    );
   }
   return response;
 }
@@ -1009,7 +1346,9 @@ export async function testProviderConnection({ baseUrl, apiKey, providerType = "
     listingSupported: discovery.listingSupported,
     warning: discovery.listingSupported
       ? null
-      : "This provider does not expose a model list. The endpoint is reachable, but credentials are only verified by an explicit model test."
+      : "The endpoint was reached, but its model list could not be verified" +
+        (discovery.listError?.message ? ": " + discovery.listError.message : ".") +
+        " Use Test model to verify the saved model and credentials."
   };
 }
 

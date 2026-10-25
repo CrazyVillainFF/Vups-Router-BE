@@ -1,6 +1,10 @@
-import mongoose from "mongoose";
+﻿import mongoose from "mongoose";
 
 const cache = globalThis.__vupsRouterMongoose ??= { connection: null, promise: null };
+
+function hasReadyConnection() {
+  return Boolean(cache.connection) && mongoose.connection.readyState === 1;
+}
 
 export function describeDatabaseError(error) {
   const parts = [error?.name || "", error?.message || ""];
@@ -88,8 +92,10 @@ export function isDatabaseFailure(error) {
   const name = String(error.name || "");
   const message = String(error.message || "");
   if (/^database is not configured\.?$/i.test(message.trim())) return true;
-  if (name === "MongoServerError") return true;
   if (MONGO_CONNECTION_ERROR_NAMES.has(name)) return true;
+  if (name === "MongoServerError") {
+    return /not primary|primary stepped down|shutdown in progress|connection|network|topology|socket|timed out|timeout|ECONNREFUSED|ECONNRESET|ETIMEDOUT|EAI_AGAIN|ENOTFOUND/i.test(message);
+  }
   if (name === "MongooseError") {
     return /buffering timed out|failed to connect|server selection|topology|not connected|ECONNREFUSED|ECONNRESET|ETIMEDOUT|EAI_AGAIN|ENOTFOUND/i.test(message);
   }
@@ -97,18 +103,24 @@ export function isDatabaseFailure(error) {
 }
 
 export default async function connectToDatabase() {
-  if (cache.connection) return cache.connection;
+  if (hasReadyConnection()) return cache.connection;
+  cache.connection = null;
   if (!process.env.MONGODB_URI) throw new Error("Database is not configured.");
 
   if (!cache.promise) {
-    cache.promise = mongoose.connect(process.env.MONGODB_URI, {
+    const pending = mongoose.connect(process.env.MONGODB_URI, {
       serverSelectionTimeoutMS: 10000
-    }).then(connection => connection).catch(error => {
+    }).then(connection => {
+      cache.connection = connection;
       cache.promise = null;
+      return connection;
+    }).catch(error => {
+      cache.promise = null;
+      cache.connection = null;
       throw error;
     });
+    cache.promise = pending;
   }
 
-  cache.connection = await cache.promise;
-  return cache.connection;
+  return cache.promise;
 }

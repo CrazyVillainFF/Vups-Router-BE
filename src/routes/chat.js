@@ -9,9 +9,11 @@ import {
   assertAllowedProviderUrl,
   chatCompletion,
   extractStreamText,
+  isQuotaExhaustedError,
   normalizeBaseUrl,
   redactSecrets,
-  startChatCompletionStream
+  startChatCompletionStream,
+  withProviderRetry
 } from "../providerClient.js";
 import { chatRateLimiter, requireAuth, vupsGalaxRateLimiter } from "../middleware.js";
 import { UsageError, acquireSlot, consumeDailyQuota, releaseSlot } from "../usage.js";
@@ -410,6 +412,7 @@ const PROVIDER_STATUS_BY_CODE = {
   unsupported_protocol: 400,
   free_tier_client_only: 403,
   free_quota_exhausted: 429,
+  quota_exhausted: 429,
   region_restricted: 403,
   model_unavailable: 400,
   dns_error: 502,
@@ -430,6 +433,17 @@ function providerFailureStatus(error) {
   if (error?.code && PROVIDER_STATUS_BY_CODE[error.code]) return PROVIDER_STATUS_BY_CODE[error.code];
   if (typeof error?.status === "number" && error.status >= 400 && error.status <= 599) return error.status;
   return 502;
+}
+
+function sendProviderFailure(res, failure, error, requestId = null) {
+  if (Number.isInteger(error?.retryAfter) && error.retryAfter >= 0) {
+    res.setHeader("Retry-After", String(error.retryAfter));
+  }
+  return res.status(failure.status).json({
+    message: failure.message,
+    code: failure.code,
+    ...(requestId ? { requestId } : {})
+  });
 }
 
 function providerFailure(provider, error) {
@@ -483,10 +497,8 @@ function providerFailure(provider, error) {
     };
   }
   if (provider?.shared) {
-    if (error.code === "rate_limited" || error.code === "insufficient_credits") {
-      const accountWide =
-        error.code === "insufficient_credits" ||
-        /free-models-per-day|per.day|daily|credits|balance/i.test(String(error.message || ""));
+    if (error.code === "rate_limited" || error.code === "insufficient_credits" || isQuotaExhaustedError(error)) {
+      const accountWide = isQuotaExhaustedError(error);
       if (accountWide) {
         return {
           status: 429,
@@ -532,19 +544,119 @@ function canTrySharedFallback(provider, error) {
   if (!["model_unavailable", "not_found", "rate_limited", "timeout", "network_error", "provider_unavailable", "empty_response", "empty_stream"].includes(error?.code)) {
     return false;
   }
-  if (error.code === "rate_limited" && /free-models-per-day|per.day|daily|credits|balance/i.test(String(error.message || ""))) {
-    return false;
-  }
+  if (isQuotaExhaustedError(error)) return false;
   return true;
+}
+
+function vupsRetryOptions() {
+  const number = (name, fallback) => {
+    const value = Number(process.env[name]);
+    return Number.isFinite(value) && value >= 0 ? Math.floor(value) : fallback;
+  };
+  return {
+    maxRetries: Math.min(number("VUPS_MAX_RETRIES", 2), 5),
+    baseDelayMs: number("VUPS_RETRY_BASE_MS", 500),
+    maxDelayMs: number("VUPS_RETRY_MAX_MS", 8000),
+    maxRetryAfterMs: number("VUPS_RETRY_MAX_RETRY_AFTER_MS", 15000)
+  };
+}
+
+function providerHostFromUrl(value) {
+  try {
+    return new URL(String(value)).hostname || "unresolved";
+  } catch {
+    return "unresolved";
+  }
+}
+
+function logVupsRetry({ attempt, delay, error, requestId, model, providerHost }) {
+  const diagnostic = error?.diagnostics || {};
+  console.warn(JSON.stringify({
+    event: "vups_provider_retry",
+    timestamp: new Date().toISOString(),
+    requestId: requestId || null,
+    providerHost: providerHost || diagnostic.providerHost || "unresolved",
+    model: model || diagnostic.model || null,
+    retry: attempt,
+    nextAttempt: attempt + 1,
+    delayMs: delay,
+    httpStatus: typeof error?.status === "number" ? error.status : null,
+    providerCode: diagnostic.providerCode || null,
+    providerType: diagnostic.providerType || null,
+    providerStatus: diagnostic.providerStatus || null,
+    providerErrorCode: diagnostic.providerErrorCode || null,
+    providerDetail: diagnostic.providerDetail || null,
+    remedyHint: diagnostic.remedyHint || null,
+    category: error?.category || diagnostic.category || "unknown",
+    classification: error?.classification || diagnostic.classification || "unknown",
+    retryable: error?.retryable ?? diagnostic.retryable ?? null,
+    retryAfter: Number.isFinite(error?.retryAfter) ? error.retryAfter : null
+  }));
+}
+
+function logVupsOutcome({
+  outcome,
+  requestId,
+  model,
+  providerHost,
+  attempts,
+  totalDurationMs,
+  error = null,
+  finalCode = null
+}) {
+  const diagnostic = error?.diagnostics || {};
+  console.warn(JSON.stringify({
+    event: "vups_provider_outcome",
+    timestamp: new Date().toISOString(),
+    outcome,
+    requestId: requestId || null,
+    providerHost: providerHost || diagnostic.providerHost || "unresolved",
+    model: model || diagnostic.model || null,
+    attempts: Number.isInteger(attempts) ? attempts : null,
+    totalDurationMs: Number.isFinite(totalDurationMs) ? totalDurationMs : null,
+    httpStatus: typeof error?.status === "number" ? error.status : null,
+    providerCode: diagnostic.providerCode || null,
+    providerType: diagnostic.providerType || null,
+    providerStatus: diagnostic.providerStatus || null,
+    providerErrorCode: diagnostic.providerErrorCode || null,
+    providerDetail: diagnostic.providerDetail || null,
+    remedyHint: diagnostic.remedyHint || null,
+    category: error?.category || diagnostic.category || null,
+    classification: error?.classification || diagnostic.classification || null,
+    retryable: error?.retryable ?? diagnostic.retryable ?? null,
+    retryAfter: Number.isFinite(error?.retryAfter) ? error.retryAfter : null,
+    finalCode
+  }));
 }
 
 function vupsFailure(error, { hasImages = false } = {}) {
   const code = error?.code || "vups_upstream_error";
   if (code === "vups_not_configured") return { status: 503, message: error.message, code };
+  if (code === "free_quota_exhausted" || code === "quota_exhausted" || isQuotaExhaustedError(error)) {
+    return {
+      status: 429,
+      message: "Vups v3 Galax's upstream quota is exhausted or its credits are depleted. Wait for the provider's reset, or configure a funded model.",
+      code: "vups_quota_exhausted"
+    };
+  }
+  if (error?.category === "concurrency_limit") {
+    return {
+      status: 429,
+      message: "Vups v3 Galax's upstream provider has reached its concurrency limit. Please wait a moment and try again.",
+      code: "vups_concurrency_limited"
+    };
+  }
+  if (error?.category === "rate_limit_tokens") {
+    return {
+      status: 429,
+      message: "Vups v3 Galax's upstream provider has reached its token-per-minute limit. Please wait a moment and try again.",
+      code: "vups_token_rate_limited"
+    };
+  }
   if (code === "rate_limited") {
     return {
       status: 429,
-      message: "Vups v3 Galax is receiving too many requests right now. Please wait a moment and try again.",
+      message: "Vups v3 Galax is rate-limited by its upstream provider right now. Please wait a moment and try again.",
       code: "vups_rate_limited"
     };
   }
@@ -564,7 +676,7 @@ function vupsFailure(error, { hasImages = false } = {}) {
   }
   const detail = typeof error?.message === "string" ? error.message : "";
   const visionUnsupported = hasImages && /no endpoints found that support image input|does not support image input|image input (?:is )?not supported|does not accept image/i.test(detail);
-  if (hasImages && (["bad_request", "unprocessable", "invalid_model"].includes(code) || (visionUnsupported && ["not_found", "model_unavailable"].includes(code)))) {
+  if (hasImages && (visionUnsupported || ["bad_request", "unprocessable"].includes(code))) {
     return {
       status: 400,
       message: "Vups v3 Galax could not read that image. The configured underlying model may not support image input. Try a different image or continue with text.",
@@ -578,14 +690,28 @@ function vupsFailure(error, { hasImages = false } = {}) {
       code: "vups_unavailable"
     };
   }
-  if (["not_found", "model_unavailable", "empty_response", "empty_stream"].includes(code)) {
+  if (["invalid_model", "not_found", "model_unavailable", "empty_response", "empty_stream"].includes(code)) {
     return {
       status: 503,
-      message: "Vups v3 Galax's configured underlying model is unavailable right now. Ask the administrator to verify VUPS_UNDERLYING_MODEL.",
+      message: hasImages
+        ? "Vups v3 Galax's configured vision model is unavailable right now. Ask the administrator to verify VUPS_VISION_MODEL."
+        : "Vups v3 Galax's configured underlying model is unavailable right now. Ask the administrator to verify VUPS_UNDERLYING_MODEL.",
       code: "vups_model_unavailable"
     };
   }
-  if (["network_error", "dns_error", "connection_refused", "provider_unavailable"].includes(code)) {
+  if (code === "provider_unavailable") {
+    const upstreamStatus = typeof error?.status === "number" && error.status >= 500 && error.status <= 599
+      ? error.status
+      : 503;
+    return {
+      status: upstreamStatus,
+      message: upstreamStatus === 503
+        ? "Vups v3 Galax's upstream provider is temporarily overloaded. Please try again shortly."
+        : "Vups v3 Galax's upstream provider failed temporarily. Please try again shortly.",
+      code: "vups_upstream_unavailable"
+    };
+  }
+  if (["network_error", "dns_error", "connection_refused"].includes(code)) {
     return {
       status: 502,
       message: "Vups v3 Galax could not reach its configured server. Please try again later.",
@@ -607,6 +733,7 @@ function vupsFailure(error, { hasImages = false } = {}) {
 }
 
 router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res, next) => {
+  const requestId = req.requestId || null;
   try {
     const body = req.body || {};
     const validated = validateMessages(body.messages);
@@ -649,6 +776,7 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
         code: "vups_vision_unsupported"
       });
     }
+    const providerHost = providerHostFromUrl(provider.baseUrl);
 
     await connectToDatabase();
     if (req.user?.aiEnabled === false) {
@@ -674,20 +802,59 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
 
     if (!stream) {
       let result;
-      try {
-        result = await chatCompletion({
-          baseUrl: provider.baseUrl,
-          apiKey: provider.apiKey,
-          providerType: provider.providerType,
+      let attempts = 0;
+      const startedAt = Date.now();
+      const retryOptions = {
+        ...vupsRetryOptions(),
+        onRetry: event => logVupsRetry({
+          ...event,
+          requestId,
           model: provider.model,
-          messages: upstreamMessages,
-          temperature,
-          reasoning: provider.reasoning
-        });
+          providerHost
+        })
+      };
+      try {
+        result = await withProviderRetry(
+          (attempt) => {
+            attempts = attempt + 1;
+            return chatCompletion({
+              baseUrl: provider.baseUrl,
+              apiKey: provider.apiKey,
+              providerType: provider.providerType,
+              model: provider.model,
+              messages: upstreamMessages,
+              temperature,
+              reasoning: provider.reasoning,
+              requestId,
+              attempt: attempt + 1
+            });
+          },
+          retryOptions
+        );
       } catch (error) {
         if (!(error instanceof ProviderError)) throw error;
         const failure = vupsFailure(error, { hasImages });
-        return res.status(failure.status).json({ message: failure.message, code: failure.code });
+        logVupsOutcome({
+          outcome: "failed",
+          requestId,
+          model: provider.model,
+          providerHost,
+          attempts: attempts || 1,
+          totalDurationMs: Date.now() - startedAt,
+          error,
+          finalCode: failure.code
+        });
+        return sendProviderFailure(res, failure, error, requestId);
+      }
+      if (attempts > 1) {
+        logVupsOutcome({
+          outcome: "recovered",
+          requestId,
+          model: provider.model,
+          providerHost,
+          attempts,
+          totalDurationMs: Date.now() - startedAt
+        });
       }
       const conversation = await persistConversation(req.userId, conversationId, validated.messages, result.content);
       return res.json({
@@ -710,26 +877,66 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
     });
 
     let upstream;
+    let streamAttempts = 0;
+    const streamStartedAt = Date.now();
+    const streamRetryOptions = {
+      ...vupsRetryOptions(),
+      signal: controller.signal,
+      onRetry: event => logVupsRetry({
+        ...event,
+        requestId,
+        model: provider.model,
+        providerHost
+      })
+    };
     try {
-      upstream = await startChatCompletionStream(
-        {
-          baseUrl: provider.baseUrl,
-          apiKey: provider.apiKey,
-          providerType: provider.providerType,
-          model: provider.model,
-          messages: upstreamMessages,
-          temperature,
-          reasoning: provider.reasoning
+      upstream = await withProviderRetry(
+        (attempt) => {
+          streamAttempts = attempt + 1;
+          return startChatCompletionStream(
+            {
+              baseUrl: provider.baseUrl,
+              apiKey: provider.apiKey,
+              providerType: provider.providerType,
+              model: provider.model,
+              messages: upstreamMessages,
+              temperature,
+              reasoning: provider.reasoning,
+              requestId,
+              attempt: attempt + 1
+            },
+            controller.signal
+          );
         },
-        controller.signal
+        streamRetryOptions
       );
     } catch (error) {
       if (controller.signal.aborted) return;
       if (error instanceof ProviderError) {
         const failure = vupsFailure(error, { hasImages });
-        return res.status(failure.status).json({ message: failure.message, code: failure.code });
+        logVupsOutcome({
+          outcome: "failed",
+          requestId,
+          model: provider.model,
+          providerHost,
+          attempts: streamAttempts || 1,
+          totalDurationMs: Date.now() - streamStartedAt,
+          error,
+          finalCode: failure.code
+        });
+        return sendProviderFailure(res, failure, error, requestId);
       }
       return next(error);
+    }
+    if (streamAttempts > 1) {
+      logVupsOutcome({
+        outcome: "recovered",
+        requestId,
+        model: provider.model,
+        providerHost,
+        attempts: streamAttempts,
+        totalDurationMs: Date.now() - streamStartedAt
+      });
     }
 
     res.status(200);
@@ -852,12 +1059,34 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
 
     if (failure) {
       const safe = vupsFailure(failure, { hasImages });
-      if (!controller.signal.aborted) sendEvent(res, { type: "error", message: safe.message, code: safe.code });
+      if (!controller.signal.aborted) {
+        logVupsOutcome({
+          outcome: "failed",
+          requestId,
+          model: provider.model,
+          providerHost,
+          attempts: streamAttempts || 1,
+          totalDurationMs: Date.now() - streamStartedAt,
+          error: failure,
+          finalCode: safe.code
+        });
+        sendEvent(res, {
+          type: "error",
+          message: safe.message,
+          code: safe.code,
+          ...(requestId ? { requestId } : {})
+        });
+      }
     }
     if (!res.writableEnded) res.end();
   } catch (error) {
     if (res.headersSent) {
-      sendEvent(res, { type: "error", message: "Something went wrong while streaming the Vups v3 Galax response.", code: "vups_stream_error" });
+      sendEvent(res, {
+        type: "error",
+        message: "Something went wrong while streaming the Vups v3 Galax response.",
+        code: "vups_stream_error",
+        ...(requestId ? { requestId } : {})
+      });
       if (!res.writableEnded) res.end();
       return;
     }
@@ -954,7 +1183,7 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
             continue;
           }
           const failure = providerFailure(provider, error);
-          return res.status(failure.status).json({ message: failure.message, code: failure.code });
+          return sendProviderFailure(res, failure, error);
         }
       }
       const conversation = await persistConversation(req.userId, conversationId, validated.messages, result.content);
@@ -997,7 +1226,7 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
             continue;
           }
           const failure = providerFailure(provider, error);
-          return res.status(failure.status).json({ message: failure.message, code: failure.code });
+          return sendProviderFailure(res, failure, error);
         }
         return next(error);
       }
