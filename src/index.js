@@ -15,7 +15,7 @@ import imageRoutes from "./routes/images.js";
 import adminRoutes from "./routes/admin.js";
 import { requireJsonBody, verifyOrigin } from "./middleware.js";
 import { chatJsonBodyLimit } from "./chatImages.js";
-import { vupsVisionConfiguration } from "./vupsGalax.js";
+import { vupsExecutionConfiguration, vupsTextConfiguration, vupsVisionConfiguration } from "./vupsGalax.js";
 
 const app = express();
 const port = Number(process.env.PORT || 4000);
@@ -126,6 +126,8 @@ app.get("/api/health", async (_req, res) => {
     await connectToDatabase();
     await mongoose.connection.db.admin().ping();
     const vision = vupsVisionConfiguration();
+    const text = vupsTextConfiguration();
+    const execution = vupsExecutionConfiguration();
     return res.json({
       success: true,
       service: "VupsRouter",
@@ -137,7 +139,13 @@ app.get("/api/health", async (_req, res) => {
         vupsDiagnostics: true,
         vupsImageGeneration: vision.enabled,
         vupsVisionModel: vision.model,
-        vupsVisionModelSource: vision.source
+        vupsVisionModelSource: vision.source,
+        vupsTextModel: text.model,
+        vupsTextModelSource: text.source,
+        vupsMaxOutputTokens: execution.maxOutputTokens,
+        vupsStreamStartTimeoutMs: execution.streamStartTimeoutMs,
+        vupsStreamIdleTimeoutMs: execution.streamIdleTimeoutMs,
+        vupsSseHeartbeatMs: execution.heartbeatMs
       }
     });
   } catch (error) {

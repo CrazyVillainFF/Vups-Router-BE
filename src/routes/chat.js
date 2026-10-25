@@ -7,6 +7,7 @@ import { decryptSecret } from "../encryption.js";
 import {
   ProviderError,
   assertAllowedProviderUrl,
+  buildProviderFailureDiagnostic,
   chatCompletion,
   extractStreamText,
   isQuotaExhaustedError,
@@ -24,6 +25,7 @@ import {
   VUPS_MODEL_ID,
   buildVupsSystemPrompt,
   normalizeVupsMode,
+  vupsExecutionConfiguration,
   vupsProviderForChat
 } from "../vupsGalax.js";
 
@@ -396,6 +398,62 @@ function sendEvent(res, payload) {
   res.write(`data: ${JSON.stringify(payload)}\n\n`);
 }
 
+function sendSseHeartbeat(res) {
+  if (res.writableEnded) return;
+  res.write(": keepalive\n\n");
+}
+
+function readStreamChunk(reader, timeoutMs, onTimeout) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      onTimeout?.();
+      reject(new ProviderError("Vups v3 Galax stopped sending data before the answer was complete.", null, "timeout"));
+    }, timeoutMs);
+    timer.unref?.();
+    reader.read().then(
+      result => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(result);
+      },
+      error => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
+}
+
+function vupsSafeDiagnostic(error, extra = {}) {
+  const diagnostic = error?.diagnostics || {};
+  const headers = diagnostic.responseHeaders || {};
+  return {
+    category: error?.category || diagnostic.category || "unknown",
+    classification: error?.classification || diagnostic.classification || "unknown",
+    retryable: error?.retryable ?? diagnostic.retryable ?? null,
+    providerStatus: diagnostic.providerStatus || null,
+    providerErrorCode: diagnostic.providerErrorCode || null,
+    limitSource: diagnostic.limitSource || null,
+    upstreamRequestId: headers["x-request-id"] || headers["request-id"] || null,
+    ...extra
+  };
+}
+
+function vupsFailureBody(failure, error, requestId, extra) {
+  return {
+    message: failure.message,
+    code: failure.code,
+    ...(requestId ? { requestId } : {}),
+    diagnostic: vupsSafeDiagnostic(error, extra)
+  };
+}
+
 const PROVIDER_STATUS_BY_CODE = {
   bad_request: 400,
   not_found: 404,
@@ -435,14 +493,15 @@ function providerFailureStatus(error) {
   return 502;
 }
 
-function sendProviderFailure(res, failure, error, requestId = null) {
+function sendProviderFailure(res, failure, error, requestId = null, diagnostic = null) {
   if (Number.isInteger(error?.retryAfter) && error.retryAfter >= 0) {
     res.setHeader("Retry-After", String(error.retryAfter));
   }
   return res.status(failure.status).json({
     message: failure.message,
     code: failure.code,
-    ...(requestId ? { requestId } : {})
+    ...(requestId ? { requestId } : {}),
+    ...(diagnostic ? { diagnostic } : {})
   });
 }
 
@@ -561,6 +620,31 @@ function vupsRetryOptions() {
   };
 }
 
+function vupsStreamFailure(payload, { url, requestId, model, attempt }) {
+  const diagnostic = buildProviderFailureDiagnostic({
+    url,
+    status: null,
+    payload,
+    context: { requestId, model, attempt }
+  });
+  let code = "stream_interrupted";
+  if (diagnostic.category === "quota_exhausted") code = "quota_exhausted";
+  else if (["rate_limit_requests", "rate_limit_tokens", "concurrency_limit", "ambiguous_rate_limit"].includes(diagnostic.category)) code = "rate_limited";
+  else if (diagnostic.category === "timeout") code = "timeout";
+  else if (["upstream_unavailable", "overloaded"].includes(diagnostic.category)) code = "provider_unavailable";
+  else if (diagnostic.category === "invalid_model") code = "invalid_model";
+  else if (diagnostic.category === "invalid_credentials") code = "invalid_api_key";
+  else if (diagnostic.category === "forbidden") code = "forbidden";
+  else if (diagnostic.category === "invalid_request") code = "bad_request";
+
+  const error = new ProviderError("The provider reported an error during streaming.", null, code);
+  error.category = diagnostic.category;
+  error.classification = diagnostic.classification;
+  error.retryable = false;
+  error.diagnostics = diagnostic;
+  return error;
+}
+
 function providerHostFromUrl(value) {
   try {
     return new URL(String(value)).hostname || "unresolved";
@@ -665,6 +749,27 @@ function vupsFailure(error, { hasImages = false } = {}) {
       status: 504,
       message: "Vups v3 Galax took too long to answer. Please try again.",
       code: "vups_timeout"
+    };
+  }
+  if (code === "stream_interrupted" || code === "stream_error") {
+    return {
+      status: 502,
+      message: "Vups v3 Galax's response stream ended before the answer was complete. Any generated text has been kept — use Continue generating to finish it, or try again.",
+      code: "vups_stream_interrupted"
+    };
+  }
+  if (code === "cancelled") {
+    return {
+      status: 499,
+      message: "The Vups v3 Galax request was cancelled.",
+      code: "vups_request_cancelled"
+    };
+  }
+  if (code === "persist_failed") {
+    return {
+      status: 500,
+      message: "Vups v3 Galax finished the answer, but it could not be saved to your history. Copy anything you still need, then try again.",
+      code: "vups_persist_failed"
     };
   }
   if (code === "output_limit") {
@@ -799,11 +904,16 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
 
     const conversationId = typeof body.conversationId === "string" ? body.conversationId : null;
     const upstreamMessages = [{ role: "system", content: buildVupsSystemPrompt(mode) }, ...validated.messages];
+    const execution = vupsExecutionConfiguration();
 
     if (!stream) {
       let result;
       let attempts = 0;
       const startedAt = Date.now();
+      const requestController = new AbortController();
+      res.on("close", () => {
+        if (!res.writableEnded) requestController.abort();
+      });
       const retryOptions = {
         ...vupsRetryOptions(),
         onRetry: event => logVupsRetry({
@@ -824,14 +934,16 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
               model: provider.model,
               messages: upstreamMessages,
               temperature,
+              maxTokens: execution.maxOutputTokens,
               reasoning: provider.reasoning,
               requestId,
               attempt: attempt + 1
-            });
+            }, AbortSignal.any([requestController.signal, AbortSignal.timeout(execution.requestTimeoutMs)]));
           },
           retryOptions
         );
       } catch (error) {
+        if (requestController.signal.aborted) return;
         if (!(error instanceof ProviderError)) throw error;
         const failure = vupsFailure(error, { hasImages });
         logVupsOutcome({
@@ -844,7 +956,7 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
           error,
           finalCode: failure.code
         });
-        return sendProviderFailure(res, failure, error, requestId);
+        return sendProviderFailure(res, failure, error, requestId, vupsSafeDiagnostic(error));
       }
       if (attempts > 1) {
         logVupsOutcome({
@@ -872,8 +984,12 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
     const prospectiveId = existingConversation ? String(existingConversation._id) : String(new mongoose.Types.ObjectId());
 
     const controller = new AbortController();
+    let clientAborted = false;
     res.on("close", () => {
-      if (!res.writableEnded) controller.abort();
+      if (!res.writableEnded) {
+        clientAborted = true;
+        controller.abort();
+      }
     });
 
     let upstream;
@@ -901,9 +1017,11 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
               model: provider.model,
               messages: upstreamMessages,
               temperature,
+              maxTokens: execution.maxOutputTokens,
               reasoning: provider.reasoning,
               requestId,
-              attempt: attempt + 1
+              attempt: attempt + 1,
+              responseTimeoutMs: execution.streamStartTimeoutMs
             },
             controller.signal
           );
@@ -911,7 +1029,7 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
         streamRetryOptions
       );
     } catch (error) {
-      if (controller.signal.aborted) return;
+      if (clientAborted) return;
       if (error instanceof ProviderError) {
         const failure = vupsFailure(error, { hasImages });
         logVupsOutcome({
@@ -924,7 +1042,7 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
           error,
           finalCode: failure.code
         });
-        return sendProviderFailure(res, failure, error, requestId);
+        return sendProviderFailure(res, failure, error, requestId, vupsSafeDiagnostic(error, { phase: "start" }));
       }
       return next(error);
     }
@@ -946,87 +1064,146 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
     res.setHeader("X-Accel-Buffering", "no");
     if (typeof res.flushHeaders === "function") res.flushHeaders();
     sendEvent(res, { type: "meta", conversationId: prospectiveId, model: VUPS_MODEL_ID });
+    const heartbeatTimer = setInterval(() => sendSseHeartbeat(res), execution.heartbeatMs);
+    heartbeatTimer.unref?.();
+    res.on("close", () => clearInterval(heartbeatTimer));
 
     const reader = upstream.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
     let fullText = "";
     let failure = null;
+    let failureReason = null;
     let finishReason = null;
     let usage = null;
+    let sawTerminal = false;
+    let idleTimedOut = false;
+
+    const handleLine = line => {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data:")) return;
+      const raw = trimmed.slice(5).trim();
+      if (!raw) return;
+      if (raw === "[DONE]") {
+        sawTerminal = true;
+        return;
+      }
+      let parsed;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        return;
+      }
+      const streamContext = {
+        url: upstream.url || provider.baseUrl,
+        requestId,
+        model: provider.model,
+        attempt: streamAttempts || 1
+      };
+      if (parsed?.error) {
+        failure = vupsStreamFailure(parsed, streamContext);
+        failureReason = "upstream_error";
+        return;
+      }
+      if (parsed?.type === "error") {
+        failure = vupsStreamFailure(parsed, streamContext);
+        failureReason = "upstream_error";
+        return;
+      }
+      if (parsed?.type === "response.failed") {
+        const payload = parsed.response?.error ? { error: parsed.response.error } : parsed;
+        failure = vupsStreamFailure(payload, streamContext);
+        failureReason = "upstream_error";
+        return;
+      }
+      const choice = parsed?.choices?.[0];
+      if (choice?.error) {
+        failure = vupsStreamFailure({ error: choice.error }, streamContext);
+        failureReason = "upstream_error";
+        return;
+      }
+      if (choice?.finish_reason === "error") {
+        failure = vupsStreamFailure(parsed, streamContext);
+        failureReason = "upstream_error";
+        return;
+      }
+      if (typeof choice?.finish_reason === "string" && choice.finish_reason) {
+        finishReason = choice.finish_reason;
+        sawTerminal = true;
+      }
+      if (parsed?.usage && typeof parsed.usage === "object") {
+        usage = parsed.usage;
+      }
+      if (parsed?.type === "message_start" && parsed.message?.usage) {
+        usage = parsed.message.usage;
+      }
+      if (parsed?.type === "message_delta") {
+        if (parsed.usage && typeof parsed.usage === "object") usage = { ...(usage || {}), ...parsed.usage };
+        const stopReason = parsed.delta?.stop_reason;
+        if (stopReason === "max_tokens") finishReason = "length";
+        else if (stopReason === "end_turn" || stopReason === "stop_sequence") finishReason = "stop";
+        else if (typeof stopReason === "string") finishReason = stopReason;
+        if (stopReason) sawTerminal = true;
+      }
+      if (parsed?.type === "message_stop") sawTerminal = true;
+      if ((parsed?.type === "response.completed" || parsed?.type === "response.incomplete") && parsed.response) {
+        if (parsed.response.usage && typeof parsed.response.usage === "object") usage = parsed.response.usage;
+        const incomplete = parsed.response.incomplete_details?.reason;
+        if (typeof incomplete === "string" && incomplete) {
+          finishReason = incomplete === "max_output_tokens" ? "length" : incomplete;
+        } else if (parsed.response.status === "completed") {
+          finishReason = finishReason ?? "stop";
+        }
+        sawTerminal = true;
+      }
+      const text = extractStreamText(parsed);
+      if (text) {
+        fullText += text;
+        if (fullText.length > MAX_UPSTREAM_TEXT_CHARS) {
+          failure = new ProviderError("The provider returned more text than VupsRouter can safely process.", null, "response_too_large");
+          failureReason = "response_too_large";
+          return;
+        }
+        sendEvent(res, { type: "delta", content: text });
+      }
+    };
 
     try {
-      while (!failure) {
-        const { done, value } = await reader.read();
+      while (!failure && !clientAborted) {
+        const { done, value } = await readStreamChunk(reader, execution.streamIdleTimeoutMs, () => {
+          idleTimedOut = true;
+          controller.abort();
+        });
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split("\n");
         buffer = lines.pop() ?? "";
         for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed.startsWith("data:")) continue;
-          const raw = trimmed.slice(5).trim();
-          if (!raw || raw === "[DONE]") continue;
-          let parsed;
-          try {
-            parsed = JSON.parse(raw);
-          } catch {
-            continue;
-          }
-          if (parsed?.error) {
-            failure = new ProviderError("The provider reported an error during streaming.", null, "stream_error");
-            break;
-          }
-          if (parsed?.type === "response.failed") {
-            failure = new ProviderError("The provider reported an error during streaming.", null, "stream_error");
-            break;
-          }
-          const choice = parsed?.choices?.[0];
-          if (choice?.error) {
-            failure = new ProviderError("The provider reported an error during streaming.", null, "stream_error");
-            break;
-          }
-          if (typeof choice?.finish_reason === "string" && choice.finish_reason) {
-            finishReason = choice.finish_reason;
-          }
-          if (parsed?.usage && typeof parsed.usage === "object") {
-            usage = parsed.usage;
-          }
-          if (parsed?.type === "message_start" && parsed.message?.usage) {
-            usage = parsed.message.usage;
-          }
-          if (parsed?.type === "message_delta") {
-            if (parsed.usage && typeof parsed.usage === "object") usage = { ...(usage || {}), ...parsed.usage };
-            const stopReason = parsed.delta?.stop_reason;
-            if (stopReason === "max_tokens") finishReason = "length";
-            else if (stopReason === "end_turn" || stopReason === "stop_sequence") finishReason = "stop";
-            else if (typeof stopReason === "string") finishReason = stopReason;
-          }
-          if ((parsed?.type === "response.completed" || parsed?.type === "response.incomplete") && parsed.response) {
-            if (parsed.response.usage && typeof parsed.response.usage === "object") usage = parsed.response.usage;
-            const incomplete = parsed.response.incomplete_details?.reason;
-            if (typeof incomplete === "string" && incomplete) {
-              finishReason = incomplete === "max_output_tokens" ? "length" : incomplete;
-            } else if (parsed.response.status === "completed") {
-              finishReason = finishReason ?? "stop";
-            }
-          }
-          const text = extractStreamText(parsed);
-          if (text) {
-            fullText += text;
-            if (fullText.length > MAX_UPSTREAM_TEXT_CHARS) {
-              failure = new ProviderError("The provider returned more text than VupsRouter can safely process.", null, "response_too_large");
-              break;
-            }
-            sendEvent(res, { type: "delta", content: text });
-          }
+          handleLine(line);
+          if (failure) break;
+        }
+      }
+      if (!failure && !clientAborted) {
+        buffer += decoder.decode();
+        for (const line of buffer.split("\n")) {
+          handleLine(line);
+          if (failure) break;
         }
       }
     } catch (error) {
-      if (!controller.signal.aborted) {
-        failure = error instanceof ProviderError ? error : new ProviderError("The provider stream was interrupted.", null, "stream_error");
+      if (idleTimedOut) {
+        failure = error instanceof ProviderError
+          ? error
+          : new ProviderError("Vups v3 Galax stopped sending data before the answer was complete.", null, "timeout");
+        failureReason = "idle_timeout";
+      } else if (!clientAborted) {
+        failure = error instanceof ProviderError
+          ? error
+          : new ProviderError("The provider stream was interrupted.", null, "stream_interrupted");
+        failureReason = failureReason || "read_error";
       }
     } finally {
+      clearInterval(heartbeatTimer);
       try {
         await reader.cancel();
       } catch {
@@ -1034,16 +1211,22 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
       }
     }
 
-    if (!failure && fullText.length === 0 && !controller.signal.aborted) {
-      failure = finishReason === "length"
-        ? new ProviderError("Vups v3 Galax reached its output limit before writing an answer. Try a shorter prompt.", null, "output_limit")
-        : new ProviderError("The provider returned an empty response.", null, "empty_response");
+    if (!failure && !clientAborted) {
+      if (fullText.length === 0) {
+        failure = finishReason === "length"
+          ? new ProviderError("Vups v3 Galax reached its output limit before writing an answer. Try a shorter prompt.", null, "output_limit")
+          : new ProviderError("The provider returned an empty response.", null, "empty_response");
+        failureReason = "empty_response";
+      } else if (!sawTerminal) {
+        failure = new ProviderError("The provider stream ended before it signalled completion.", null, "stream_interrupted");
+        failureReason = "eof_without_terminal";
+      }
     }
 
     if (fullText.length > 0) {
       try {
         const conversation = await persistConversation(req.userId, prospectiveId, validated.messages, fullText);
-        if (!failure && !controller.signal.aborted) {
+        if (!failure && !clientAborted) {
           sendEvent(res, {
             type: "done",
             conversationId: String(conversation._id),
@@ -1053,13 +1236,16 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
           });
         }
       } catch {
-        if (!failure) failure = new ProviderError("The response was generated but could not be saved to your history.", null, "persist_failed");
+        if (!failure) {
+          failure = new ProviderError("The response was generated but could not be saved to your history.", null, "persist_failed");
+          failureReason = "persist_failed";
+        }
       }
     }
 
     if (failure) {
       const safe = vupsFailure(failure, { hasImages });
-      if (!controller.signal.aborted) {
+      if (!clientAborted) {
         logVupsOutcome({
           outcome: "failed",
           requestId,
@@ -1074,7 +1260,15 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
           type: "error",
           message: safe.message,
           code: safe.code,
-          ...(requestId ? { requestId } : {})
+          ...(requestId ? { requestId } : {}),
+          partial: fullText.length > 0,
+          diagnostic: vupsSafeDiagnostic(failure, {
+            phase: "stream",
+            reason: failureReason || (idleTimedOut ? "idle_timeout" : "stream_interrupted"),
+            contentChars: fullText.length,
+            durationMs: Date.now() - streamStartedAt,
+            sawTerminal
+          })
         });
       }
     }

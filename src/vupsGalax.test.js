@@ -3,7 +3,15 @@ import { test } from "node:test";
 
 process.env.NODE_ENV = "test";
 
-const { vupsProviderForChat, vupsVisionConfiguration, DEFAULT_VUPS_VISION_MODEL } = await import("./vupsGalax.js");
+const {
+  vupsExecutionConfiguration,
+  vupsMaxOutputTokens,
+  vupsProviderForChat,
+  vupsTextConfiguration,
+  vupsVisionConfiguration,
+  DEFAULT_VUPS_MAX_OUTPUT_TOKENS,
+  DEFAULT_VUPS_VISION_MODEL
+} = await import("./vupsGalax.js");
 
 const ENV_KEYS = [
   "VUPS_BASE_URL",
@@ -11,6 +19,11 @@ const ENV_KEYS = [
   "VUPS_UNDERLYING_MODEL",
   "VUPS_VISION",
   "VUPS_VISION_MODEL",
+  "VUPS_MAX_OUTPUT_TOKENS",
+  "VUPS_REQUEST_TIMEOUT_MS",
+  "VUPS_STREAM_START_TIMEOUT_MS",
+  "VUPS_STREAM_IDLE_TIMEOUT_MS",
+  "VUPS_SSE_HEARTBEAT_MS",
   "OPENROUTER_API_KEY",
   "OPENROUTER_BASE_URL",
   "OPENROUTER_DEFAULT_MODEL",
@@ -274,6 +287,60 @@ test("an invalid dedicated VUPS endpoint never falls back to OpenRouter", () => 
         () => vupsProviderForChat(),
         error => error.status === 503 && /VUPS_BASE_URL/.test(error.message)
       );
+    }
+  );
+});
+
+test("output and timeout settings are bounded and read without a reload", () => {
+  withEnv({ VUPS_MAX_OUTPUT_TOKENS: undefined }, () => {
+    assert.equal(vupsMaxOutputTokens(), DEFAULT_VUPS_MAX_OUTPUT_TOKENS);
+  });
+  withEnv({ VUPS_MAX_OUTPUT_TOKENS: "999999" }, () => {
+    assert.equal(vupsMaxOutputTokens(), 32768);
+  });
+  withEnv(
+    {
+      VUPS_MAX_OUTPUT_TOKENS: "12",
+      VUPS_REQUEST_TIMEOUT_MS: "1",
+      VUPS_STREAM_START_TIMEOUT_MS: "9999999",
+      VUPS_STREAM_IDLE_TIMEOUT_MS: "abc",
+      VUPS_SSE_HEARTBEAT_MS: "50"
+    },
+    () => {
+      assert.deepEqual(vupsExecutionConfiguration(), {
+        maxOutputTokens: 256,
+        requestTimeoutMs: 5000,
+        streamStartTimeoutMs: 180000,
+        streamIdleTimeoutMs: 240000,
+        heartbeatMs: 1000
+      });
+    }
+  );
+});
+
+test("text model configuration reports the effective source without credentials", () => {
+  withEnv(
+    {
+      VUPS_UNDERLYING_MODEL: "dedicated/model",
+      OPENROUTER_DEFAULT_MODEL: "shared/default"
+    },
+    () => {
+      assert.deepEqual(vupsTextConfiguration(), {
+        model: "dedicated/model",
+        source: "VUPS_UNDERLYING_MODEL"
+      });
+    }
+  );
+  withEnv(
+    {
+      VUPS_UNDERLYING_MODEL: undefined,
+      OPENROUTER_DEFAULT_MODEL: "shared/default"
+    },
+    () => {
+      assert.deepEqual(vupsTextConfiguration(), {
+        model: "shared/default",
+        source: "OPENROUTER_DEFAULT_MODEL"
+      });
     }
   );
 });

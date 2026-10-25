@@ -149,6 +149,12 @@ test("GET /api/health reports MongoDB, release metadata, features, and a request
   assert.equal(response.body.features.vupsRetry, true);
   assert.equal(response.body.features.vupsDiagnostics, true);
   assert.equal(typeof response.body.features.vupsImageGeneration, "boolean");
+  assert.equal(response.body.features.vupsTextModel, "fake-model-mini");
+  assert.equal(response.body.features.vupsTextModelSource, "VUPS_UNDERLYING_MODEL");
+  assert.equal(response.body.features.vupsMaxOutputTokens, 24576);
+  assert.equal(response.body.features.vupsStreamStartTimeoutMs, 60000);
+  assert.equal(response.body.features.vupsStreamIdleTimeoutMs, 240000);
+  assert.equal(response.body.features.vupsSseHeartbeatMs, 15000);
   assert.match(response.headers.get("x-request-id"), /^[0-9a-f-]{36}$/);
 });
 
@@ -897,10 +903,142 @@ test("Vups reports a mid-stream failure without retrying or faking success", asy
           .filter(line => line.startsWith("data: "))
           .map(line => JSON.parse(line.slice(6)));
         assert.equal(events.some(event => event.type === "done"), false);
-        assert.equal(events.find(event => event.type === "error")?.code, "vups_upstream_error");
+        const errorEvent = events.find(event => event.type === "error");
+        assert.equal(errorEvent?.code, "vups_stream_interrupted");
+        assert.equal(errorEvent?.partial, true);
+        assert.equal(typeof errorEvent?.requestId, "string");
+        assert.equal(errorEvent?.diagnostic?.reason, "upstream_error");
+        assert.equal(errorEvent?.diagnostic?.contentChars, "Hello from fake-model-mini!".length);
         assert.equal(fakeProvider.state.chatRequests.length, 1);
       }
     );
+  } finally {
+    fakeProvider.state.reset();
+  }
+});
+
+test("Vups preserves partial output when the upstream closes without a terminal event", async () => {
+  const { cookie } = await signupUser();
+  fakeProvider.state.reset();
+  fakeProvider.state.set({ streamWithoutTerminal: true });
+  try {
+    const response = await fetch(`${baseURL}/api/chat/vups-v3-galax`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Cookie: cookie },
+      body: JSON.stringify({ stream: true, messages: [{ role: "user", content: "Finish this" }] })
+    });
+    assert.equal(response.status, 200);
+    const text = await response.text();
+    const events = text
+      .split("\n")
+      .filter(line => line.startsWith("data: "))
+      .map(line => JSON.parse(line.slice(6)));
+    assert.equal(events.filter(event => event.type === "delta").map(event => event.content).join(""), "Hello from fake-model-mini!");
+    assert.equal(events.some(event => event.type === "done"), false);
+    const errorEvent = events.find(event => event.type === "error");
+    assert.equal(errorEvent.code, "vups_stream_interrupted");
+    assert.equal(errorEvent.partial, true);
+    assert.equal(errorEvent.requestId, response.headers.get("x-request-id"));
+    assert.equal(errorEvent.diagnostic.reason, "eof_without_terminal");
+    assert.equal(errorEvent.diagnostic.sawTerminal, false);
+    assert.equal(errorEvent.diagnostic.contentChars, "Hello from fake-model-mini!".length);
+    assert.ok(!text.includes(FAKE_API_KEY));
+    assert.equal(fakeProvider.state.chatRequests.length, 1);
+  } finally {
+    fakeProvider.state.reset();
+  }
+});
+
+test("Vups classifies structured mid-stream upstream errors without leaking details to the client", async () => {
+  const { cookie } = await signupUser();
+  fakeProvider.state.reset();
+  fakeProvider.state.set({
+    failStreamMidway: true,
+    streamErrorPayload: {
+      error: {
+        code: 429,
+        status: "429",
+        message: "Provider returned error",
+        metadata: {
+          provider_name: "Fake upstream",
+          provider_error_code: "rate_limit_tokens",
+          limit_source: "tokens_per_minute",
+          raw: "Upstream rate limit; key sk-secret-value-123 was not sent."
+        }
+      }
+    }
+  });
+  try {
+    const response = await fetch(`${baseURL}/api/chat/vups-v3-galax`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Cookie: cookie },
+      body: JSON.stringify({ stream: true, messages: [{ role: "user", content: "Break with detail" }] })
+    });
+    const text = await response.text();
+    const events = text
+      .split("\n")
+      .filter(line => line.startsWith("data: "))
+      .map(line => JSON.parse(line.slice(6)));
+    const errorEvent = events.find(event => event.type === "error");
+    assert.equal(errorEvent.code, "vups_token_rate_limited");
+    assert.equal(errorEvent.partial, true);
+    assert.equal(errorEvent.diagnostic.reason, "upstream_error");
+    assert.equal(errorEvent.diagnostic.providerStatus, "429");
+    assert.equal(errorEvent.diagnostic.providerErrorCode, "rate_limit_tokens");
+    assert.equal(errorEvent.diagnostic.limitSource, "tokens_per_minute");
+    assert.ok(!text.includes("sk-secret-value-123"));
+  } finally {
+    fakeProvider.state.reset();
+  }
+});
+
+test("Vups sends a bounded output budget for streaming and non-streaming requests", async () => {
+  const { cookie } = await signupUser();
+  fakeProvider.state.reset();
+  try {
+    await withEnv({ VUPS_MAX_OUTPUT_TOKENS: "12345" }, async () => {
+      const nonStream = await api("/api/chat/vups-v3-galax", {
+        method: "POST",
+        cookie,
+        body: { stream: false, messages: [{ role: "user", content: "Budget" }] }
+      });
+      assert.equal(nonStream.status, 200);
+      assert.equal(fakeProvider.state.chatRequests.at(-1).body.max_tokens, 12345);
+
+      const stream = await fetch(`${baseURL}/api/chat/vups-v3-galax`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: cookie },
+        body: JSON.stringify({ stream: true, messages: [{ role: "user", content: "Budget stream" }] })
+      });
+      await stream.text();
+      assert.equal(fakeProvider.state.chatRequests.at(-1).body.max_tokens, 12345);
+    });
+  } finally {
+    fakeProvider.state.reset();
+  }
+});
+
+test("Vups keeps the SSE connection alive while the upstream is quiet", async () => {
+  const { cookie } = await signupUser();
+  fakeProvider.state.reset();
+  fakeProvider.state.set({ streamInitialDelayMs: 1300 });
+  try {
+    await withEnv({ VUPS_SSE_HEARTBEAT_MS: "1000" }, async () => {
+      const response = await fetch(`${baseURL}/api/chat/vups-v3-galax`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: cookie },
+        body: JSON.stringify({ stream: true, messages: [{ role: "user", content: "Quiet upstream" }] })
+      });
+      assert.equal(response.status, 200);
+      const text = await response.text();
+      assert.match(text, /^: keepalive$/m);
+      const events = text
+        .split("\n")
+        .filter(line => line.startsWith("data: "))
+        .map(line => JSON.parse(line.slice(6)));
+      assert.equal(events.filter(event => event.type === "delta").map(event => event.content).join(""), "Hello from fake-model-mini!");
+      assert.ok(events.some(event => event.type === "done"));
+    });
   } finally {
     fakeProvider.state.reset();
   }

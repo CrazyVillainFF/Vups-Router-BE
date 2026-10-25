@@ -1252,7 +1252,7 @@ export async function chatCompletion({ baseUrl, apiKey, model, messages, tempera
   };
 }
 
-export async function startChatCompletionStream({ baseUrl, apiKey, model, messages, temperature, maxTokens, providerType = "openai_compatible", reasoning, requestId = null, attempt = null }, signal) {
+export async function startChatCompletionStream({ baseUrl, apiKey, model, messages, temperature, maxTokens, providerType = "openai_compatible", reasoning, requestId = null, attempt = null, responseTimeoutMs = null }, signal) {
   const type = normalizeProviderType(providerType);
   const anthropic = usesAnthropicApi(baseUrl, model, type);
   const watsonx = !isOpenCodeZenBase(baseUrl) && type === "watsonx";
@@ -1265,15 +1265,34 @@ export async function startChatCompletionStream({ baseUrl, apiKey, model, messag
       ? buildWatsonxRequestBody({ model, messages, temperature, maxTokens, stream: true, projectId: requireWatsonxProjectId(baseUrl) })
       : buildChatRequestBody({ model, messages, temperature, maxTokens, stream: true, responses, reasoning });
 
+  let responseTimer = null;
+  let responseTimedOut = false;
+  let requestSignal = signal;
+  if (Number.isFinite(responseTimeoutMs) && responseTimeoutMs >= 1000) {
+    const timeoutController = new AbortController();
+    responseTimer = setTimeout(() => {
+      responseTimedOut = true;
+      timeoutController.abort();
+    }, responseTimeoutMs);
+    responseTimer.unref?.();
+    requestSignal = signal ? AbortSignal.any([signal, timeoutController.signal]) : timeoutController.signal;
+  }
+
   let response;
   try {
     response = await guardedProviderFetch(url, {
       method: "POST",
       headers: { ...(await authHeaders(apiKey, type, baseUrl)), Accept: "text/event-stream" },
       body: JSON.stringify(body),
-      signal: signal ?? AbortSignal.timeout(STREAM_TIMEOUT_MS)
+      signal: requestSignal ?? AbortSignal.timeout(STREAM_TIMEOUT_MS)
     });
   } catch (error) {
+    if (responseTimedOut) {
+      throw attachProviderDiagnostic(
+        new ProviderError("Timed out while waiting for the provider to start its stream.", null, "timeout"),
+        { url, context, classification: { category: "timeout", classification: "transient", retryable: true } }
+      );
+    }
     if (error?.name === "TimeoutError" || error?.name === "AbortError") {
       if (signal?.aborted) throw new ProviderError("Request cancelled.", null, "cancelled");
       throw attachProviderDiagnostic(
@@ -1283,6 +1302,8 @@ export async function startChatCompletionStream({ baseUrl, apiKey, model, messag
     }
     if (error instanceof ProviderError) throw error;
     throw networkError(error, url, context);
+  } finally {
+    if (responseTimer) clearTimeout(responseTimer);
   }
   if (!response.ok) {
     const failure = await readJsonSafely(response);

@@ -4,6 +4,12 @@ import { openRouterApiKey, openRouterBaseUrl, openRouterModel } from "./openrout
 export const VUPS_MODEL_ID = "vups-v3-galax";
 export const VUPS_MODEL_NAME = "Vups v3 Galax";
 export const DEFAULT_VUPS_VISION_MODEL = "nvidia/nemotron-3.5-super-vl:free";
+export const DEFAULT_VUPS_MAX_OUTPUT_TOKENS = 24576;
+export const VUPS_MAX_OUTPUT_TOKENS_LIMIT = 32768;
+export const DEFAULT_VUPS_REQUEST_TIMEOUT_MS = 300000;
+export const DEFAULT_VUPS_STREAM_START_TIMEOUT_MS = 60000;
+export const DEFAULT_VUPS_STREAM_IDLE_TIMEOUT_MS = 240000;
+export const DEFAULT_VUPS_SSE_HEARTBEAT_MS = 15000;
 
 export const VUPS_BASE_PROMPT = `You are Vups v3 Galax, an AI model created by Vups and available for free on VupsRouter AI.
 
@@ -47,6 +53,51 @@ function visionSetting(value) {
 
 function envText(name) {
   return typeof process.env[name] === "string" ? process.env[name].trim() : "";
+}
+
+function boundedEnvNumber(name, fallback, { min, max }) {
+  const value = Number(process.env[name]);
+  if (!Number.isFinite(value)) return fallback;
+  return Math.min(Math.max(Math.floor(value), min), max);
+}
+
+export function vupsMaxOutputTokens() {
+  return boundedEnvNumber("VUPS_MAX_OUTPUT_TOKENS", DEFAULT_VUPS_MAX_OUTPUT_TOKENS, {
+    min: 256,
+    max: VUPS_MAX_OUTPUT_TOKENS_LIMIT
+  });
+}
+
+export function vupsExecutionConfiguration() {
+  return {
+    maxOutputTokens: vupsMaxOutputTokens(),
+    requestTimeoutMs: boundedEnvNumber("VUPS_REQUEST_TIMEOUT_MS", DEFAULT_VUPS_REQUEST_TIMEOUT_MS, {
+      min: 5000,
+      max: 600000
+    }),
+    streamStartTimeoutMs: boundedEnvNumber("VUPS_STREAM_START_TIMEOUT_MS", DEFAULT_VUPS_STREAM_START_TIMEOUT_MS, {
+      min: 5000,
+      max: 180000
+    }),
+    streamIdleTimeoutMs: boundedEnvNumber("VUPS_STREAM_IDLE_TIMEOUT_MS", DEFAULT_VUPS_STREAM_IDLE_TIMEOUT_MS, {
+      min: 15000,
+      max: 600000
+    }),
+    heartbeatMs: boundedEnvNumber("VUPS_SSE_HEARTBEAT_MS", DEFAULT_VUPS_SSE_HEARTBEAT_MS, {
+      min: 1000,
+      max: 60000
+    })
+  };
+}
+
+export function vupsTextConfiguration() {
+  const dedicated = envText("VUPS_UNDERLYING_MODEL");
+  if (dedicated) return { model: dedicated, source: "VUPS_UNDERLYING_MODEL" };
+  const configuredDefault = envText("OPENROUTER_DEFAULT_MODEL");
+  if (configuredDefault) return { model: configuredDefault, source: "OPENROUTER_DEFAULT_MODEL" };
+  const configuredModel = envText("OPENROUTER_MODEL");
+  if (configuredModel) return { model: configuredModel, source: "OPENROUTER_MODEL" };
+  return { model: openRouterModel(), source: "default" };
 }
 
 export function vupsVisionConfiguration() {

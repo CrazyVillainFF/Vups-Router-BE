@@ -38,6 +38,9 @@ export async function startFakeProvider() {
       chatErrorPayload: null,
       chatResponseHeaders: null,
       failStreamMidway: false,
+      streamWithoutTerminal: false,
+      streamErrorPayload: null,
+      streamInitialDelayMs: 0,
       failModel: null,
       failModelStatus: 404,
       failModelMessage: "",
@@ -64,6 +67,9 @@ export async function startFakeProvider() {
       state.behavior.chatErrorPayload = null;
       state.behavior.chatResponseHeaders = null;
       state.behavior.failStreamMidway = false;
+      state.behavior.streamWithoutTerminal = false;
+      state.behavior.streamErrorPayload = null;
+      state.behavior.streamInitialDelayMs = 0;
       state.behavior.failModel = null;
       state.behavior.failModelStatus = 404;
       state.behavior.failModelMessage = "";
@@ -179,6 +185,10 @@ export async function startFakeProvider() {
       }
 
       res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
+      if (state.behavior.streamInitialDelayMs > 0) {
+        res.flushHeaders?.();
+        await new Promise(resolve => setTimeout(resolve, state.behavior.streamInitialDelayMs));
+      }
       if (state.behavior.emptyStream) {
         res.write(`data: ${JSON.stringify({ id: "chatcmpl-fake", model, choices: [{ delta: { role: "assistant" }, finish_reason: null }] })}\n\n`);
         res.write(`data: ${JSON.stringify({ id: "chatcmpl-fake", model, choices: [{ delta: {}, finish_reason: state.behavior.finishReason }] })}\n\n`);
@@ -195,15 +205,20 @@ export async function startFakeProvider() {
         res.write(`data: ${JSON.stringify({
           id: "chatcmpl-fake",
           model,
-          choices: [{ delta: { content: chunks[i] }, ...(last ? { finish_reason: state.behavior.finishReason } : {}) }]
+          choices: [{ delta: { content: chunks[i] }, ...(last && !state.behavior.streamWithoutTerminal ? { finish_reason: state.behavior.finishReason } : {}) }]
         })}\n\n`);
         await new Promise(resolve => setTimeout(resolve, 5));
       }
       if (state.behavior.failStreamMidway) {
-        res.write(`data: ${JSON.stringify({ error: { message: "Upstream exploded mid-stream." } })}\n\n`);
+        res.write(`data: ${JSON.stringify(state.behavior.streamErrorPayload || { error: { message: "Upstream exploded mid-stream." } })}\n\n`);
         res.end();
         return;
       }
+      if (state.behavior.streamWithoutTerminal) {
+        res.end();
+        return;
+      }
+
       if (state.behavior.usageChunk) {
         res.write(`data: ${JSON.stringify({
           id: "chatcmpl-fake",
