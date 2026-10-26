@@ -29,6 +29,7 @@ import { UsageError, acquireSlot, consumeDailyQuota, releaseSlot } from "../usag
 import { sharedModelStatus, sharedProviderForChat } from "../sharedModel.js";
 import { resolveOmniRouteChat } from "../omniroute.js";
 import { attachmentMetadata, validateImages } from "../chatImages.js";
+import { resolveTerminalEvent, writeSseEvent } from "../chatTerminal.js";
 import {
   VUPS_MODEL_ID,
   buildVupsSystemPrompt,
@@ -686,8 +687,7 @@ async function saveGeneratedArtifact({
 }
 
 function sendEvent(res, payload) {
-  if (res.writableEnded) return;
-  res.write(`data: ${JSON.stringify(payload)}\n\n`);
+  return writeSseEvent(res, payload);
 }
 
 function createStreamProgress(res, messageId) {
@@ -1630,6 +1630,7 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
     let savedContinuation = null;
     let savedContent = null;
     let artifactError = null;
+    let persistFailure = null;
     let savedConversationId = prospectiveId;
     if (fullText.length > 0) {
       progress.preparing();
@@ -1667,29 +1668,56 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
           savedArtifact = turn.artifact ? artifactPayload(turn.artifact) : null;
           artifactError = turn.artifactError;
         }
-        if (!failure && !artifactError && !clientAborted) {
-          sendEvent(res, {
-            type: "done",
-            conversationId: savedConversationId,
-            messageId: assistantMessageId,
-            finishReason: finishReason ?? "stop",
-            model: VUPS_MODEL_ID,
-            ...(savedContent ? { message: { role: "assistant", content: savedContent, messageId: assistantMessageId } } : {}),
-            ...(savedArtifact ? { artifact: savedArtifact, artifacts: [savedArtifact] } : {}),
-            ...(savedContinuation ? { continuedFile: savedContinuation } : {}),
-            ...(usage ? { usage } : {})
-          });
-        }
       } catch (error) {
         if (error instanceof ArtifactError) artifactError = error;
         else if (!failure) {
-          failure = new ProviderError("The response was generated but could not be saved to your history.", null, "persist_failed");
-          failureReason = "persist_failed";
+          persistFailure = new ProviderError(
+            "The response was generated but could not be saved to your history.",
+            null,
+            "persist_failed"
+          );
         }
       }
     }
 
-    if (artifactError && !failure && !clientAborted) {
+    const terminal = resolveTerminalEvent({
+      failure,
+      artifactError,
+      persistFailure,
+      clientAborted
+    });
+
+    if ((artifactError || persistFailure) && !failure && !clientAborted) {
+      const saveError = artifactError || persistFailure;
+      logVupsOutcome({
+        outcome: "completed_with_warning",
+        requestId,
+        model: provider.model,
+        providerHost,
+        attempts: streamAttempts || 1,
+        totalDurationMs: Date.now() - streamStartedAt,
+        error: saveError,
+        finalCode: saveError.code
+      });
+    }
+
+    if (terminal.type === "done") {
+      sendEvent(res, {
+        type: "done",
+        conversationId: savedConversationId,
+        messageId: assistantMessageId,
+        finishReason: finishReason ?? "stop",
+        model: VUPS_MODEL_ID,
+        ...(savedContent ? { message: { role: "assistant", content: savedContent, messageId: assistantMessageId } } : {}),
+        ...(savedArtifact ? { artifact: savedArtifact, artifacts: [savedArtifact] } : {}),
+        ...(savedContinuation ? { continuedFile: savedContinuation } : {}),
+        ...(terminal.saveWarning ? { saveWarning: terminal.saveWarning } : {}),
+        ...(usage ? { usage } : {})
+      });
+    }
+
+    if (terminal.type === "error") {
+      const safe = vupsFailure(failure, { hasImages });
       logVupsOutcome({
         outcome: "failed",
         requestId,
@@ -1697,57 +1725,29 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
         providerHost,
         attempts: streamAttempts || 1,
         totalDurationMs: Date.now() - streamStartedAt,
-        error: artifactError,
-        finalCode: artifactError.code
+        error: failure,
+        finalCode: safe.code
       });
       sendEvent(res, {
         type: "error",
-        message: artifactError.message,
-        code: artifactError.code,
+        message: safe.message,
+        code: safe.code,
         model: VUPS_MODEL_ID,
+        ...resetMetadata(failure),
         ...(requestId ? { requestId } : {}),
         messageId: assistantMessageId,
         conversationId: savedConversationId,
         partial: fullText.length > 0,
         ...(savedArtifact ? { artifact: savedArtifact, artifacts: [savedArtifact] } : {}),
-        ...(savedContinuation ? { continuedFile: savedContinuation } : {})
+        ...(savedContinuation ? { continuedFile: savedContinuation } : {}),
+        diagnostic: vupsSafeDiagnostic(failure, {
+          phase: "stream",
+          reason: failureReason || (idleTimedOut ? "idle_timeout" : "stream_interrupted"),
+          contentChars: fullText.length,
+          durationMs: Date.now() - streamStartedAt,
+          sawTerminal
+        })
       });
-    }
-
-    if (failure) {
-      const safe = vupsFailure(failure, { hasImages });
-      if (!clientAborted) {
-        logVupsOutcome({
-          outcome: "failed",
-          requestId,
-          model: provider.model,
-          providerHost,
-          attempts: streamAttempts || 1,
-          totalDurationMs: Date.now() - streamStartedAt,
-          error: failure,
-          finalCode: safe.code
-        });
-        sendEvent(res, {
-          type: "error",
-          message: safe.message,
-          code: safe.code,
-          model: VUPS_MODEL_ID,
-          ...resetMetadata(failure),
-          ...(requestId ? { requestId } : {}),
-          messageId: assistantMessageId,
-          conversationId: savedConversationId,
-          partial: fullText.length > 0,
-          ...(savedArtifact ? { artifact: savedArtifact, artifacts: [savedArtifact] } : {}),
-          ...(savedContinuation ? { continuedFile: savedContinuation } : {}),
-          diagnostic: vupsSafeDiagnostic(failure, {
-            phase: "stream",
-            reason: failureReason || (idleTimedOut ? "idle_timeout" : "stream_interrupted"),
-            contentChars: fullText.length,
-            durationMs: Date.now() - streamStartedAt,
-            sawTerminal
-          })
-        });
-      }
     }
     if (!res.writableEnded) res.end();
   } catch (error) {
@@ -1939,8 +1939,12 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
     const prospectiveId = existingConversation ? String(existingConversation._id) : String(new mongoose.Types.ObjectId());
 
     const controller = new AbortController();
+    let clientAborted = false;
     res.on("close", () => {
-      if (!res.writableEnded) controller.abort();
+      if (!res.writableEnded) {
+        clientAborted = true;
+        controller.abort();
+      }
     });
 
     let upstream;
@@ -2101,12 +2105,13 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
     let savedContinuation = null;
     let savedContent = null;
     let artifactError = null;
+    let persistFailure = null;
     let savedConversationId = prospectiveId;
     if (fullText.length > 0) {
       progress.preparing();
       try {
         if (continuationState) {
-          const complete = !failure && !controller.signal.aborted && generatedArtifactStatus(finishReason, null) === "complete";
+          const complete = !failure && !clientAborted && generatedArtifactStatus(finishReason, null) === "complete";
           const continued = await persistContinuation({
             conversation: continuationState.conversation,
             target: continuationState.target,
@@ -2138,31 +2143,51 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
           savedArtifact = turn.artifact ? artifactPayload(turn.artifact) : null;
           artifactError = turn.artifactError;
         }
-        if (!failure && !artifactError && !controller.signal.aborted) {
-          sendEvent(res, {
-            type: "done",
-            conversationId: savedConversationId,
-            messageId: assistantMessageId,
-            finishReason: finishReason ?? "stop",
-            ...(savedContent ? { message: { role: "assistant", content: savedContent, messageId: assistantMessageId } } : {}),
-            ...(savedArtifact ? { artifact: savedArtifact, artifacts: [savedArtifact] } : {}),
-            ...(savedContinuation ? { continuedFile: savedContinuation } : {}),
-            ...(usage ? { usage } : {})
-          });
-        }
       } catch (error) {
         if (error instanceof ArtifactError) artifactError = error;
-        else if (!failure) failure = new ProviderError("The response was generated but could not be saved to your history.", null, "persist_failed");
+        else if (!failure) {
+          persistFailure = new ProviderError(
+            "The response was generated but could not be saved to your history.",
+            null,
+            "persist_failed"
+          );
+        }
       }
     }
 
-    if (artifactError && !failure && !controller.signal.aborted) {
-      logProviderFailure(provider, artifactError);
+    const terminal = resolveTerminalEvent({
+      failure,
+      artifactError,
+      persistFailure,
+      clientAborted
+    });
+
+    if ((artifactError || persistFailure) && !failure && !clientAborted) {
+      logProviderFailure(provider, artifactError || persistFailure);
+    }
+
+    if (terminal.type === "done") {
+      sendEvent(res, {
+        type: "done",
+        conversationId: savedConversationId,
+        messageId: assistantMessageId,
+        finishReason: finishReason ?? "stop",
+        ...(savedContent ? { message: { role: "assistant", content: savedContent, messageId: assistantMessageId } } : {}),
+        ...(savedArtifact ? { artifact: savedArtifact, artifacts: [savedArtifact] } : {}),
+        ...(savedContinuation ? { continuedFile: savedContinuation } : {}),
+        ...(terminal.saveWarning ? { saveWarning: terminal.saveWarning } : {}),
+        ...(usage ? { usage } : {})
+      });
+    }
+
+    if (terminal.type === "error") {
+      logProviderFailure(provider, failure);
       sendEvent(res, {
         type: "error",
-        message: artifactError.message,
-        code: artifactError.code,
+        message: failure.message,
+        code: failure.code,
         model: usedModel,
+        ...resetMetadata(failure),
         ...(req.requestId ? { requestId: req.requestId } : {}),
         messageId: assistantMessageId,
         conversationId: savedConversationId,
@@ -2170,25 +2195,6 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
         ...(savedArtifact ? { artifact: savedArtifact, artifacts: [savedArtifact] } : {}),
         ...(savedContinuation ? { continuedFile: savedContinuation } : {})
       });
-    }
-
-    if (failure) {
-      logProviderFailure(provider, failure);
-      if (!controller.signal.aborted) {
-        sendEvent(res, {
-          type: "error",
-          message: failure.message,
-          code: failure.code,
-          model: usedModel,
-          ...resetMetadata(failure),
-          ...(req.requestId ? { requestId: req.requestId } : {}),
-          messageId: assistantMessageId,
-          conversationId: savedConversationId,
-          partial: fullText.length > 0,
-          ...(savedArtifact ? { artifact: savedArtifact, artifacts: [savedArtifact] } : {}),
-          ...(savedContinuation ? { continuedFile: savedContinuation } : {})
-        });
-      }
     }
     if (!res.writableEnded) res.end();
   } catch (error) {

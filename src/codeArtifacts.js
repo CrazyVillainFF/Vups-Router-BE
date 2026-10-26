@@ -309,7 +309,10 @@ function cleanAddition(text, targetPath) {
     .replace(/^\s*```[^\n]*\n/, "")
     .replace(/\n```\s*$/, "")
     .replace(/\r\n?/g, "\n")
-    .trim();
+    // A continuation can resume mid-token or mid-line, so only blank edges are
+    // removable; trimming indentation or a leading space would corrupt the seam.
+    .replace(/^\n+/, "")
+    .replace(/\s+$/, "");
 }
 
 export function mergeContinuation(base, addition, targetPath = "") {
@@ -358,7 +361,11 @@ export function continuationPlan(artifact) {
 }
 
 export function applyContinuationFile(artifact, targetPath, addition, { complete = true } = {}) {
-  const files = Array.isArray(artifact?.files) ? artifact.files.map(file => ({ ...file })) : [];
+  // Mongoose subdocuments expose fields through getters, so spreading them
+  // directly loses path/content. Normalize via toObject before merging.
+  const files = Array.isArray(artifact?.files)
+    ? artifact.files.map(file => (typeof file?.toObject === "function" ? file.toObject() : { ...file }))
+    : [];
   const index = files.findIndex(file => file.path === targetPath);
   if (index === -1) {
     throw new ArtifactError("The saved file could not be found for continuation.", "continuation_unavailable");
