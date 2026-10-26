@@ -7,7 +7,70 @@ import { requireAuth } from "../middleware.js";
 
 const router = Router();
 
+const MAX_HANDOFF_CHARS = 20000;
+const MAX_TITLE_CHARS = 60;
+
 router.use(requireAuth);
+
+function serializeMessage(message) {
+  return {
+    role: message.role,
+    content: message.content,
+    ...(message.messageId ? { messageId: message.messageId } : {}),
+    ...(message.feedback ? { feedback: message.feedback } : {}),
+    ...(Array.isArray(message.attachments) && message.attachments.length > 0
+      ? { attachments: message.attachments.map(attachment => ({ name: attachment.name, mimeType: attachment.mimeType, bytes: attachment.bytes })) }
+      : {}),
+    ...(Array.isArray(message.artifacts) && message.artifacts.length > 0
+      ? {
+          artifacts: message.artifacts.map(artifact => ({
+            id: artifact.id,
+            title: artifact.title,
+            status: artifact.status,
+            fileCount: artifact.fileCount,
+            bytes: artifact.bytes
+          }))
+        }
+      : {}),
+    createdAt: message.createdAt
+  };
+}
+
+function serializeConversation(conversation) {
+  return {
+    id: String(conversation._id),
+    title: conversation.title,
+    createdAt: conversation.createdAt,
+    updatedAt: conversation.updatedAt,
+    messages: conversation.messages.map(serializeMessage)
+  };
+}
+
+// Starts a persisted conversation from a bounded handoff before the user types
+// anything, so the first model request in the new chat already carries context.
+router.post("/", async (req, res, next) => {
+  try {
+    const handoff = typeof req.body?.handoff === "string" ? req.body.handoff.trim() : "";
+    if (!handoff) {
+      return res.status(400).json({ message: "A continuation summary is required." });
+    }
+    if (handoff.length > MAX_HANDOFF_CHARS) {
+      return res.status(413).json({ message: "The continuation summary is too long." });
+    }
+    const requestedTitle =
+      typeof req.body?.title === "string" ? req.body.title.replace(/\s+/g, " ").trim() : "";
+    const title = (requestedTitle || "Continued chat").slice(0, MAX_TITLE_CHARS);
+    await connectToDatabase();
+    const conversation = await Conversation.create({
+      userId: req.userId,
+      title,
+      messages: [{ role: "user", content: handoff }]
+    });
+    return res.status(201).json({ conversation: serializeConversation(conversation) });
+  } catch (error) {
+    return next(error);
+  }
+});
 
 router.get("/", async (req, res, next) => {
   try {
@@ -65,6 +128,41 @@ router.get("/:id/artifacts", async (req, res, next) => {
   }
 });
 
+const FEEDBACK_VALUES = new Set(["like", "dislike"]);
+
+// A reaction lives on the assistant message itself, so repeated clicks update
+// the same record and can never create duplicates for one response.
+router.put("/:id/messages/:messageId/feedback", async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(404).json({ message: "Conversation not found." });
+    }
+    const messageId = typeof req.params.messageId === "string" ? req.params.messageId.trim() : "";
+    if (!messageId || messageId.length > 80) {
+      return res.status(400).json({ message: "Invalid message ID." });
+    }
+    const value = req.body?.value ?? null;
+    if (value !== null && !FEEDBACK_VALUES.has(value)) {
+      return res.status(400).json({ message: "Feedback must be like, dislike, or null." });
+    }
+    await connectToDatabase();
+    const conversation = await Conversation.findOne({
+      _id: req.params.id,
+      userId: req.userId
+    }).select("messages");
+    if (!conversation) return res.status(404).json({ message: "Conversation not found." });
+    const message = conversation.messages.find(
+      item => item.messageId === messageId && item.role === "assistant"
+    );
+    if (!message) return res.status(404).json({ message: "Message not found." });
+    message.feedback = value === null ? undefined : value;
+    await conversation.save();
+    return res.json({ feedback: message.feedback ?? null });
+  } catch (error) {
+    return next(error);
+  }
+});
+
 router.get("/:id", async (req, res, next) => {
   try {
     if (!mongoose.isValidObjectId(req.params.id)) {
@@ -73,34 +171,7 @@ router.get("/:id", async (req, res, next) => {
     await connectToDatabase();
     const conversation = await Conversation.findOne({ _id: req.params.id, userId: req.userId }).lean();
     if (!conversation) return res.status(404).json({ message: "Conversation not found." });
-    return res.json({
-      conversation: {
-        id: String(conversation._id),
-        title: conversation.title,
-        createdAt: conversation.createdAt,
-        updatedAt: conversation.updatedAt,
-        messages: conversation.messages.map(message => ({
-          role: message.role,
-          content: message.content,
-          ...(message.messageId ? { messageId: message.messageId } : {}),
-          ...(Array.isArray(message.attachments) && message.attachments.length > 0
-            ? { attachments: message.attachments.map(attachment => ({ name: attachment.name, mimeType: attachment.mimeType, bytes: attachment.bytes })) }
-            : {}),
-          ...(Array.isArray(message.artifacts) && message.artifacts.length > 0
-            ? {
-                artifacts: message.artifacts.map(artifact => ({
-                  id: artifact.id,
-                  title: artifact.title,
-                  status: artifact.status,
-                  fileCount: artifact.fileCount,
-                  bytes: artifact.bytes
-                }))
-              }
-            : {}),
-          createdAt: message.createdAt
-        }))
-      }
-    });
+    return res.json({ conversation: serializeConversation(conversation) });
   } catch (error) {
     return next(error);
   }

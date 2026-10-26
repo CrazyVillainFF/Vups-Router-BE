@@ -14,6 +14,7 @@ import {
 import { decryptSecret } from "../encryption.js";
 import {
   ProviderError,
+  CONTEXT_LIMIT_MESSAGE,
   assertAllowedProviderUrl,
   buildProviderFailureDiagnostic,
   chatCompletion,
@@ -101,6 +102,19 @@ function validateMessages(value, { allowAssistantLast = false } = {}) {
   }
   if (!allowAssistantLast && messages[messages.length - 1].role !== "user") return "The last message must come from the user.";
   return { messages };
+}
+
+// Limits enforced before any provider call are still context-limit failures.
+// The 32,000-character single-message cap stays an oversize error because it is
+// not evidence that the conversation window is exhausted.
+const PRE_PROVIDER_CONTEXT_LIMIT =
+  /at most \d+ messages|conversation is too large|too large to replay|too long for this (?:model|provider)/i;
+
+function sendValidationFailure(res, message) {
+  return res.status(400).json({
+    message,
+    ...(PRE_PROVIDER_CONTEXT_LIMIT.test(message) ? { code: "context_limit" } : {})
+  });
 }
 
 function parseMessageId(value) {
@@ -841,6 +855,16 @@ function sendProviderFailure(res, failure, error, requestId = null, diagnostic =
 }
 
 function providerFailure(provider, error) {
+  // Context limits are decided by the shared classifier before provider
+  // branches. Serializing them as a safe 400 keeps credential and generic
+  // mappings from overwriting the decision on the way to the client.
+  if (error?.category === "context_limit" || error?.code === "context_limit") {
+    return {
+      status: 400,
+      message: CONTEXT_LIMIT_MESSAGE,
+      code: "context_limit"
+    };
+  }
   if (provider?.gateway) {
     if (error.code === "invalid_api_key" || error.code === "forbidden") {
       return {
@@ -980,6 +1004,32 @@ function vupsStreamFailure(payload, { url, requestId, model, attempt }) {
   return error;
 }
 
+// Errors delivered inside an already-open SSE stream still go through the
+// shared classifier. A context-limit payload must not become a generic stream
+// interruption just because the HTTP response had already started.
+function streamingProviderFailure(payload, detail, model) {
+  const diagnostic = buildProviderFailureDiagnostic({
+    status: null,
+    payload,
+    context: { model, attempt: null, requestId: null }
+  });
+  const contextLimit = diagnostic.category === "context_limit";
+  const error = new ProviderError(
+    contextLimit
+      ? CONTEXT_LIMIT_MESSAGE
+      : detail
+        ? `The provider reported an error during streaming: ${redactSecrets(detail)}`
+        : "The provider reported an error during streaming.",
+    null,
+    contextLimit ? "context_limit" : "stream_error"
+  );
+  error.category = diagnostic.category;
+  error.classification = diagnostic.classification;
+  error.retryable = diagnostic.retryable;
+  error.diagnostics = diagnostic;
+  return error;
+}
+
 function providerHostFromUrl(value) {
   try {
     return new URL(String(value)).hostname || "unresolved";
@@ -1115,6 +1165,18 @@ function vupsFailure(error, { hasImages = false } = {}) {
     };
   }
   const detail = typeof error?.message === "string" ? error.message : "";
+  const contextLimit =
+    error?.category === "context_limit" ||
+    code === "context_limit" ||
+    code === "context_length_exceeded" ||
+    /context (?:length|window)|conversation is too long|too many tokens|input length exceeds/i.test(detail);
+  if (contextLimit) {
+    return {
+      status: 400,
+      message: "This conversation is too long for Vups v3 Galax. Continue in a new chat to keep going.",
+      code: "vups_context_exceeded"
+    };
+  }
   const visionUnsupported = hasImages && /no endpoints found that support image input|does not support image input|image input (?:is )?not supported|does not accept image/i.test(detail);
   if (hasImages && (visionUnsupported || ["bad_request", "unprocessable"].includes(code))) {
     return {
@@ -1184,7 +1246,7 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
       throw error;
     }
     const validated = validateMessages(body.messages, { allowAssistantLast: Boolean(continuation) });
-    if (typeof validated === "string") return res.status(400).json({ message: validated });
+    if (typeof validated === "string") return sendValidationFailure(res, validated);
     const assistantMessageId = parseMessageId(body.assistantMessageId) || continuation?.messageId || String(new mongoose.Types.ObjectId());
 
     if (body.model !== undefined && body.model !== VUPS_MODEL_ID) {
@@ -1776,7 +1838,7 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
       throw error;
     }
     const validated = validateMessages(body.messages, { allowAssistantLast: Boolean(continuation) });
-    if (typeof validated === "string") return res.status(400).json({ message: validated });
+    if (typeof validated === "string") return sendValidationFailure(res, validated);
     const assistantMessageId = parseMessageId(body.assistantMessageId) || continuation?.messageId || String(new mongoose.Types.ObjectId());
 
     const stream = body.stream !== false;
@@ -1877,7 +1939,14 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
             continue;
           }
           const failure = providerFailure(provider, error);
-          return sendProviderFailure(res, failure, error, null, null, usedModel);
+          return sendProviderFailure(
+            res,
+            failure,
+            error,
+            null,
+            vupsSafeDiagnostic(error),
+            usedModel
+          );
         }
       }
       if (continuationState) {
@@ -1967,7 +2036,14 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
             continue;
           }
           const failure = providerFailure(provider, error);
-          return sendProviderFailure(res, failure, error, null, null, usedModel);
+          return sendProviderFailure(
+            res,
+            failure,
+            error,
+            null,
+            vupsSafeDiagnostic(error),
+            usedModel
+          );
         }
         return next(error);
       }
@@ -2013,37 +2089,37 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
           } catch {
             continue;
           }
-          if (parsed?.error) {
-            failure = new ProviderError(
-              typeof parsed.error?.message === "string"
-                ? `The provider reported an error during streaming: ${redactSecrets(parsed.error.message)}`
-                : "The provider reported an error during streaming.",
-              null,
-              "stream_error"
+          if (parsed?.type === "error" && (parsed.code || parsed.message)) {
+            failure = streamingProviderFailure(
+              parsed,
+              typeof parsed.message === "string" ? parsed.message : "",
+              usedModel
             );
+            break;
+          }
+          if (parsed?.error) {
+            const detail =
+              typeof parsed.error === "string"
+                ? parsed.error
+                : typeof parsed.error?.message === "string"
+                  ? parsed.error.message
+                  : "";
+            failure = streamingProviderFailure(parsed, detail, usedModel);
             break;
           }
           if (parsed?.type === "response.failed") {
             const detail = parsed.response?.error?.message;
-            failure = new ProviderError(
-              typeof detail === "string"
-                ? `The provider reported an error during streaming: ${redactSecrets(detail)}`
-                : "The provider reported an error during streaming.",
-              null,
-              "stream_error"
+            failure = streamingProviderFailure(
+              { error: parsed.response?.error },
+              typeof detail === "string" ? detail : "",
+              usedModel
             );
             break;
           }
           const choice = parsed?.choices?.[0];
           if (choice?.error) {
             const detail = typeof choice.error?.message === "string" ? choice.error.message : "";
-            failure = new ProviderError(
-              detail
-                ? `The provider reported an error during streaming: ${redactSecrets(detail)}`
-                : "The provider reported an error during streaming.",
-              null,
-              "stream_error"
-            );
+            failure = streamingProviderFailure({ error: choice.error }, detail, usedModel);
             break;
           }
           if (typeof choice?.finish_reason === "string" && choice.finish_reason) {
@@ -2193,7 +2269,8 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
         conversationId: savedConversationId,
         partial: fullText.length > 0,
         ...(savedArtifact ? { artifact: savedArtifact, artifacts: [savedArtifact] } : {}),
-        ...(savedContinuation ? { continuedFile: savedContinuation } : {})
+        ...(savedContinuation ? { continuedFile: savedContinuation } : {}),
+        ...(failure ? { diagnostic: vupsSafeDiagnostic(failure) } : {})
       });
     }
     if (!res.writableEnded) res.end();

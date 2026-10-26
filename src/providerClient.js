@@ -444,11 +444,61 @@ export function buildProviderFailureLog({ url, method = "POST", status, contentT
 
 // Upstream error bodies are third-party data. Never surface HTML error pages or
 // markup: summarize them instead, and keep JSON/message details short.
+// Providers wrap failures differently: {error:{message}}, {error:{error:{...}}},
+// {cause:{...}}, or a raw string. Walk a few nested levels so a wrapped
+// context-window error is not replaced by the outer generic envelope.
+function providerErrorLevels(payload) {
+  const levels = [];
+  let current = payload;
+  for (let depth = 0; depth < 4 && current; depth += 1) {
+    if (typeof current === "string") {
+      levels.push({ message: current });
+      break;
+    }
+    if (typeof current !== "object" || Array.isArray(current)) break;
+    levels.push(current);
+    const child =
+      (typeof current.error === "string" ? current.error : diagnosticObject(current.error)) ??
+      (typeof current.cause === "string" ? current.cause : diagnosticObject(current.cause));
+    if (!child) break;
+    current = child;
+  }
+  return levels;
+}
+
+function firstErrorField(levels, names, limit = 120) {
+  for (const level of levels) {
+    for (const name of names) {
+      const value = diagnosticText(level?.[name], limit);
+      if (value) return value;
+    }
+  }
+  return "";
+}
+
+function firstErrorMetadata(levels, names, limit = 120) {
+  for (const level of levels) {
+    const metadata = diagnosticObject(level?.metadata);
+    if (!metadata) continue;
+    for (const name of names) {
+      const value = diagnosticText(metadata?.[name], limit);
+      if (value) return value;
+    }
+  }
+  return "";
+}
+
 function sanitizedErrorDetail(payload) {
-  const raw = payload?.error?.message
-    || (typeof payload?.error === "string" ? payload.error : "")
-    || payload?.message
-    || (typeof payload === "string" ? payload : "");
+  let raw = typeof payload === "string" ? payload : "";
+  if (!raw) {
+    for (const level of providerErrorLevels(payload)) {
+      const value = level?.message ?? level?.detail ?? level?.reason;
+      if (typeof value === "string" && value.trim()) {
+        raw = value;
+        break;
+      }
+    }
+  }
   if (typeof raw !== "string") return "";
   const text = raw.trim();
   if (!text) return "";
@@ -468,23 +518,26 @@ function diagnosticText(value, limit = 120) {
 }
 
 export function providerErrorFields(payload) {
+  const levels = providerErrorLevels(payload);
   const root = diagnosticObject(payload) || {};
-  const error = diagnosticObject(root.error) || {};
-  const metadata = diagnosticObject(error.metadata) || diagnosticObject(root.metadata) || {};
-  const details = Array.isArray(error.details) ? error.details : Array.isArray(root.details) ? root.details : [];
+  const details = levels
+    .map(level => (Array.isArray(level?.details) ? level.details : null))
+    .find(Boolean) || [];
   const reasons = details
     .map(entry => diagnosticText(diagnosticObject(entry)?.reason, 80))
     .filter(Boolean)
     .slice(0, 5);
   return {
-    code: diagnosticText(error.code ?? root.code ?? error.error_code ?? root.error_code, 80),
-    type: diagnosticText(error.type ?? root.type ?? error.error_type ?? root.error_type, 80),
-    status: diagnosticText(error.status ?? root.error_status, 80),
-    providerName: diagnosticText(metadata.provider_name ?? metadata.provider ?? root.provider_name, 80),
-    providerCode: diagnosticText(metadata.provider_error_code, 80),
-    limitSource: diagnosticText(metadata.limit_source, 80),
-    remedyHint: diagnosticText(metadata.remedy_hint, 240),
-    detail: diagnosticText(metadata.raw, 300),
+    code: firstErrorField(levels, ["code", "error_code"], 80),
+    type: firstErrorField(levels, ["type", "error_type"], 80),
+    status: firstErrorField(levels, ["status", "error_status"], 80),
+    providerName:
+      firstErrorMetadata(levels, ["provider_name", "provider"], 80) ||
+      diagnosticText(root.provider_name, 80),
+    providerCode: firstErrorMetadata(levels, ["provider_error_code"], 80),
+    limitSource: firstErrorMetadata(levels, ["limit_source"], 80),
+    remedyHint: firstErrorMetadata(levels, ["remedy_hint"], 240),
+    detail: firstErrorMetadata(levels, ["raw"], 300),
     reasons,
     message: sanitizedErrorDetail(payload)
   };
@@ -497,6 +550,13 @@ const TOKEN_RATE_ERROR_TEXT = /tokens? per min|\bTPM\b|token[- ]rate|tokens?.*(?
 const REQUEST_RATE_ERROR_TEXT = /requests? per min|\bRPM\b|too many requests|rate.?limit|request rate/i;
 const INVALID_MODEL_ERROR_TEXT = /model.*(?:not found|does not exist|not available|invalid)|invalid model|unknown model|no endpoints found/i;
 const CREDENTIAL_ERROR_TEXT = /invalid.*(?:api.?key|token|credential)|unauthorized|authentication|api key.*(?:invalid|expired|disabled)/i;
+// Context-window failures arrive as HTTP 400 from most providers. They must be
+// classified before credential heuristics, because a bare 400 message often
+// lists the API key as something to check even when the key is fine.
+const CONTEXT_LIMIT_ERROR_CODE = /context[_-]?(?:length|window)|context_limit|string_above_max_length|prompt_too_long|input_too_long|too_many_tokens|model_context_window_exceeded|conversation_too_long|chat_too_long/i;
+const CONTEXT_LIMIT_ERROR_TEXT = /context (?:length|window)[^.\n]{0,60}(?:exceed|too (?:long|large|small)|maximum|max|limit)|(?:maximum|max)[^.\n]{0,20}context (?:length|window)|(?:prompt|input|messages?|conversation|chat)[^.\n]{0,80}\btoo (?:long|large|big)\b|conversation is too large|input length exceeds (?:the )?context|too many tokens|exceed(?:s|ed)? (?:the )?(?:model'?s )?(?:maximum|max|available) (?:context|tokens|input)|string too long for/i;
+export const CONTEXT_LIMIT_MESSAGE =
+  "This conversation is too long for this model. Continue in a new chat to keep going.";
 
 export function classifyProviderFailure({ status = null, payload = null, message = "" } = {}) {
   const fields = providerErrorFields(payload);
@@ -520,6 +580,9 @@ export function classifyProviderFailure({ status = null, payload = null, message
   const requestRate = REQUEST_RATE_ERROR_TEXT.test(signal);
   const invalidModel = INVALID_MODEL_ERROR_TEXT.test(signal);
   const credentials = CREDENTIAL_ERROR_TEXT.test(signal);
+  const contextLimit = CONTEXT_LIMIT_ERROR_CODE.test(
+    `${fields.code} ${fields.type} ${fields.providerCode}`
+  ) || CONTEXT_LIMIT_ERROR_TEXT.test(signal);
 
   const result = (category, classification, retryable) => ({
     category,
@@ -533,6 +596,7 @@ export function classifyProviderFailure({ status = null, payload = null, message
     limitSource: fields.limitSource
   });
 
+  if (contextLimit) return result("context_limit", "permanent", false);
   if (statusCode === 401 || (statusCode === 403 && credentials && !quota)) return result("invalid_credentials", "permanent", false);
   if (statusCode === 402 || quota) return result("quota_exhausted", "permanent", false);
   if (statusCode === 403) return result("forbidden", "permanent", false);
@@ -645,6 +709,12 @@ function attachProviderDiagnostic(error, options) {
   error.classification = diagnostic.classification;
   error.retryable = diagnostic.retryable;
   error.diagnostics = diagnostic;
+  // A context-window decision is authoritative. Do not let a generic 401/403
+  // wrapper keep its credential code or raw upstream wording.
+  if (diagnostic.category === "context_limit") {
+    error.code = "context_limit";
+    error.message = CONTEXT_LIMIT_MESSAGE;
+  }
   if (diagnostic.category === "quota_exhausted" && error.code === "rate_limited") error.code = "quota_exhausted";
   if (diagnostic.category === "invalid_model" && error.code === "bad_request") error.code = "invalid_model";
   if (diagnostic.category === "invalid_credentials" && error.code === "bad_request") error.code = "invalid_api_key";
@@ -653,9 +723,19 @@ function attachProviderDiagnostic(error, options) {
 }
 
 export function describeProviderError(status, payload) {
+  // Context overflow can arrive with 400, 401, 403, 413, or 422 depending on
+  // the provider. Structured codes or explicit context wording win, but a
+  // bare credential rejection is never inferred to be a context limit.
+  if (classifyProviderFailure({ status, payload }).category === "context_limit") {
+    return new ProviderError(CONTEXT_LIMIT_MESSAGE, status, "context_limit");
+  }
   const detail = sanitizedErrorDetail(payload);
   const suffix = detail ? ` Provider said: ${detail}` : "";
-  if (status === 400) return new ProviderError(`The provider rejected the request (HTTP 400)${detail ? "." : " and did not include details. Check the API key, model ID, and API base URL."}${suffix}`, status, "bad_request");
+  if (status === 400) {
+    // Do not suggest an API key here. A generic 400 is not evidence of a
+    // credential failure and used to be mislabeled as one in the client.
+    return new ProviderError(`The provider rejected the request (HTTP 400)${detail ? "." : " and did not include details. Check the model ID and API base URL, then try again."}${suffix}`, status, "bad_request");
+  }
   if (status === 401) return new ProviderError(`The provider rejected your API key (HTTP 401). Check the key in Settings.${suffix}`, status, "invalid_api_key");
   if (status === 402) return new ProviderError(`Your provider account has insufficient credits (HTTP 402).${suffix}`, status, "insufficient_credits");
   if (status === 403) return new ProviderError(`The provider denied access (HTTP 403). Your key may lack permission for this model.${suffix}`, status, "forbidden");
@@ -788,13 +868,20 @@ export async function withProviderRetry(operation, options = {}) {
 }
 
 function providerHttpError(url, status, payload, retryAfter = null, headers = null, context = {}) {
+  const classification = classifyProviderFailure({ status, payload });
   let error;
-  try {
-    if (isGoogleGeminiHost(new URL(url).hostname)) error = googleGeminiError(status, payload);
-  } catch {
-    /* fall through to the generic mapping */
+  if (classification.category === "context_limit") {
+    // Run the shared classification before provider-specific adapters so a
+    // credential or generic mapping can never replace a proven context limit.
+    error = new ProviderError(CONTEXT_LIMIT_MESSAGE, status, "context_limit");
+  } else {
+    try {
+      if (isGoogleGeminiHost(new URL(url).hostname)) error = googleGeminiError(status, payload);
+    } catch {
+      /* fall through to the generic mapping */
+    }
+    if (!error) error = describeProviderError(status, payload);
   }
-  if (!error) error = describeProviderError(status, payload);
   if (retryAfter !== null) error.retryAfter = retryAfter;
   return attachProviderDiagnostic(error, {
     url,
@@ -803,7 +890,8 @@ function providerHttpError(url, status, payload, retryAfter = null, headers = nu
     headers,
     retryAfter,
     retryAfterRaw: responseHeader(headers, "retry-after"),
-    context
+    context,
+    classification
   });
 }
 

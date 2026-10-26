@@ -19,6 +19,7 @@ const messageSchema = new mongoose.Schema({
   messageId: { type: String, maxlength: 80 },
   role: { type: String, enum: ["user", "assistant"], required: true },
   content: { type: String, default: "", maxlength: 100000 },
+  feedback: { type: String, enum: ["like", "dislike"], default: undefined },
   attachments: { type: [attachmentSchema], default: undefined },
   artifacts: { type: [artifactRefSchema], default: undefined },
   createdAt: { type: Date, default: Date.now }

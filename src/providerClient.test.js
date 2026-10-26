@@ -556,6 +556,78 @@ test("classifies provider 429s by structured quota, token, concurrency, and shar
   );
 });
 
+test("HTTP 400 context-window failures are classified as context limits, not credentials", () => {
+  const classified = classifyProviderFailure({
+    status: 400,
+    payload: {
+      error: {
+        code: "context_length_exceeded",
+        message: "This model's maximum context length is 8192 tokens. However, your messages resulted in 12000 tokens."
+      }
+    }
+  });
+  assert.equal(classified.category, "context_limit");
+
+  const withoutMessage = describeProviderError(400, { error: { code: "context_length_exceeded" } });
+  assert.equal(withoutMessage.code, "context_limit");
+  assert.equal(withoutMessage.status, 400);
+  assert.doesNotMatch(withoutMessage.message, /api key/i);
+
+  const generic = describeProviderError(400, {});
+  assert.equal(generic.code, "bad_request");
+  assert.doesNotMatch(generic.message, /api key/i);
+  assert.match(generic.message, /Check the model ID and API base URL/);
+});
+
+test("context-window evidence wins even when the provider wraps it in 401 or 403", () => {
+  const forbidden = {
+    error: {
+      message:
+        "This model's maximum context length is 131072 tokens. However, your messages resulted in 160000 tokens.",
+      code: "context_length_exceeded"
+    }
+  };
+  assert.equal(classifyProviderFailure({ status: 403, payload: forbidden }).category, "context_limit");
+  const described = describeProviderError(403, forbidden);
+  assert.equal(described.code, "context_limit");
+  assert.equal(described.status, 403);
+  assert.doesNotMatch(described.message, /denied access|api key|permission/i);
+  assert.match(described.message, /Continue in a new chat/);
+
+  const nested = {
+    error: {
+      error: {
+        message: "input length exceeds the context length",
+        code: "prompt_too_long"
+      }
+    }
+  };
+  assert.equal(classifyProviderFailure({ status: 401, payload: nested }).category, "context_limit");
+  assert.equal(describeProviderError(401, nested).code, "context_limit");
+
+  const diagnosticOnly = {
+    error: {
+      message: "The provider rejected the request.",
+      metadata: { provider_error_code: "context_length_exceeded" }
+    }
+  };
+  assert.equal(classifyProviderFailure({ status: 403, payload: diagnosticOnly }).category, "context_limit");
+});
+
+test("genuine credential and permission failures are never context limits", () => {
+  const denied = { error: { message: "Access denied for this model." } };
+  assert.equal(classifyProviderFailure({ status: 403, payload: denied }).category, "forbidden");
+  const described = describeProviderError(403, denied);
+  assert.equal(described.code, "forbidden");
+  assert.match(described.message, /denied access/i);
+
+  const invalidKey = { error: { message: "Invalid API key provided." } };
+  assert.equal(classifyProviderFailure({ status: 401, payload: invalidKey }).category, "invalid_credentials");
+  const keyError = describeProviderError(401, invalidKey);
+  assert.equal(keyError.code, "invalid_api_key");
+  assert.doesNotMatch(keyError.message, /Continue in a new chat/);
+});
+
 test("provider failure diagnostics expose safe classification and upstream metadata", () => {
   const diagnostic = buildProviderFailureDiagnostic({
     url: "https://openrouter.ai/api/v1/chat/completions?key=sk-query-secret",
