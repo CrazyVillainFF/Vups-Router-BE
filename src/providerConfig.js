@@ -25,7 +25,7 @@ const providerConfigSchema = new mongoose.Schema({
   provider: { type: String, required: true, trim: true, maxlength: 80 },
   providerType: {
     type: String,
-    enum: ["openai_compatible", "openai_responses", "anthropic_compatible", "azure_openai", "watsonx", "local_gateway", "native"],
+    enum: ["openai_compatible", "openai_responses", "anthropic_compatible", "azure_openai", "watsonx", "local_gateway", "native", "qoder_cloud_agents"],
     default: "openai_compatible"
   },
   baseUrl: { type: String, required: true, trim: true, maxlength: 500 },

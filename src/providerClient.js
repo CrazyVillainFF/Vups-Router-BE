@@ -1,4 +1,5 @@
 import dns from "node:dns/promises";
+import { createHash } from "node:crypto";
 import { imageSourceUrl } from "./chatImages.js";
 import { freeFromPricing, geminiCapabilities, normalizeCapabilities, visionFromCapabilities } from "./modelCapabilities.js";
 
@@ -30,7 +31,7 @@ const AGENTROUTER_HOSTS = new Set(["agentrouter.org", "www.agentrouter.org"]);
 const ANTHROPIC_HOSTS = new Set(["api.anthropic.com", "www.api.anthropic.com"]);
 const GOOGLE_GEMINI_HOSTS = new Set(["generativelanguage.googleapis.com"]);
 const OPENCODE_ZEN_HOSTS = new Set(["opencode.ai", "www.opencode.ai"]);
-const PROVIDER_TYPES = ["openai_compatible", "openai_responses", "anthropic_compatible", "azure_openai", "watsonx", "local_gateway", "native"];
+const PROVIDER_TYPES = ["openai_compatible", "openai_responses", "anthropic_compatible", "azure_openai", "watsonx", "local_gateway", "native", "qoder_cloud_agents"];
 const WATSONX_VERSION = "2024-10-08";
 const WATSONX_LISTING_VERSION = "2024-10-10";
 const WATSONX_IAM_URL = () => process.env.WATSONX_IAM_URL || "https://iam.cloud.ibm.com/identity/token";
@@ -221,13 +222,373 @@ function requireWatsonxProjectId(baseUrl) {
   return projectId;
 }
 
+// ─── Qoder Cloud Agents ──────────────────────────────────────────────────────
+// Qoder's public API is a session/event protocol, not chat completions:
+//   GET  /models                      enabled model IDs for the account
+//   GET  /environments                sandboxes; a session needs an env_ ID
+//   GET  /agents                      cursor-paged agents; a session needs agent_
+//   POST /sessions                    { agent, environment_id } -> sess_...
+//   GET  /sessions/{id}/events/stream  SSE
+//   POST /sessions/{id}/events         { events: [{ type: "user.message", ... }] }
+// Since 2026-08-24 the stream delivers only events created after the connection
+// and never replays history, so the stream is opened before the message is sent.
+// A reply arrives as incremental `event_delta` frames plus one authoritative
+// buffered `agent.message`; the turn ends with `session.status_idle`.
+const QODER_HOSTS = new Set(["api.qoder.com", "www.api.qoder.com"]);
+const QODER_ROLE_LABELS = { user: "User", assistant: "Assistant", system: "System" };
+// Keyed on the credential fingerprint so two users of the same public host
+// never share an environment or an agent.
+const qoderEnvironmentCache = new Map();
+const qoderAgentCache = new Map();
+
+function isQoderHost(hostname) {
+  return QODER_HOSTS.has(String(hostname || "").toLowerCase());
+}
+
+function qoderApiBase(baseUrl) {
+  const parsed = new URL(normalizeBaseUrl(baseUrl));
+  const path = parsed.pathname.replace(/\/+$/, "");
+  if (isQoderHost(parsed.hostname)) return `${parsed.origin}/api/v1/cloud`;
+  if (/\/api\/v\d+\/cloud$/i.test(path) || /\/cloud$/i.test(path)) return parsed.origin + path;
+  return parsed.origin + `${path}/api/v1/cloud`.replace(/\/{2,}/g, "/");
+}
+
+function qoderCacheKey(baseUrl, apiKey) {
+  const fingerprint = createHash("sha256").update(String(apiKey || "")).digest("hex").slice(0, 16);
+  return `${qoderApiBase(baseUrl)}|${fingerprint}`;
+}
+
+function qoderRemember(cache, key, value) {
+  if (cache.size > 200) cache.clear();
+  cache.set(key, value);
+  return value;
+}
+
+async function qoderRequest(url, { method = "GET", body, accept, headers }, signal, context = {}) {
+  let response;
+  try {
+    response = await guardedProviderFetch(url, {
+      method,
+      headers: accept ? { ...headers, Accept: accept } : headers,
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      signal: signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+    });
+  } catch (error) {
+    if (error?.name === "TimeoutError" || error?.name === "AbortError") {
+      throw attachProviderDiagnostic(
+        new ProviderError("Timed out while contacting Qoder Cloud Agents.", null, "timeout"),
+        { url, context, classification: { category: "timeout", classification: "transient", retryable: true } }
+      );
+    }
+    if (error instanceof ProviderError) throw error;
+    throw networkError(error, url, context);
+  }
+  if (!response.ok) {
+    throw providerHttpError(
+      url,
+      response.status,
+      await readJsonSafely(response),
+      parseRetryAfter(response.headers.get("retry-after")),
+      response.headers,
+      context
+    );
+  }
+  return response;
+}
+
+async function qoderListModels({ baseUrl, apiKey }, signal) {
+  const url = `${qoderApiBase(baseUrl)}/models`;
+  const response = await qoderRequest(url, { headers: await authHeaders(apiKey, "qoder_cloud_agents", baseUrl) }, signal);
+  const payload = await readJsonSafely(response);
+  const entries = Array.isArray(payload?.data) ? payload.data : [];
+  return entries
+    .filter(entry => entry?.is_enabled !== false)
+    .map(entry => {
+      const id = typeof entry?.id === "string" ? entry.id.trim() : "";
+      if (!id) return null;
+      const contextLength = Number.isFinite(entry?.max_input_tokens) ? entry.max_input_tokens : null;
+      const capabilities = { chat: true, streaming: true, ...(contextLength ? { contextLength } : {}) };
+      return {
+        id,
+        ownedBy: typeof entry?.display_name === "string" && entry.display_name ? `Qoder · ${entry.display_name}` : "Qoder Cloud Agents",
+        vision: visionFromCapabilities(capabilities),
+        capabilities,
+        contextLength,
+        maxOutputTokens: null
+      };
+    })
+    .filter(Boolean)
+    .slice(0, 1000);
+}
+
+// The API requires an existing environment. Use the account's first one and
+// only create the documented cloud default when the account has none.
+async function qoderEnvironmentId({ baseUrl, apiKey }, signal, context) {
+  const base = qoderApiBase(baseUrl);
+  const cacheKey = qoderCacheKey(baseUrl, apiKey);
+  if (qoderEnvironmentCache.has(cacheKey)) return qoderEnvironmentCache.get(cacheKey);
+  const headers = await authHeaders(apiKey, "qoder_cloud_agents", baseUrl);
+  const listed = await qoderRequest(`${base}/environments`, { headers }, signal, context);
+  const existing = (await readJsonSafely(listed))?.data?.[0];
+  if (existing?.id) return qoderRemember(qoderEnvironmentCache, cacheKey, existing.id);
+  const created = await qoderRequest(`${base}/environments`, {
+    method: "POST",
+    headers,
+    body: { name: "VupsRouter", config: { type: "cloud" } }
+  }, signal, context);
+  const id = (await readJsonSafely(created))?.id;
+  if (typeof id !== "string" || !id) {
+    throw new ProviderError("Qoder Cloud Agents created no environment. Create one in your Qoder console and try again.", 502, "qoder_no_environment");
+  }
+  return qoderRemember(qoderEnvironmentCache, cacheKey, id);
+}
+
+// An agent fixes the model, so one agent per (credential, model) is reused.
+async function qoderAgentId({ baseUrl, apiKey, model }, signal, context) {
+  const base = qoderApiBase(baseUrl);
+  const cacheKey = `${qoderCacheKey(baseUrl, apiKey)}|${model}`;
+  if (qoderAgentCache.has(cacheKey)) return qoderAgentCache.get(cacheKey);
+  const headers = await authHeaders(apiKey, "qoder_cloud_agents", baseUrl);
+  let page = "";
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const listed = await qoderRequest(
+      `${base}/agents?limit=100${page ? `&page=${encodeURIComponent(page)}` : ""}`,
+      { headers },
+      signal,
+      context
+    );
+    const payload = await readJsonSafely(listed);
+    const match = (Array.isArray(payload?.data) ? payload.data : [])
+      .find(agent => agent?.archived_at === null && (agent?.model === model || agent?.model?.id === model));
+    if (match?.id) return qoderRemember(qoderAgentCache, cacheKey, match.id);
+    if (!payload?.has_more || !payload?.next_page) break;
+    page = payload.next_page;
+  }
+  const created = await qoderRequest(`${base}/agents`, {
+    method: "POST",
+    headers,
+    body: { name: `VupsRouter ${model}`, model, system: "You are a helpful assistant." }
+  }, signal, context);
+  const id = (await readJsonSafely(created))?.id;
+  if (typeof id !== "string" || !id) {
+    throw new ProviderError("Qoder Cloud Agents created no agent for this model. Choose another model or create the agent in your Qoder console.", 502, "qoder_no_agent");
+  }
+  return qoderRemember(qoderAgentCache, cacheKey, id);
+}
+
+// Qoder accepts one batch of events per turn and has no chat-style history, so
+// the conversation is flattened into labelled text blocks in a single
+// user.message. Images use Qoder's documented base64/url source blocks.
+export function qoderEventContent(messages = []) {
+  const blocks = [];
+  for (const message of messages) {
+    const label = QODER_ROLE_LABELS[message?.role] || "User";
+    const text = typeof message?.content === "string"
+      ? message.content
+      : Array.isArray(message?.content)
+        ? message.content.filter(part => part?.type === "text").map(part => part?.text || "").join("\n")
+        : "";
+    if (text.trim()) blocks.push({ type: "text", text: `[${label}]\n${text.trim()}` });
+    for (const image of Array.isArray(message?.images) ? message.images : []) {
+      if (typeof image?.url === "string" && image.url) {
+        blocks.push({ type: "image", source: { type: "url", url: image.url } });
+      } else if (typeof image?.data === "string" && image.data) {
+        blocks.push({ type: "image", source: { type: "base64", media_type: image.mimeType, data: image.data } });
+      }
+    }
+  }
+  return blocks;
+}
+
+async function qoderStartStream({ baseUrl, apiKey, model, messages, requestId = null, attempt = null }, signal) {
+  const base = qoderApiBase(baseUrl);
+  const context = { requestId, attempt, model };
+  const headers = await authHeaders(apiKey, "qoder_cloud_agents", baseUrl);
+  const [environmentId, agentId] = await Promise.all([
+    qoderEnvironmentId({ baseUrl, apiKey }, signal, context),
+    qoderAgentId({ baseUrl, apiKey, model }, signal, context)
+  ]);
+  const sessionResponse = await qoderRequest(`${base}/sessions`, {
+    method: "POST",
+    headers,
+    body: { agent: agentId, environment_id: environmentId, title: "VupsRouter" }
+  }, signal, context);
+  const sessionId = (await readJsonSafely(sessionResponse))?.id;
+  if (typeof sessionId !== "string" || !sessionId.startsWith("sess_")) {
+    throw new ProviderError("Qoder Cloud Agents returned a session without an ID.", 502, "qoder_no_session");
+  }
+  const streamUrl = new URL(`${base}/sessions/${sessionId}/events/stream`);
+  streamUrl.searchParams.append("event_deltas[]", "agent.message");
+  const stream = await qoderRequest(
+    streamUrl.toString(),
+    { headers, accept: "text/event-stream" },
+    signal ?? AbortSignal.timeout(STREAM_TIMEOUT_MS),
+    context
+  );
+  if (!stream.body) {
+    throw attachProviderDiagnostic(
+      new ProviderError("Qoder Cloud Agents did not return an event stream.", stream.status, "empty_stream"),
+      { url: streamUrl.toString(), status: stream.status, context, headers: stream.headers, classification: { category: "empty_stream", classification: "permanent", retryable: false } }
+    );
+  }
+  // Executing only after the stream is attached is what makes the first deltas
+  // of this turn observable; Qoder does not replay earlier events.
+  await qoderRequest(`${base}/sessions/${sessionId}/events`, {
+    method: "POST",
+    headers,
+    body: { events: [{ type: "user.message", content: qoderEventContent(messages) }] }
+  }, signal, context);
+  const response = new Response(qoderSSEToChatStream(stream.body), {
+    status: 200,
+    headers: { "content-type": "text/event-stream" }
+  });
+  Object.defineProperty(response, "url", { value: streamUrl.toString(), configurable: true });
+  return response;
+}
+
+function qoderSSEToChatStream(sourceBody) {
+  const reader = sourceBody.getReader();
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  const streamedByEvent = new Map();
+  const deltaOnlyEvents = new Set();
+  let buffer = "";
+
+  return new ReadableStream({
+    async start(controller) {
+      let closed = false;
+      const push = data => controller.enqueue(encoder.encode(`data: ${data}\n\n`));
+      const sendText = text => push(JSON.stringify({ choices: [{ delta: { content: text } }] }));
+      const finish = () => {
+        if (closed) return;
+        closed = true;
+        push(JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] }));
+        push("[DONE]");
+        controller.close();
+      };
+      const handleFrame = frame => {
+        let eventName = "";
+        let data = "";
+        for (const line of frame.split("\n")) {
+          if (line.startsWith(":")) continue;
+          if (line.startsWith("event:")) eventName = line.slice(6).trim();
+          else if (line.startsWith("data:")) data += (data ? "\n" : "") + line.slice(5).trim();
+        }
+        if (!data) {
+          // ": heartbeat" keeps the connection open; forward an empty chunk so
+          // the chat route's stream-idle watchdog does not fire mid-turn.
+          push(JSON.stringify({ choices: [{ delta: {} }] }));
+          return;
+        }
+        let payload;
+        try {
+          payload = JSON.parse(data);
+        } catch {
+          return;
+        }
+        const type = typeof payload?.type === "string" ? payload.type : eventName;
+        if (type === "event_start") {
+          const id = String(payload?.event?.id || "");
+          if (id && payload?.event?.type !== "agent.message") deltaOnlyEvents.add(id);
+          return;
+        }
+        if (type === "event_delta") {
+          const id = String(payload?.event_id || "");
+          if (deltaOnlyEvents.has(id)) return;
+          const text = payload?.delta?.type === "content_delta" ? payload.delta.content?.text : "";
+          if (typeof text !== "string" || !text) return;
+          streamedByEvent.set(id, (streamedByEvent.get(id) || "") + text);
+          sendText(text);
+          return;
+        }
+        if (type === "agent.message") {
+          const id = String(payload?.id || "");
+          const full = (Array.isArray(payload?.content) ? payload.content : [])
+            .filter(block => block?.type === "text" && typeof block.text === "string")
+            .map(block => block.text)
+            .join("");
+          if (full) {
+            const already = streamedByEvent.get(id) || "";
+            const rest = full.startsWith(already) ? full.slice(already.length) : "";
+            if (rest) sendText(rest);
+            streamedByEvent.set(id, full);
+          }
+          return;
+        }
+        if (type === "session.status_idle" || type === "session.status_terminated" || type === "session.deleted") finish();
+      };
+
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          let boundary = buffer.indexOf("\n\n");
+          while (boundary !== -1) {
+            const frame = buffer.slice(0, boundary);
+            buffer = buffer.slice(boundary + 2);
+            handleFrame(frame);
+            if (closed) {
+              reader.cancel().catch(() => {});
+              return;
+            }
+            boundary = buffer.indexOf("\n\n");
+          }
+        }
+        if (buffer.trim()) handleFrame(buffer);
+        finish();
+      } catch (error) {
+        if (!closed) {
+          closed = true;
+          controller.error(error);
+        }
+      }
+    },
+    cancel(reason) {
+      reader.cancel(reason).catch(() => {});
+    }
+  });
+}
+
+async function qoderCompletion(params, signal) {
+  const response = await qoderStartStream(params, signal);
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let pending = "";
+  let content = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    pending += decoder.decode(value, { stream: true });
+    const lines = pending.split("\n");
+    pending = lines.pop() ?? "";
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data:")) continue;
+      const raw = trimmed.slice(5).trim();
+      if (!raw || raw === "[DONE]") continue;
+      try {
+        content += extractStreamText(JSON.parse(raw));
+      } catch {
+        continue;
+      }
+    }
+  }
+  if (!content) {
+    throw new ProviderError("Qoder Cloud Agents returned an empty response.", null, "empty_response");
+  }
+  return { content, finishReason: "stop" };
+}
+
+// ─── end Qoder helpers ──────────────────────────────────────────────────────
+
 // OpenAI Responses can be selected explicitly, or inferred for AgentRouter's
 // GPT models. Anthropic and every other provider use their own endpoint.
 export function usesResponsesApi(baseUrl, model, providerType = "openai_compatible") {
   if (isOpenCodeZenBase(baseUrl)) return opencodeZenProtocol(model) === "responses";
   const type = normalizeProviderType(providerType);
   if (type === "openai_responses") return true;
-  if (type === "anthropic_compatible" || type === "azure_openai" || type === "watsonx") return false;
+  if (type === "anthropic_compatible" || type === "azure_openai" || type === "watsonx" || type === "qoder_cloud_agents") return false;
   const normalized = normalizeBaseUrl(baseUrl);
   let host;
   try {
@@ -243,6 +604,9 @@ export function resolveChatEndpoint(baseUrl, model, providerType = "openai_compa
   const type = normalizeProviderType(providerType);
   if (type === "anthropic_compatible") return `${anthropicBaseUrl(baseUrl)}/messages`;
   if (type === "watsonx") return `${watsonxBaseUrl(baseUrl)}/text/chat${stream ? "_stream" : ""}?version=${WATSONX_VERSION}`;
+  // Qoder has no completions endpoint; a turn is created as a session and the
+  // reply is read from that session's event stream.
+  if (type === "qoder_cloud_agents") return `${qoderApiBase(baseUrl)}/sessions`;
   const normalized = normalizeBaseUrl(baseUrl);
   return `${normalized}${usesResponsesApi(normalized, model, type) ? "/responses" : "/chat/completions"}`;
 }
@@ -1033,6 +1397,7 @@ async function authHeaders(apiKey, providerType = "openai_compatible", baseUrl =
 
 export async function listProviderModels({ baseUrl, apiKey, providerType = "openai_compatible" }, signal) {
   const type = normalizeProviderType(providerType);
+  if (type === "qoder_cloud_agents") return qoderListModels({ baseUrl, apiKey }, signal);
   const zen = isOpenCodeZenBase(baseUrl);
   const google = isGoogleGeminiBase(baseUrl);
   let url;
@@ -1284,6 +1649,9 @@ function responsesFinishReason(payload) {
 
 export async function chatCompletion({ baseUrl, apiKey, model, messages, temperature, maxTokens, providerType = "openai_compatible", reasoning, requestId = null, attempt = null }, signal) {
   const type = normalizeProviderType(providerType);
+  if (type === "qoder_cloud_agents") {
+    return qoderCompletion({ baseUrl, apiKey, model, messages, requestId, attempt }, signal);
+  }
   const anthropic = usesAnthropicApi(baseUrl, model, type);
   const watsonx = !isOpenCodeZenBase(baseUrl) && type === "watsonx";
   const responses = !anthropic && !watsonx && usesResponsesApi(baseUrl, model, type);
@@ -1347,11 +1715,6 @@ export async function startChatCompletionStream({ baseUrl, apiKey, model, messag
   const responses = !anthropic && !watsonx && usesResponsesApi(baseUrl, model, type);
   const url = resolveChatEndpoint(baseUrl, model, type, { stream: true });
   const context = { requestId, attempt, model };
-  const body = anthropic
-    ? buildAnthropicRequestBody({ model, messages, temperature, maxTokens, stream: true })
-    : watsonx
-      ? buildWatsonxRequestBody({ model, messages, temperature, maxTokens, stream: true, projectId: requireWatsonxProjectId(baseUrl) })
-      : buildChatRequestBody({ model, messages, temperature, maxTokens, stream: true, responses, reasoning });
 
   let responseTimer = null;
   let responseTimedOut = false;
@@ -1365,6 +1728,31 @@ export async function startChatCompletionStream({ baseUrl, apiKey, model, messag
     responseTimer.unref?.();
     requestSignal = signal ? AbortSignal.any([signal, timeoutController.signal]) : timeoutController.signal;
   }
+
+  if (type === "qoder_cloud_agents") {
+    try {
+      return await qoderStartStream(
+        { baseUrl, apiKey, model, messages, requestId, attempt },
+        requestSignal ?? AbortSignal.timeout(STREAM_TIMEOUT_MS)
+      );
+    } catch (error) {
+      if (responseTimedOut) {
+        throw attachProviderDiagnostic(
+          new ProviderError("Timed out while waiting for Qoder to start its event stream.", null, "timeout"),
+          { url, context, classification: { category: "timeout", classification: "transient", retryable: true } }
+        );
+      }
+      throw error;
+    } finally {
+      if (responseTimer) clearTimeout(responseTimer);
+    }
+  }
+
+  const body = anthropic
+    ? buildAnthropicRequestBody({ model, messages, temperature, maxTokens, stream: true })
+    : watsonx
+      ? buildWatsonxRequestBody({ model, messages, temperature, maxTokens, stream: true, projectId: requireWatsonxProjectId(baseUrl) })
+      : buildChatRequestBody({ model, messages, temperature, maxTokens, stream: true, responses, reasoning });
 
   let response;
   try {
