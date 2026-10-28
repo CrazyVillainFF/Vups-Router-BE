@@ -9,8 +9,31 @@ const router = Router();
 
 const MAX_HANDOFF_CHARS = 20000;
 const MAX_TITLE_CHARS = 60;
+const MAX_SEARCH_CHARS = 100;
 
 router.use(requireAuth);
+
+function normalizedTitle(value) {
+  return typeof value === "string" ? value.replace(/\s+/g, " ").trim().slice(0, MAX_TITLE_CHARS) : "";
+}
+
+function escapedRegex(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function conversationSnippet(conversation, query) {
+  const needle = query.toLowerCase();
+  const message = conversation.messages?.find(
+    item => typeof item.content === "string" && item.content.toLowerCase().includes(needle)
+  );
+  if (!message) return "";
+  const compact = message.content.replace(/\s+/g, " ").trim();
+  const index = compact.toLowerCase().indexOf(needle);
+  if (index < 0) return compact.slice(0, 160);
+  const start = Math.max(0, index - 48);
+  const end = Math.min(compact.length, index + needle.length + 96);
+  return `${start > 0 ? "..." : ""}${compact.slice(start, end)}${end < compact.length ? "..." : ""}`;
+}
 
 function serializeMessage(message) {
   return {
@@ -74,8 +97,21 @@ router.post("/", async (req, res, next) => {
 
 router.get("/", async (req, res, next) => {
   try {
+    const query = typeof req.query.q === "string" ? req.query.q.replace(/\s+/g, " ").trim() : "";
+    if (query.length > MAX_SEARCH_CHARS) {
+      return res.status(400).json({ message: `Search terms must be ${MAX_SEARCH_CHARS} characters or fewer.` });
+    }
     await connectToDatabase();
-    const conversations = await Conversation.find({ userId: req.userId })
+    const filter = query
+      ? {
+          userId: req.userId,
+          $or: [
+            { title: { $regex: escapedRegex(query), $options: "i" } },
+            { "messages.content": { $regex: escapedRegex(query), $options: "i" } }
+          ]
+        }
+      : { userId: req.userId };
+    const conversations = await Conversation.find(filter)
       .select("title createdAt updatedAt messages")
       .sort({ updatedAt: -1 })
       .limit(50)
@@ -86,8 +122,37 @@ router.get("/", async (req, res, next) => {
         title: conversation.title,
         messageCount: conversation.messages?.length ?? 0,
         createdAt: conversation.createdAt,
-        updatedAt: conversation.updatedAt
+        updatedAt: conversation.updatedAt,
+        ...(query ? { match: conversationSnippet(conversation, query) } : {})
       }))
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.patch("/:id", async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(400).json({ message: "Invalid conversation ID." });
+    }
+    const title = normalizedTitle(req.body?.title);
+    if (!title) return res.status(400).json({ message: "Enter a task title." });
+    await connectToDatabase();
+    const conversation = await Conversation.findOneAndUpdate(
+      { _id: req.params.id, userId: req.userId },
+      { $set: { title } },
+      { returnDocument: "after", projection: "title createdAt updatedAt messages" }
+    ).lean();
+    if (!conversation) return res.status(404).json({ message: "Conversation not found." });
+    return res.json({
+      conversation: {
+        id: String(conversation._id),
+        title: conversation.title,
+        messageCount: conversation.messages?.length ?? 0,
+        createdAt: conversation.createdAt,
+        updatedAt: conversation.updatedAt
+      }
     });
   } catch (error) {
     return next(error);

@@ -31,6 +31,7 @@ const AGENTROUTER_HOSTS = new Set(["agentrouter.org", "www.agentrouter.org"]);
 const ANTHROPIC_HOSTS = new Set(["api.anthropic.com", "www.api.anthropic.com"]);
 const GOOGLE_GEMINI_HOSTS = new Set(["generativelanguage.googleapis.com"]);
 const OPENCODE_ZEN_HOSTS = new Set(["opencode.ai", "www.opencode.ai"]);
+const OPENROUTER_HOSTS = new Set(["openrouter.ai", "www.openrouter.ai"]);
 const PROVIDER_TYPES = ["openai_compatible", "openai_responses", "anthropic_compatible", "azure_openai", "watsonx", "local_gateway", "native", "qoder_cloud_agents"];
 const WATSONX_VERSION = "2024-10-08";
 const WATSONX_LISTING_VERSION = "2024-10-10";
@@ -73,6 +74,17 @@ export function isGoogleGeminiHost(hostname) {
 export function isGoogleGeminiBase(value) {
   try {
     return isGoogleGeminiHost(new URL(String(value ?? "").trim()).hostname);
+  } catch {
+    return false;
+  }
+}
+
+// OpenRouter extends the OpenAI chat schema with two behaviours VupsRouter has
+// to ask for explicitly: a final usage chunk on streams, and reasoning text
+// delivered beside (not inside) delta.content.
+export function isOpenRouterBase(value) {
+  try {
+    return OPENROUTER_HOSTS.has(new URL(String(value ?? "").trim()).hostname.toLowerCase());
   } catch {
     return false;
   }
@@ -584,6 +596,16 @@ async function qoderCompletion(params, signal) {
 
 // OpenAI Responses can be selected explicitly, or inferred for AgentRouter's
 // GPT models. Anthropic and every other provider use their own endpoint.
+export function providerSupportsToolCalling(provider, model) {
+  const type = normalizeProviderType(provider?.providerType);
+  if (type === "anthropic_compatible" || type === "watsonx" || type === "qoder_cloud_agents") return false;
+  try {
+    return !usesResponsesApi(provider?.baseUrl, model, type);
+  } catch {
+    return false;
+  }
+}
+
 export function usesResponsesApi(baseUrl, model, providerType = "openai_compatible") {
   if (isOpenCodeZenBase(baseUrl)) return opencodeZenProtocol(model) === "responses";
   const type = normalizeProviderType(providerType);
@@ -1518,6 +1540,20 @@ export async function listProviderModels({ baseUrl, apiKey, providerType = "open
 // everything else is passed through untouched.
 export function serializeMessages(messages) {
   return messages.map(message => {
+    if (message.role === "tool") {
+      return {
+        role: "tool",
+        tool_call_id: message.tool_call_id,
+        content: message.content
+      };
+    }
+    if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+      return {
+        role: message.role,
+        content: message.content ?? null,
+        tool_calls: message.tool_calls
+      };
+    }
     const images = Array.isArray(message?.images) ? message.images : [];
     if (images.length === 0) return { role: message.role, content: message.content };
     const parts = [];
@@ -1604,7 +1640,7 @@ function anthropicFinishReason(payload) {
   return typeof reason === "string" ? reason : null;
 }
 
-export function buildChatRequestBody({ model, messages, temperature, maxTokens, stream, responses = false, reasoning }) {
+export function buildChatRequestBody({ model, messages, temperature, maxTokens, stream, responses = false, reasoning, tools = null, toolChoice = null, streamUsage = false }) {
   if (responses) {
     const instructions = messages
       .filter(message => message.role === "system" && typeof message.content === "string")
@@ -1621,6 +1657,9 @@ export function buildChatRequestBody({ model, messages, temperature, maxTokens, 
   if (typeof temperature === "number" && Number.isFinite(temperature)) body.temperature = temperature;
   if (typeof maxTokens === "number" && Number.isFinite(maxTokens)) body.max_tokens = maxTokens;
   if (reasoning && typeof reasoning === "object") body.reasoning = reasoning;
+  if (Array.isArray(tools) && tools.length > 0) body.tools = tools;
+  if (toolChoice && body.tools) body.tool_choice = toolChoice;
+  if (stream && streamUsage) body.usage = { include: true };
   return body;
 }
 
@@ -1647,7 +1686,7 @@ function responsesFinishReason(payload) {
   return payload?.status === "completed" ? "stop" : null;
 }
 
-export async function chatCompletion({ baseUrl, apiKey, model, messages, temperature, maxTokens, providerType = "openai_compatible", reasoning, requestId = null, attempt = null }, signal) {
+export async function chatCompletion({ baseUrl, apiKey, model, messages, temperature, maxTokens, providerType = "openai_compatible", reasoning, requestId = null, attempt = null, tools = null, toolChoice = null }, signal) {
   const type = normalizeProviderType(providerType);
   if (type === "qoder_cloud_agents") {
     return qoderCompletion({ baseUrl, apiKey, model, messages, requestId, attempt }, signal);
@@ -1661,7 +1700,7 @@ export async function chatCompletion({ baseUrl, apiKey, model, messages, tempera
     ? buildAnthropicRequestBody({ model, messages, temperature, maxTokens, stream: false })
     : watsonx
       ? buildWatsonxRequestBody({ model, messages, temperature, maxTokens, stream: false, projectId: requireWatsonxProjectId(baseUrl) })
-      : buildChatRequestBody({ model, messages, temperature, maxTokens, stream: false, responses, reasoning });
+      : buildChatRequestBody({ model, messages, temperature, maxTokens, stream: false, responses, reasoning, tools, toolChoice });
 
   let response;
   try {
@@ -1694,7 +1733,35 @@ export async function chatCompletion({ baseUrl, apiKey, model, messages, tempera
   }
   const payload = await readJsonSafely(response);
   const content = anthropic ? extractAnthropicText(payload) : extractResponseText(payload);
-  if (content.length === 0) {
+  const rawToolCalls = !anthropic && !responses && Array.isArray(payload?.choices?.[0]?.message?.tool_calls)
+    ? payload.choices[0].message.tool_calls
+    : [];
+  const toolCalls = rawToolCalls
+    .filter(call => call?.type === "function" && call?.function?.name)
+    .map(call => ({
+      id: typeof call.id === "string" ? call.id : "",
+      type: "function",
+      function: {
+        name: String(call.function.name),
+        arguments: typeof call.function.arguments === "string" ? call.function.arguments : "{}"
+      }
+    }));
+  if (content.length === 0 && toolCalls.length === 0) {
+    const message = payload?.choices?.[0]?.message;
+    const reasoned =
+      Number(payload?.usage?.completion_tokens_details?.reasoning_tokens) > 0 ||
+      (typeof message?.reasoning === "string" && message.reasoning.length > 0) ||
+      (Array.isArray(message?.reasoning_details) && message.reasoning_details.length > 0);
+    if (reasoned && payload?.choices?.[0]?.finish_reason === "length") {
+      throw attachProviderDiagnostic(
+        new ProviderError(
+          "The model spent its whole output budget on reasoning before writing an answer. Raise the maximum output tokens, or choose a model that reasons less.",
+          response.status,
+          "output_limit"
+        ),
+        { url, status: response.status, context, headers: response.headers, classification: { category: "output_limit", classification: "permanent", retryable: false } }
+      );
+    }
     throw attachProviderDiagnostic(
       new ProviderError("The provider returned an empty or unexpected response.", response.status, "empty_response"),
       { url, status: response.status, context, headers: response.headers, classification: { category: "empty_response", classification: "permanent", retryable: false } }
@@ -1704,7 +1771,15 @@ export async function chatCompletion({ baseUrl, apiKey, model, messages, tempera
     content,
     finishReason: anthropic
       ? anthropicFinishReason(payload)
-      : responses ? responsesFinishReason(payload) : (typeof payload?.choices?.[0]?.finish_reason === "string" ? payload.choices[0].finish_reason : null)
+      : responses ? responsesFinishReason(payload) : (typeof payload?.choices?.[0]?.finish_reason === "string" ? payload.choices[0].finish_reason : null),
+    ...(toolCalls.length > 0 ? {
+      toolCalls,
+      assistantMessage: {
+        role: "assistant",
+        content: content || null,
+        tool_calls: rawToolCalls
+      }
+    } : {})
   };
 }
 
@@ -1752,7 +1827,7 @@ export async function startChatCompletionStream({ baseUrl, apiKey, model, messag
     ? buildAnthropicRequestBody({ model, messages, temperature, maxTokens, stream: true })
     : watsonx
       ? buildWatsonxRequestBody({ model, messages, temperature, maxTokens, stream: true, projectId: requireWatsonxProjectId(baseUrl) })
-      : buildChatRequestBody({ model, messages, temperature, maxTokens, stream: true, responses, reasoning });
+      : buildChatRequestBody({ model, messages, temperature, maxTokens, stream: true, responses, reasoning, streamUsage: isOpenRouterBase(baseUrl) });
 
   let response;
   try {
@@ -1815,6 +1890,25 @@ export function extractStreamText(payload) {
       .join("");
   }
   return "";
+}
+
+// Reasoning travels beside the answer, never inside it: OpenRouter sends it as
+// delta.reasoning and delta.reasoning_details (same increment twice), Anthropic
+// as a thinking content block.
+export function extractStreamReasoning(payload) {
+  if (payload?.type === "content_block_delta" && payload?.delta?.type === "thinking") {
+    return typeof payload.delta.thinking === "string" ? payload.delta.thinking : "";
+  }
+  const delta = payload?.choices?.[0]?.delta;
+  if (!delta || typeof delta !== "object") return "";
+  if (Array.isArray(delta.reasoning_details)) {
+    const structured = delta.reasoning_details
+      .filter(part => part?.type === "reasoning.text" && typeof part.text === "string")
+      .map(part => part.text)
+      .join("");
+    if (structured) return structured;
+  }
+  return typeof delta.reasoning === "string" ? delta.reasoning : "";
 }
 
 const UNSUPPORTED_LISTING_CODES = new Set(["not_found", "method_not_allowed", "unsupported_listing", "bad_request"]);

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { after, beforeEach, test } from "node:test";
 
-const { checkOpenRouter, checkOpenRouterKey, openRouterModelIsChat, openRouterModelIsFree, resetOpenRouterCache } = await import("./openrouter.js");
+const { checkOpenRouter, checkOpenRouterKey, openRouterModelIsChat, openRouterModelIsFree, openRouterProviderForChat, resetOpenRouterCache } = await import("./openrouter.js");
 
 const FREE_ALPHA = {
   id: "free/alpha:free",
@@ -229,4 +229,12 @@ test("a rejected server key is reported as unauthorized instead of serving stale
   const result = await checkOpenRouter({ forceRefresh: true });
   assert.equal(result.status, "unauthorized");
   assert.equal(result.available, false);
+});
+
+test("the shared OpenRouter provider leaves reasoning at each model's default", () => {
+  setEnv();
+  const provider = openRouterProviderForChat();
+  assert.equal(provider.provider, "OpenRouter");
+  assert.equal(provider.defaultModel, FREE_ALPHA.id);
+  assert.equal("reasoning" in provider, false, "disabling reasoning makes mandatory-reasoning models answer HTTP 400");
 });

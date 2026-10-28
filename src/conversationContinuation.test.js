@@ -198,3 +198,69 @@ test("the first model request in the new chat receives the persisted handoff", a
   assert.equal(stored.body.conversation.messages[0].content, HANDOFF);
   assert.equal(stored.body.conversation.messages.at(-1).role, "assistant");
 });
+
+test("task history can be renamed and searched by title or conversation content", async () => {
+  const cookie = await signupUser();
+  const first = await api("/api/conversations", {
+    method: "POST",
+    cookie,
+    body: { handoff: HANDOFF, title: "Invoice export" }
+  });
+  const second = await api("/api/conversations", {
+    method: "POST",
+    cookie,
+    body: { handoff: "Research a compact release checklist.", title: "Release checklist" }
+  });
+  assert.equal(first.status, 201);
+  assert.equal(second.status, 201);
+
+  const renamed = await api(`/api/conversations/${second.body.conversation.id}`, {
+    method: "PATCH",
+    cookie,
+    body: { title: "  Launch   checklist  " }
+  });
+  assert.equal(renamed.status, 200);
+  assert.equal(renamed.body.conversation.title, "Launch checklist");
+  assert.equal(renamed.body.conversation.messageCount, 1);
+
+  const byTitle = await api(`/api/conversations?q=${encodeURIComponent("launch")}`, { cookie });
+  assert.equal(byTitle.status, 200);
+  assert.deepEqual(byTitle.body.conversations.map(item => item.id), [second.body.conversation.id]);
+
+  const byContent = await api(`/api/conversations?q=${encodeURIComponent("invoice csv")}`, { cookie });
+  assert.equal(byContent.status, 200);
+  assert.equal(byContent.body.conversations[0].id, first.body.conversation.id);
+  assert.match(byContent.body.conversations[0].match, /Invoice CSV export/i);
+
+  const escaped = await api(`/api/conversations?q=${encodeURIComponent(".*")}`, { cookie });
+  assert.equal(escaped.status, 200);
+  assert.equal(escaped.body.conversations.length, 0);
+
+  const otherCookie = await signupUser();
+  const denied = await api(`/api/conversations/${first.body.conversation.id}`, {
+    method: "PATCH",
+    cookie: otherCookie,
+    body: { title: "Not mine" }
+  });
+  assert.equal(denied.status, 404);
+
+  const invalid = await api(`/api/conversations/${first.body.conversation.id}`, {
+    method: "PATCH",
+    cookie,
+    body: { title: "   " }
+  });
+  assert.equal(invalid.status, 400);
+});
+
+test("signed-in users can read their real daily request usage", async () => {
+  const cookie = await signupUser();
+  const usage = await api("/api/auth/usage", { cookie });
+  assert.equal(usage.status, 200);
+  assert.equal(usage.body.usage.dailyUsed, 0);
+  assert.ok(usage.body.usage.dailyQuota > 0);
+  assert.equal(usage.body.usage.remaining, usage.body.usage.dailyQuota);
+  assert.match(usage.body.usage.resetAt, /T00:00:00.000Z$/);
+
+  const anonymous = await api("/api/auth/usage");
+  assert.equal(anonymous.status, 401);
+});

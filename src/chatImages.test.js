@@ -416,7 +416,7 @@ test("Vups v3 Galax keeps text on the text model and routes images to the vision
       });
       assert.equal(text.status, 200);
       assert.equal(lastChatRequest().body.model, "fake-model-pro");
-      assert.deepEqual(lastChatRequest().body.reasoning, { enabled: false });
+      assert.equal("reasoning" in lastChatRequest().body, false, "OpenRouter must not be told to disable reasoning");
 
       const image = await vupsChat(user.cookie, {
         stream: false,
@@ -426,7 +426,7 @@ test("Vups v3 Galax keeps text on the text model and routes images to the vision
       assert.equal(image.status, 200);
       const upstream = lastChatRequest();
       assert.equal(upstream.body.model, "fake-model-mini", "image requests must use the vision model");
-      assert.deepEqual(upstream.body.reasoning, { enabled: false });
+      assert.equal("reasoning" in upstream.body, false, "OpenRouter must not be told to disable reasoning");
       const sent = upstream.body.messages.at(-1);
       assert.ok(Array.isArray(sent.content));
       assert.equal(sent.content[1].image_url.url, `data:image/png;base64,${PNG_DATA}`);
@@ -475,7 +475,7 @@ test("Vups streaming image requests use the configured vision model", async () =
 
       const upstream = lastChatRequest();
       assert.equal(upstream.body.model, "fake-model-mini");
-      assert.deepEqual(upstream.body.reasoning, { enabled: false });
+      assert.equal("reasoning" in upstream.body, false, "a streamed image request must not disable reasoning");
       const sent = upstream.body.messages.at(-1);
       assert.ok(Array.isArray(sent.content));
       assert.equal(sent.content[1].image_url.url, `data:image/png;base64,${PNG_DATA}`);

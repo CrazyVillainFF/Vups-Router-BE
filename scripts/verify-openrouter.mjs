@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { checkOpenRouter, openRouterBaseUrl } from "../src/openrouter.js";
+import { extractStreamReasoning, extractStreamText, startChatCompletionStream, withProviderRetry } from "../src/providerClient.js";
 
 const key = (process.env.OPENROUTER_API_KEY || "").trim();
 const base = openRouterBaseUrl();
@@ -35,7 +36,7 @@ try {
     fail(`key check failed with HTTP ${keyResponse.status}${keyPayload?.error?.message ? `: ${keyPayload.error.message}` : ""}`);
   } else {
     const data = keyPayload?.data || {};
-    console.log(`[ok] API key accepted (label: ${data.label || "n/a"}, usage: ${data.usage ?? "n/a"}, limit: ${data.limit ?? "n/a"}, is_free_tier: ${data.is_free_tier ?? "n/a"})`);
+    console.log(`[ok] API key accepted (usage: ${data.usage ?? "n/a"}, limit: ${data.limit ?? "n/a"}, is_free_tier: ${data.is_free_tier ?? "n/a"})`);
   }
 } catch (error) {
   fail(`key check could not be completed: ${error.message}`);
@@ -96,6 +97,88 @@ for (const id of targets) {
     else fail(`chat probe for "${id}" failed: ${result.reason}`);
   } catch (error) {
     fail(`chat probe for "${id}" could not be completed: ${error.message}`);
+  }
+}
+
+async function probeStream(id) {
+  // Same retry policy the chat route now applies, so this reports what a user
+  // would actually experience rather than a single unlucky upstream slot.
+  const response = await withProviderRetry(
+    () => startChatCompletionStream(
+      {
+        baseUrl: base,
+        apiKey: key,
+        model: id,
+        messages: [{ role: "user", content: "Reply with the single word OK." }],
+        maxTokens: 1024
+      },
+      AbortSignal.timeout(120000)
+    ),
+    { maxRetries: 2, baseDelayMs: 2000, maxDelayMs: 15000 }
+  );
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let content = "";
+  let reasoningChars = 0;
+  let usage = null;
+  let finish = null;
+  let sawDone = false;
+
+  function handleLine(line) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("data:")) return;
+    const raw = trimmed.slice(5).trim();
+    if (!raw) return;
+    if (raw === "[DONE]") {
+      sawDone = true;
+      return;
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return;
+    }
+    const choice = parsed?.choices?.[0];
+    if (typeof choice?.finish_reason === "string" && choice.finish_reason) finish = choice.finish_reason;
+    if (parsed?.usage && typeof parsed.usage === "object") usage = parsed.usage;
+    reasoningChars += extractStreamReasoning(parsed).length;
+    content += extractStreamText(parsed);
+  }
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+    for (const line of lines) handleLine(line);
+  }
+  handleLine(buffer);
+
+  const detail =
+    `answer ${content.length} chars, reasoning ${reasoningChars} chars, finish_reason: ${finish ?? "none"}, ` +
+    `terminal: ${sawDone ? "[DONE]" : "missing"}, usage: ${usage ? JSON.stringify(usage) : "none"}`;
+  if (content.trim().length === 0) return { ok: false, reason: `stream produced no answer text (${detail})` };
+  if (!sawDone) return { ok: false, reason: `stream ended without [DONE] (${detail})` };
+  if (!usage) return { ok: true, detail: `${detail}; warn: no usage chunk even though the request asked for one` };
+  return { ok: true, detail };
+}
+
+const streamModel = (process.env.OPENROUTER_VERIFY_STREAM_MODEL || "").trim() || check.model;
+if (streamModel) {
+  try {
+    let streamed = await probeStream(streamModel);
+    if (!streamed.ok) {
+      console.log(`[info] streaming retry for "${streamModel}"; first attempt: ${streamed.reason}`);
+      await sleep(5000);
+      streamed = await probeStream(streamModel);
+    }
+    if (streamed.ok) console.log(`[ok] streaming probe succeeded with "${streamModel}" (${streamed.detail})`);
+    else fail(`streaming probe for "${streamModel}" failed: ${streamed.reason}`);
+  } catch (error) {
+    fail(`streaming probe for "${streamModel}" could not be completed: ${error.code ? `${error.code}: ` : ""}${error.message}`);
   }
 }
 

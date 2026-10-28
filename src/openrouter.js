@@ -4,7 +4,6 @@ import { normalizeCapabilities } from "./modelCapabilities.js";
 export const DEFAULT_OPENROUTER_MODEL = "nvidia/nemotron-3.5-lightning:free";
 export const DEFAULT_OPENROUTER_MODELS = [
   "nvidia/nemotron-3.5-lightning:free",
-  "nvidia/nemotron-3-super-120b-a12b:free",
   "cohere/north-mini-code:free",
   "google/gemma-4-31b-it:free"
 ];
@@ -392,12 +391,13 @@ export function openRouterProviderForChat() {
   const key = openRouterApiKey();
   const baseUrl = openRouterBaseUrl();
   if (!key || !baseUrl) return null;
+  // No reasoning toggle: OpenRouter answers HTTP 400 "Reasoning is mandatory
+  // for this endpoint" when it is disabled, so each model keeps its default.
   return {
     provider: "OpenRouter",
     baseUrl,
     apiKey: key,
     defaultModel: openRouterModel(),
-    maxTokens: openRouterMaxOutputTokens(),
-    reasoning: { enabled: false }
+    maxTokens: openRouterMaxOutputTokens()
   };
 }

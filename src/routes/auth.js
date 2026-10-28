@@ -2,6 +2,7 @@
 import { createToken, hashPassword, passwordMatches, validateSignin, validateSignup } from "../auth.js";
 import connectToDatabase from "../db.js";
 import User from "../user.js";
+import { dailyQuota } from "../usage.js";
 import { SESSION_TTL_MS } from "../session.js";
 import {
   authRateLimiter,
@@ -72,6 +73,29 @@ router.get("/me", requireAuth, (req, res) => {
     if (secret) setSessionCookie(res, createToken(req.user, secret));
   }
   return res.json({ user: publicUser(req.user) });
+});
+
+router.get("/usage", requireAuth, async (req, res, next) => {
+  try {
+    const user = await User.findById(req.userId).select("aiUsage").lean();
+    if (!user) return res.status(404).json({ message: "Your account was not found." });
+    const now = new Date();
+    const day = now.toISOString().slice(0, 10);
+    const quota = dailyQuota();
+    const used = user.aiUsage?.day === day ? Math.max(0, user.aiUsage?.count ?? 0) : 0;
+    const resetAt = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
+    return res.json({
+      usage: {
+        day,
+        dailyUsed: used,
+        dailyQuota: quota,
+        remaining: Math.max(0, quota - used),
+        resetAt: resetAt.toISOString()
+      }
+    });
+  } catch (error) {
+    return next(error);
+  }
 });
 
 export default router;

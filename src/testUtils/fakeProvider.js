@@ -47,10 +47,15 @@ export async function startFakeProvider() {
       invalidKey: false,
       finishReason: "stop",
       usageChunk: false,
+      streamReasoning: false,
+      reasoningOnly: false,
+      streamChunkDelayMs: 5,
       emptyDeltaFirst: false,
       emptyStream: false,
       chatResponseText: null,
-      extraModels: []
+      toolCalls: null,
+      extraModels: [],
+      acceptedKeys: null
     },
     set(partial) {
       Object.assign(state.behavior, partial);
@@ -77,12 +82,24 @@ export async function startFakeProvider() {
       state.behavior.invalidKey = false;
       state.behavior.finishReason = "stop";
       state.behavior.usageChunk = false;
+      state.behavior.streamReasoning = false;
+      state.behavior.reasoningOnly = false;
+      state.behavior.streamChunkDelayMs = 5;
       state.behavior.emptyDeltaFirst = false;
       state.behavior.emptyStream = false;
       state.behavior.chatResponseText = null;
+      state.behavior.toolCalls = null;
       state.behavior.extraModels = [];
+      state.behavior.acceptedKeys = null;
     }
   };
+
+  // A second fake instance can stand in for the shared server-side provider,
+  // which authenticates with its own key instead of FAKE_API_KEY.
+  function acceptsKey(key) {
+    const accepted = state.behavior.acceptedKeys;
+    return Array.isArray(accepted) ? accepted.includes(key) : key === FAKE_API_KEY;
+  }
 
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, "http://localhost");
@@ -91,7 +108,7 @@ export async function startFakeProvider() {
 
     if (url.pathname.endsWith("/key") && req.method === "GET") {
       state.keyRequests += 1;
-      if (key !== FAKE_API_KEY || state.behavior.invalidKey) {
+      if (!acceptsKey(key) || state.behavior.invalidKey) {
         return json(res, 401, { error: { message: "Invalid API key provided." } });
       }
       if (state.behavior.keyStatus !== 200) {
@@ -110,7 +127,7 @@ export async function startFakeProvider() {
 
     if (url.pathname.endsWith("/models") && req.method === "GET") {
       state.modelsRequests += 1;
-      if (key !== FAKE_API_KEY) return json(res, 401, { error: { message: "Invalid API key provided." } });
+      if (!acceptsKey(key)) return json(res, 401, { error: { message: "Invalid API key provided." } });
       if (state.behavior.listStatus !== 200) {
         return json(res, state.behavior.listStatus, { error: { message: `Listing rejected with ${state.behavior.listStatus}` } });
       }
@@ -133,7 +150,7 @@ export async function startFakeProvider() {
     if (url.pathname.endsWith("/chat/completions") && req.method === "POST") {
       const body = JSON.parse((await readBody(req)) || "{}");
       state.chatRequests.push({ key, body });
-      if (key !== FAKE_API_KEY || state.behavior.invalidKey) {
+      if (!acceptsKey(key) || state.behavior.invalidKey) {
         return json(res, 401, { error: { message: "Invalid API key provided." } });
       }
       if (state.behavior.failModel && body.model === state.behavior.failModel) {
@@ -179,6 +196,22 @@ export async function startFakeProvider() {
       const model = body.model;
 
       if (!body.stream) {
+        if (Array.isArray(state.behavior.toolCalls) && state.behavior.toolCalls.length > 0) {
+          const calls = state.behavior.toolCalls.map((call, index) => ({
+            id: call.id || `fake_call_${index}`,
+            type: "function",
+            function: { name: call.name, arguments: JSON.stringify(call.args ?? {}) }
+          }));
+          return json(res, 200, {
+            id: "chatcmpl-fake",
+            model,
+            choices: [{
+              index: 0,
+              message: { role: "assistant", content: null, tool_calls: calls },
+              finish_reason: "tool_calls"
+            }]
+          });
+        }
         const content = state.behavior.chatResponseText ?? `Echo from ${model}: ${body.messages.at(-1)?.content ?? ""}`;
         return json(res, 200, {
           id: "chatcmpl-fake",
@@ -199,6 +232,46 @@ export async function startFakeProvider() {
         res.end();
         return;
       }
+      if (state.behavior.streamReasoning || state.behavior.reasoningOnly) {
+        // OpenRouter duplicates each reasoning increment in both delta.reasoning
+        // and delta.reasoning_details, so a parser must not count it twice.
+        for (const piece of ["Thinking about ", "the request. "]) {
+          res.write(`data: ${JSON.stringify({
+            id: "chatcmpl-fake",
+            model,
+            choices: [{
+              delta: {
+                content: "",
+                reasoning: piece,
+                reasoning_details: [{ type: "reasoning.text", text: piece, format: "unknown", index: 0 }]
+              },
+              finish_reason: null
+            }]
+          })}\n\n`);
+          await new Promise(resolve => setTimeout(resolve, state.behavior.streamChunkDelayMs));
+        }
+      }
+      if (state.behavior.reasoningOnly) {
+        res.write(`data: ${JSON.stringify({
+          id: "chatcmpl-fake",
+          model,
+          choices: [{ delta: {}, finish_reason: state.behavior.finishReason }]
+        })}\n\n`);
+        res.write(`data: ${JSON.stringify({
+          id: "chatcmpl-fake",
+          model,
+          choices: [],
+          usage: {
+            prompt_tokens: 5,
+            completion_tokens: 40,
+            total_tokens: 45,
+            completion_tokens_details: { reasoning_tokens: 40 }
+          }
+        })}\n\n`);
+        res.write("data: [DONE]\n\n");
+        res.end();
+        return;
+      }
       const chunks = state.behavior.chatResponseText
         ? state.behavior.chatResponseText.match(/[\s\S]{1,240}/g) || [""]
         : ["Hello ", "from ", `${model}`, "!"];
@@ -212,7 +285,7 @@ export async function startFakeProvider() {
           model,
           choices: [{ delta: { content: chunks[i] }, ...(last && !state.behavior.streamWithoutTerminal ? { finish_reason: state.behavior.finishReason } : {}) }]
         })}\n\n`);
-        await new Promise(resolve => setTimeout(resolve, 5));
+        await new Promise(resolve => setTimeout(resolve, state.behavior.streamChunkDelayMs));
       }
       if (state.behavior.failStreamMidway) {
         res.write(`data: ${JSON.stringify(state.behavior.streamErrorPayload || { error: { message: "Upstream exploded mid-stream." } })}\n\n`);

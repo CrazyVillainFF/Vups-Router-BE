@@ -13,6 +13,7 @@ import conversationsRoutes from "./routes/conversations.js";
 import chatRoutes from "./routes/chat.js";
 import imageRoutes from "./routes/images.js";
 import adminRoutes from "./routes/admin.js";
+import pluginRoutes from "./routes/plugins.js";
 import { requireJsonBody, verifyOrigin } from "./middleware.js";
 import { chatJsonBodyLimit } from "./chatImages.js";
 import { vupsExecutionConfiguration, vupsTextConfiguration, vupsVisionConfiguration } from "./vupsGalax.js";
@@ -168,7 +169,7 @@ app.get("/api", (_req, res) => res.json({
   service: "VupsRouter",
   message: "VupsRouter API index. All application routes are served under /api/*.",
   health: "/api/health",
-  routes: ["/api/auth", "/api/forgot-password", "/api/verify-code", "/api/reset-password", "/api/settings", "/api/conversations", "/api/chat", "/api/images", "/api/admin"]
+  routes: ["/api/auth", "/api/forgot-password", "/api/verify-code", "/api/reset-password", "/api/settings", "/api/conversations", "/api/chat", "/api/images", "/api/plugins", "/api/admin"]
 }));
 
 app.use("/api/auth", authRoutes);
@@ -177,6 +178,7 @@ app.use("/api/settings", settingsRoutes);
 app.use("/api/conversations", conversationsRoutes);
 app.use("/api/chat", chatRoutes);
 app.use("/api/images", imageRoutes);
+app.use("/api/plugins", pluginRoutes);
 app.use("/api/admin", adminRoutes);
 
 app.use((_req, res) => {

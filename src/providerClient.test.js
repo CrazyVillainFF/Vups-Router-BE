@@ -10,7 +10,9 @@ import {
   classifyProviderFailure,
   describeProviderError,
   extractResponseText,
+  extractStreamReasoning,
   extractStreamText,
+  isOpenRouterBase,
   isGoogleGeminiBase,
   isOpenCodeZenBase,
   isOpenCodeZenFreeModel,
@@ -934,6 +936,91 @@ test("Google Gemini invalid keys and free-tier quota errors stay actionable", as
         && error.code === "region_restricted"
         && error.status === 403
         && /EEA, Switzerland, or the UK/.test(error.message)
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("OpenRouter reasoning increments are read once, never twice", () => {
+  const bothFields = {
+    choices: [{ delta: { content: "", reasoning: "We", reasoning_details: [{ type: "reasoning.text", text: "We", format: "unknown", index: 0 }] } }]
+  };
+  assert.equal(extractStreamReasoning(bothFields), "We");
+  assert.equal(extractStreamText(bothFields), "");
+  assert.equal(
+    extractStreamReasoning({ choices: [{ delta: { reasoning_details: [
+      { type: "reasoning.text", text: "Alpha " },
+      { type: "reasoning.text", text: "beta" }
+    ] } }] }),
+    "Alpha beta"
+  );
+  assert.equal(extractStreamReasoning({ choices: [{ delta: { reasoning: "only field" } }] }), "only field");
+  assert.equal(extractStreamReasoning({ choices: [{ delta: { reasoning: "encrypted", reasoning_details: [{ type: "reasoning.encrypted", data: "blob" }] } }] }), "encrypted");
+  assert.equal(extractStreamReasoning({ type: "content_block_delta", delta: { type: "thinking", thinking: "Hmm " } }), "Hmm ");
+  assert.equal(extractStreamReasoning({ choices: [{ delta: { content: "answer" } }] }), "");
+  assert.equal(extractStreamReasoning({ choices: [] }), "");
+});
+
+test("OpenRouter stream requests opt into the final usage chunk", () => {
+  const withUsage = buildChatRequestBody({ model: "recursive/flint-v1.0:free", messages: [{ role: "user", content: "Hi" }], stream: true, streamUsage: true });
+  assert.deepEqual(withUsage.usage, { include: true });
+  const plain = buildChatRequestBody({ model: "m", messages: [{ role: "user", content: "Hi" }], stream: true });
+  assert.equal("usage" in plain, false);
+  const nonStream = buildChatRequestBody({ model: "m", messages: [{ role: "user", content: "Hi" }], stream: false, streamUsage: true });
+  assert.equal("usage" in nonStream, false);
+  assert.equal(isOpenRouterBase("https://openrouter.ai/api/v1"), true);
+  assert.equal(isOpenRouterBase("https://openrouter.ai"), true);
+  assert.equal(isOpenRouterBase("https://api.example.com/v1"), false);
+  assert.equal(isOpenRouterBase("not a url"), false);
+});
+
+test("the stream request body carries usage for OpenRouter and nothing for other hosts", async () => {
+  const originalFetch = globalThis.fetch;
+  const sent = [];
+  globalThis.fetch = async (url, init) => {
+    sent.push({ url: String(url), body: JSON.parse(init.body) });
+    return new Response("data: [DONE]\n\n", { status: 200, headers: { "Content-Type": "text/event-stream" } });
+  };
+  try {
+    await startChatCompletionStream({
+      baseUrl: "https://openrouter.ai/api/v1",
+      apiKey: "sk-or-test",
+      model: "recursive/flint-v1.0:free",
+      messages: [{ role: "user", content: "Hi" }]
+    });
+    await startChatCompletionStream({
+      baseUrl: "https://api.example.com/v1",
+      apiKey: "sk-test",
+      model: "some-model",
+      messages: [{ role: "user", content: "Hi" }]
+    });
+    assert.equal(sent.length, 2);
+    assert.deepEqual(sent[0].body.usage, { include: true });
+    assert.equal("usage" in sent[1].body, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("a non-stream answer spent entirely on reasoning reports the output limit", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    choices: [{ index: 0, message: { role: "assistant", content: "", reasoning: "a very long thought", reasoning_details: [] }, finish_reason: "length" }],
+    usage: { prompt_tokens: 9, completion_tokens: 64, total_tokens: 73, completion_tokens_details: { reasoning_tokens: 64 } }
+  }), { status: 200, headers: { "Content-Type": "application/json" } });
+  try {
+    await assert.rejects(
+      () => chatCompletion({
+        baseUrl: "https://openrouter.ai/api/v1",
+        apiKey: "sk-or-test",
+        model: "recursive/flint-v1.0:free",
+        messages: [{ role: "user", content: "Hi" }],
+        maxTokens: 64
+      }),
+      error => error instanceof ProviderError
+        && error.code === "output_limit"
+        && /output budget on reasoning/.test(error.message)
     );
   } finally {
     globalThis.fetch = originalFetch;

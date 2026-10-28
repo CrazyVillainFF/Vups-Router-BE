@@ -106,7 +106,7 @@ test("shared OpenRouter fallback keeps text on the default model and routes imag
       const image = vupsProviderForChat({ images: true });
       assert.equal(image.model, DEFAULT_VUPS_VISION_MODEL);
       assert.equal(image.vision, true);
-      assert.deepEqual(image.reasoning, { enabled: false });
+      assert.equal(image.reasoning, undefined, "OpenRouter fallback must not disable reasoning");
     }
   );
 });

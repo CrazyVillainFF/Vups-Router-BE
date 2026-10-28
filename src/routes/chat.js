@@ -18,9 +18,11 @@ import {
   assertAllowedProviderUrl,
   buildProviderFailureDiagnostic,
   chatCompletion,
+  extractStreamReasoning,
   extractStreamText,
   isQuotaExhaustedError,
   normalizeBaseUrl,
+  providerSupportsToolCalling,
   redactSecrets,
   startChatCompletionStream,
   withProviderRetry
@@ -31,6 +33,13 @@ import { sharedModelStatus, sharedProviderForChat } from "../sharedModel.js";
 import { resolveOmniRouteChat } from "../omniroute.js";
 import { attachmentMetadata, validateImages } from "../chatImages.js";
 import { resolveTerminalEvent, writeSseEvent } from "../chatTerminal.js";
+import { runPluginToolLoop } from "../plugins/toolChat.js";
+import {
+  DESKTOP_TOOLS,
+  DESKTOP_TOOL_PROMPT,
+  isDesktopToolName,
+  normalizeDesktopToolCalls
+} from "../desktopTools.js";
 import {
   VUPS_MODEL_ID,
   buildVupsSystemPrompt,
@@ -102,6 +111,79 @@ function validateMessages(value, { allowAssistantLast = false } = {}) {
   }
   if (!allowAssistantLast && messages[messages.length - 1].role !== "user") return "The last message must come from the user.";
   return { messages };
+}
+
+const MAX_DESKTOP_STEPS = 6;
+const DESKTOP_RUN_TTL_MS = 10 * 60 * 1000;
+const desktopRuns = new Map();
+
+function validDesktopRunId(value) {
+  return typeof value === "string" && /^[A-Za-z0-9_-]{8,80}$/.test(value.trim());
+}
+
+function validateDesktopMessages(value) {
+  if (!Array.isArray(value) || value.length === 0) return "messages must be a non-empty array.";
+  if (value.length > MAX_MESSAGES + 12) return "A desktop tool request can contain at most 72 messages.";
+  const messages = [];
+  let total = 0;
+  for (const entry of value) {
+    const role = entry?.role;
+    const content = typeof entry?.content === "string" ? entry.content : "";
+    if (role !== "user" && role !== "assistant" && role !== "tool") {
+      return "Every desktop tool message needs a role of user, assistant, or tool.";
+    }
+    if (role === "tool") {
+      const callId = typeof entry?.tool_call_id === "string" ? entry.tool_call_id.trim() : "";
+      if (!callId || callId.length > 120) return "Every tool result needs its tool call id.";
+      if (!content.trim()) return "A tool result cannot be empty.";
+      if (content.length > 20000) return "A tool result is too large to send back to the model.";
+      total += content.length;
+      messages.push({ role, tool_call_id: callId, content });
+    } else if (role === "assistant") {
+      const toolCalls = Array.isArray(entry?.tool_calls) ? entry.tool_calls : [];
+      if (toolCalls.length > 5) return "The assistant can request at most five local tools per step.";
+      if (content.length > MAX_ASSISTANT_MESSAGE_CHARS) return "A single assistant message is too large.";
+      const normalizedCalls = toolCalls.map((call, index) => {
+        const name = typeof call?.function?.name === "string" ? call.function.name : "";
+        if (!isDesktopToolName(name)) return null;
+        const id = typeof call?.id === "string" && call.id.trim()
+          ? call.id.trim().slice(0, 120)
+          : `desktop_call_${index}`;
+        const args = typeof call?.function?.arguments === "string" ? call.function.arguments : "{}";
+        if (args.length > 12000) return null;
+        return { id, type: "function", function: { name, arguments: args } };
+      });
+      if (normalizedCalls.some(call => !call)) return "A previous tool call is not recognized.";
+      if (!content.trim() && normalizedCalls.length === 0) return "An assistant message cannot be empty.";
+      messages.push({
+        role,
+        content: content || null,
+        ...(normalizedCalls.length > 0 ? { tool_calls: normalizedCalls } : {})
+      });
+      total += content.length;
+    } else {
+      if (content.length > 32000) return "A single message cannot exceed 32000 characters.";
+      if (Array.isArray(entry?.images) && entry.images.length > 0) {
+        return "Local filesystem tools are text-only. Remove image attachments or use a normal chat.";
+      }
+      if (!content.trim()) return "Message content cannot be empty.";
+      total += content.length;
+      messages.push({ role, content });
+    }
+    if (total > MAX_TOTAL_CHARS) return "The conversation is too large. Start a new chat or shorten your messages.";
+  }
+  const lastRole = messages[messages.length - 1]?.role;
+  if (lastRole !== "user" && lastRole !== "tool") {
+    return "The last desktop tool message must be a user message or a tool result.";
+  }
+  return { messages };
+}
+
+function cleanupDesktopRuns() {
+  const now = Date.now();
+  for (const [id, run] of desktopRuns) {
+    if (now - run.createdAt > DESKTOP_RUN_TTL_MS) desktopRuns.delete(id);
+  }
 }
 
 // Limits enforced before any provider call are still context-limit failures.
@@ -704,12 +786,40 @@ function sendEvent(res, payload) {
   return writeSseEvent(res, payload);
 }
 
+function syntheticUpstream(content, finishReason = "stop") {
+  const encoder = new TextEncoder();
+  const text = String(content || "");
+  const stream = new ReadableStream({
+    start(controller) {
+      for (let index = 0; index < text.length; index += 120) {
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+          choices: [{ delta: { content: text.slice(index, index + 120) }, finish_reason: null }]
+        })}\n\n`));
+      }
+      controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+        choices: [{ delta: {}, finish_reason: finishReason || "stop" }]
+      })}\n\n`));
+      controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+      controller.close();
+    }
+  });
+  return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+}
+
 function createStreamProgress(res, messageId) {
   let codeStarted = false;
   let currentFile = "";
   let preparing = false;
+  let reasoningSeen = false;
   let markerTail = "";
   return {
+    onReasoning() {
+      // A reasoning model can stream hundreds of thinking chunks before its first
+      // answer character; without this the composer looks stalled.
+      if (reasoningSeen) return;
+      reasoningSeen = true;
+      sendEvent(res, { type: "progress", messageId, phase: "reasoning", message: "Thinking through your request" });
+    },
     onText(text) {
       const combined = `${markerTail}${text}`;
       markerTail = combined.slice(-40);
@@ -1542,6 +1652,7 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
     let usage = null;
     let sawTerminal = false;
     let idleTimedOut = false;
+    let reasoningChars = 0;
 
     const handleLine = line => {
       const trimmed = line.trim();
@@ -1620,6 +1731,11 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
         }
         sawTerminal = true;
       }
+      const reasoning = extractStreamReasoning(parsed);
+      if (reasoning) {
+        reasoningChars += reasoning.length;
+        progress.onReasoning();
+      }
       const text = extractStreamText(parsed);
       if (text) {
         fullText += text;
@@ -1679,7 +1795,13 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
     if (!failure && !clientAborted) {
       if (fullText.length === 0) {
         failure = finishReason === "length"
-          ? new ProviderError("Vups v3 Galax reached its output limit before writing an answer. Try a shorter prompt.", null, "output_limit")
+          ? new ProviderError(
+              reasoningChars > 0
+                ? "Vups v3 Galax spent its whole output budget reasoning before writing an answer. Try a shorter prompt."
+                : "Vups v3 Galax reached its output limit before writing an answer. Try a shorter prompt.",
+              null,
+              "output_limit"
+            )
           : new ProviderError("The provider returned an empty response.", null, "empty_response");
         failureReason = "empty_response";
       } else if (!sawTerminal) {
@@ -1827,6 +1949,216 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
   }
 });
 
+router.post("/desktop-tools", requireAuth, chatRateLimiter, async (req, res, next) => {
+  try {
+    const body = req.body || {};
+    const runId = typeof body.runId === "string" ? body.runId.trim() : "";
+    if (!validDesktopRunId(runId)) {
+      return res.status(400).json({ message: "A valid desktop tool run id is required.", code: "invalid_run_id" });
+    }
+    cleanupDesktopRuns();
+    let run = desktopRuns.get(runId);
+    if (run && run.userId !== req.userId) {
+      return res.status(403).json({ message: "That desktop tool run belongs to another account.", code: "run_forbidden" });
+    }
+    if (run?.busy) {
+      return res.status(409).json({ message: "This desktop tool run is already waiting for a model response.", code: "run_busy" });
+    }
+
+    const validated = validateDesktopMessages(body.messages);
+    if (typeof validated === "string") return sendValidationFailure(res, validated);
+    const assistantMessageId = parseMessageId(body.assistantMessageId) || String(new mongoose.Types.ObjectId());
+    const mode = typeof body.mode === "string" ? body.mode.trim().toLowerCase() || "general" : "general";
+    if (!CHAT_MODES.has(mode)) {
+      return res.status(400).json({ message: "Unknown chat mode. Choose general or motion.", code: "invalid_mode" });
+    }
+    const temperature =
+      typeof body.temperature === "number" && body.temperature >= 0 && body.temperature <= 2
+        ? body.temperature
+        : undefined;
+    const requestedModel = typeof body.model === "string" ? body.model.trim() : "";
+    const requestedConfigId = typeof body.configId === "string" ? body.configId.trim() : "";
+    const requestedProviderId = typeof body.providerId === "string" ? body.providerId.trim().slice(0, 80) : "";
+    const requestedSource = typeof body.source === "string" ? body.source.trim().toLowerCase() : "";
+    const requestedConversationId = typeof body.conversationId === "string" ? body.conversationId : null;
+    if (run && requestedConversationId && run.conversationId && requestedConversationId !== run.conversationId) {
+      return res.status(400).json({ message: "This desktop tool run is attached to another conversation.", code: "run_conversation_mismatch" });
+    }
+
+    await connectToDatabase();
+    if (req.user?.aiEnabled === false) {
+      return res.status(403).json({ message: "AI chat has been disabled for your account by an administrator.", code: "ai_disabled" });
+    }
+
+    let provider;
+    let model;
+    try {
+      if (body.vups === true) {
+        provider = vupsProviderForChat({ images: false });
+        model = requestedModel || provider.model || VUPS_MODEL_ID;
+        if (requestedModel && requestedModel !== VUPS_MODEL_ID) {
+          return res.status(400).json({ message: "This route only serves Vups v3 Galax.", code: "invalid_model" });
+        }
+      } else {
+        provider = await resolveProvider(req.userId, requestedModel, requestedConfigId, requestedSource, requestedProviderId);
+        model = requestedModel || provider.defaultModel;
+      }
+    } catch (error) {
+      if (error instanceof ProviderError) {
+        return res.status(error.status ?? 400).json({ message: error.message, code: error.code });
+      }
+      throw error;
+    }
+    if (!model) {
+      return res.status(400).json({ message: "Select a model before using local filesystem tools.", code: "no_model" });
+    }
+    if (!providerSupportsToolCalling(provider, model)) {
+      return res.status(400).json({
+        message: "This model's provider does not support tool calling in VupsRouter. Choose an OpenAI-compatible chat model to use local Windows filesystem tools.",
+        code: "tool_calling_unsupported"
+      });
+    }
+
+    if (!run) {
+      run = {
+        userId: req.userId,
+        conversationId: requestedConversationId,
+        createdAt: Date.now(),
+        steps: 0,
+        quotaConsumed: false,
+        busy: false
+      };
+      desktopRuns.set(runId, run);
+    }
+    if (run.steps >= MAX_DESKTOP_STEPS) {
+      return res.status(429).json({
+        message: "The assistant used too many local filesystem tool rounds. Ask a narrower question and try again.",
+        code: "tool_round_limit"
+      });
+    }
+    if (!acquireSlot(req.userId)) {
+      return res.status(429).json({
+        message: "Too many AI requests are already in flight for your account. Wait for them to finish and try again.",
+        code: "concurrency_limit"
+      });
+    }
+
+    run.busy = true;
+    const controller = new AbortController();
+    res.on("close", () => {
+      if (!res.writableEnded) controller.abort();
+    });
+    try {
+      if (!run.quotaConsumed) {
+        try {
+          await consumeDailyQuota(req.userId);
+          run.quotaConsumed = true;
+        } catch (error) {
+          if (error instanceof UsageError) return res.status(429).json({ message: error.message, code: error.code });
+          throw error;
+        }
+      }
+
+      const systemPrompt = body.vups === true
+        ? `${buildVupsSystemPrompt(mode)}${DESKTOP_TOOL_PROMPT}`
+        : `${CHAT_MODES.get(mode)}${DESKTOP_TOOL_PROMPT}`;
+      const upstreamMessages = [
+        { role: "system", content: systemPrompt },
+        ...validated.messages
+      ];
+
+      let result;
+      try {
+        result = await chatCompletion(
+          {
+            baseUrl: provider.baseUrl,
+            apiKey: provider.apiKey,
+            providerType: provider.providerType,
+            model,
+            messages: upstreamMessages,
+            temperature,
+            maxTokens: provider.maxTokens,
+            reasoning: provider.reasoning,
+            tools: DESKTOP_TOOLS,
+            toolChoice: "auto",
+            requestId: req.requestId
+          },
+          controller.signal
+        );
+      } catch (error) {
+        if (controller.signal.aborted) return;
+        if (error instanceof ProviderError) {
+          logProviderFailure(provider, error);
+          return res.status(error.status && error.status >= 400 ? error.status : 502).json({
+            message: error.message,
+            code: error.code || "provider_error"
+          });
+        }
+        throw error;
+      }
+
+      const toolCalls = normalizeDesktopToolCalls(result.toolCalls);
+      if (toolCalls.length > 0) {
+        run.steps += 1;
+        return res.json({
+          runId,
+          type: "tool_calls",
+          conversationId: run.conversationId,
+          content: result.content,
+          finishReason: result.finishReason,
+          toolCalls,
+          assistantMessage: {
+            role: "assistant",
+            content: result.content || null,
+            tool_calls: toolCalls
+          },
+          model
+        });
+      }
+
+      const content = String(result.content || "").trim();
+      if (!content) {
+        return res.status(502).json({
+          message: "The model returned an empty answer after the local tool step. Try again.",
+          code: "empty_response"
+        });
+      }
+      const persistMessages = validated.messages.filter(message =>
+        (message.role === "user" || message.role === "assistant") &&
+        typeof message.content === "string" &&
+        message.content.trim()
+      );
+      const turn = await persistGeneratedTurn({
+        userId: req.userId,
+        conversationId: run.conversationId,
+        messages: persistMessages,
+        fullText: content,
+        messageId: assistantMessageId,
+        finishReason: result.finishReason,
+        failure: null,
+        title: generatedArtifactTitle(persistMessages),
+        requestId: req.requestId
+      });
+      desktopRuns.delete(runId);
+      return res.json({
+        runId,
+        type: "final",
+        conversationId: String(turn.conversation._id),
+        message: { role: "assistant", content: turn.summary, messageId: assistantMessageId },
+        content: turn.summary,
+        finishReason: result.finishReason,
+        ...(turn.artifact ? { artifact: artifactPayload(turn.artifact), artifacts: [artifactPayload(turn.artifact)] } : {}),
+        ...(turn.artifactError ? { artifactError: { code: turn.artifactError.code, message: turn.artifactError.message } } : {})
+      });
+    } finally {
+      run.busy = false;
+      releaseSlot(req.userId);
+    }
+  } catch (error) {
+    return next(error);
+  }
+});
+
 router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
   try {
     const body = req.body || {};
@@ -1923,7 +2255,26 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
       let result;
       let usedModel = model;
       let fallbackUsed = false;
-      while (true) {
+      let pluginRun = null;
+      try {
+        pluginRun = await runPluginToolLoop({
+          userId: req.userId,
+          provider,
+          model,
+          messages: upstreamMessages,
+          temperature,
+          maxTokens: provider.maxTokens,
+          reasoning: provider.reasoning,
+          requestId: req.requestId
+        });
+      } catch (error) {
+        // A provider that fails mid tool loop must not lose the reply; fall back
+        // to the plain completion below.
+        if (!(error instanceof ProviderError)) throw error;
+        logProviderFailure(provider, error);
+        pluginRun = null;
+      }
+      while (!pluginRun) {
         try {
           result = await chatCompletion(
             { baseUrl: provider.baseUrl, apiKey: provider.apiKey, providerType: provider.providerType, model: usedModel, messages: upstreamMessages, temperature, maxTokens: provider.maxTokens, reasoning: provider.reasoning },
@@ -1949,6 +2300,8 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
           );
         }
       }
+      if (pluginRun) result = pluginRun;
+      const pluginToolsUsed = pluginRun?.toolsUsed || [];
       if (continuationState) {
         try {
           const continued = await persistContinuation({
@@ -1971,6 +2324,7 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
             finishReason: result.finishReason,
             ...(continued.artifact ? { artifact: continued.artifact, artifacts: [continued.artifact] } : {}),
             ...(continued.continuedFile ? { continuedFile: continued.continuedFile } : {}),
+            ...(pluginToolsUsed.length > 0 ? { toolsUsed: pluginToolsUsed } : {}),
             ...(fallbackUsed ? { model: usedModel, fallbackUsed: true } : {})
           });
         } catch (error) {
@@ -1997,6 +2351,7 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
         finishReason: result.finishReason,
         ...(turn.artifact ? { artifact: artifactPayload(turn.artifact), artifacts: [artifactPayload(turn.artifact)] } : {}),
         ...(turn.artifactError ? { artifactError: { code: turn.artifactError.code, message: turn.artifactError.message } } : {}),
+        ...(pluginToolsUsed.length > 0 ? { toolsUsed: pluginToolsUsed } : {}),
         ...(fallbackUsed ? { model: usedModel, fallbackUsed: true } : {})
       });
     }
@@ -2016,14 +2371,41 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
       }
     });
 
-    let upstream;
+    let toolRun = null;
+    try {
+      toolRun = await runPluginToolLoop({
+        userId: req.userId,
+        provider,
+        model,
+        messages: upstreamMessages,
+        temperature,
+        maxTokens: provider.maxTokens,
+        reasoning: provider.reasoning,
+        signal: controller.signal,
+        requestId: req.requestId
+      });
+    } catch (error) {
+      if (controller.signal.aborted) return;
+      console.warn("Plugin tool loop skipped:", error?.name || "UnknownError", error?.code || "");
+    }
+
+    let upstream = toolRun ? syntheticUpstream(toolRun.content, toolRun.finishReason) : null;
     let usedModel = model;
     let fallbackUsed = false;
-    while (true) {
+    while (!upstream) {
       try {
-        upstream = await startChatCompletionStream(
-          { baseUrl: provider.baseUrl, apiKey: provider.apiKey, providerType: provider.providerType, model: usedModel, messages: upstreamMessages, temperature, maxTokens: provider.maxTokens, reasoning: provider.reasoning },
-          controller.signal
+        // OpenRouter free models share an upstream pool and answer with a
+        // transient 429 often enough that a personal key deserves the same
+        // bounded retry the shared route already gets. A shared provider with a
+        // configured fallback fails over to it instead of retrying in place.
+        const streamRetry = vupsRetryOptions();
+        if (provider.shared && provider.fallbackModel) streamRetry.maxRetries = 0;
+        upstream = await withProviderRetry(
+          () => startChatCompletionStream(
+            { baseUrl: provider.baseUrl, apiKey: provider.apiKey, providerType: provider.providerType, model: usedModel, messages: upstreamMessages, temperature, maxTokens: provider.maxTokens, reasoning: provider.reasoning },
+            controller.signal
+          ),
+          { ...streamRetry, signal: controller.signal }
         );
         break;
       } catch (error) {
@@ -2061,6 +2443,14 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
       messageId: assistantMessageId,
       ...(fallbackUsed ? { model: usedModel, fallbackUsed: true } : {})
     });
+    if (toolRun?.toolsUsed?.length) {
+      sendEvent(res, {
+        type: "progress",
+        messageId: assistantMessageId,
+        phase: "plugin_tools",
+        message: `Used ${toolRun.toolsUsed.length} plugin tool${toolRun.toolsUsed.length === 1 ? "" : "s"}.`
+      });
+    }
     const progress = createStreamProgress(res, assistantMessageId);
 
     const reader = upstream.body.getReader();
@@ -2070,6 +2460,7 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
     let failure = null;
     let finishReason = null;
     let usage = null;
+    let reasoningChars = 0;
 
     try {
       while (!failure) {
@@ -2147,6 +2538,11 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
               finishReason = finishReason ?? "stop";
             }
           }
+          const reasoning = extractStreamReasoning(parsed);
+          if (reasoning) {
+            reasoningChars += reasoning.length;
+            progress.onReasoning();
+          }
           const text = extractStreamText(parsed);
           if (text) {
             fullText += text;
@@ -2173,7 +2569,13 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
 
     if (!failure && fullText.length === 0 && !controller.signal.aborted) {
       failure = finishReason === "length"
-        ? new ProviderError("The model reached its output limit before writing an answer. Try a shorter prompt or choose another model.", null, "output_limit")
+        ? new ProviderError(
+            reasoningChars > 0
+              ? "The model spent its whole output budget reasoning before writing an answer. Raise the maximum output tokens in API settings, or choose another model."
+              : "The model reached its output limit before writing an answer. Try a shorter prompt or choose another model.",
+            null,
+            "output_limit"
+          )
         : new ProviderError("The provider returned an empty response. Check the model ID and try again.", null, "empty_response");
     }
 

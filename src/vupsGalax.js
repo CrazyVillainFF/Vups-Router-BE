@@ -177,7 +177,6 @@ export function vupsProviderForChat({ images = false } = {}) {
     apiKey,
     model: requestModel,
     providerType: "openai_compatible",
-    vision: requestVision,
-    reasoning: useDedicated ? undefined : { enabled: false }
+    vision: requestVision
   };
 }
