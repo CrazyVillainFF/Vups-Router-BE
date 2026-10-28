@@ -2,6 +2,16 @@
 
 Express API for VupsRouter with MongoDB-backed accounts, HTTP-only cookie sessions, encrypted per-user AI provider configuration, a server-side OpenAI-compatible chat proxy (with streaming), and database-backed conversation history.
 
+## VupsRouter apps
+
+This repository is the backend only — it is not a user-facing download. The Windows installer, Android build, and web app are distributed from the client repository:
+
+- **Web app / PWA:** <https://vups-router-three.vercel.app/>
+- **Windows and Android builds:** <https://github.com/CrazyVillainFF/Vups-Router/releases> (built by `.github/workflows/native-builds.yml`; see that repository's README for signing status and what is published today)
+- **Client README download guide:** <https://github.com/CrazyVillainFF/Vups-Router#download-vupsrouter>
+
+`http://localhost:4000` is a development API and is not a downloadable product.
+
 ## Requirements
 
 - Node.js >= 22
