@@ -4,6 +4,7 @@ import PluginInstallation from "./installation.js";
 import { PLUGIN_CATALOG, catalogSummary, getPlugin } from "./catalog.js";
 import { getAdapter, publicTools, findTool } from "./adapters/index.js";
 import { PluginError, isPluginError } from "./errors.js";
+import { redactSecrets, secretValues } from "./redact.js";
 import { splitSecretFields, validateFields, validateInput } from "./validation.js";
 
 const CONNECTION_TIMEOUT_MS = 20000;
@@ -18,10 +19,15 @@ function executionSignal() {
   return AbortSignal.timeout(EXECUTION_TIMEOUT_MS);
 }
 
-function safeErrorMessage(error) {
-  if (error instanceof PluginError) return error.message;
-  if (error?.name === "TimeoutError" || error?.name === "AbortError") return "The plugin service timed out.";
-  return "The plugin service could not be reached.";
+// Exported so the redaction path can be tested without a live provider: an
+// upstream body that echoes a token must never reach the client or the database.
+export function safeErrorMessage(error, secrets = []) {
+  const raw = error instanceof PluginError
+    ? error.message
+    : error?.name === "TimeoutError" || error?.name === "AbortError"
+      ? "The plugin service timed out."
+      : "The plugin service could not be reached.";
+  return redactSecrets(raw, secrets);
 }
 
 function credentialMap(installation, credentials) {
@@ -132,10 +138,10 @@ async function connectAndTest(plugin, adapter, config, credentials) {
       credentials,
       signal: connectionSignal()
     });
-    return result?.message || `${plugin.name} is connected.`;
+    return redactSecrets(result?.message || `${plugin.name} is connected.`, secretValues(credentials, config));
   } catch (error) {
     throw new PluginError(
-      `Could not connect to ${plugin.name}: ${safeErrorMessage(error)}`,
+      `Could not connect to ${plugin.name}: ${safeErrorMessage(error, secretValues(credentials, config))}`,
       422,
       "connection_failed",
       { cause: error }
@@ -260,7 +266,7 @@ export async function testPlugin(userId, pluginId, { requestId = "" } = {}) {
     await audit(userId, plugin.id, "test", "success", { requestId });
     return { plugin: decorate(plugin, updated), message };
   } catch (error) {
-    const message = safeErrorMessage(error);
+    const message = safeErrorMessage(error, secretValues(credentials, installation.config));
     await PluginInstallation.updateOne(
       { userId, pluginId: plugin.id },
       {
@@ -277,7 +283,7 @@ export async function testPlugin(userId, pluginId, { requestId = "" } = {}) {
       requestId,
       errorCode: isPluginError(error) ? error.code : "connection_failed"
     });
-    throw error;
+    throw new PluginError(message, isPluginError(error) ? error.status : 422, isPluginError(error) ? error.code : "connection_failed");
   }
 }
 
@@ -333,13 +339,15 @@ export async function executePluginTool(userId, pluginId, toolName, args = {}, {
     });
     return { tool: tool.name, pluginId: plugin.id, result, durationMs: Date.now() - started };
   } catch (error) {
+    const secrets = secretValues(credentials, installation.config);
+    const message = safeErrorMessage(error, secrets);
     const status = isPluginError(error) && (error.status === 401 || error.status === 403)
       ? "needs_reconnection"
       : installation.status;
     if (status !== installation.status) {
       await PluginInstallation.updateOne(
         { userId, pluginId: plugin.id },
-        { $set: { status, lastError: safeErrorMessage(error) } }
+        { $set: { status, lastError: message } }
       );
     }
     await audit(userId, plugin.id, "execute", "error", {
@@ -349,8 +357,10 @@ export async function executePluginTool(userId, pluginId, toolName, args = {}, {
       errorCode: isPluginError(error) ? error.code : "tool_failed",
       metadata: { source }
     });
-    if (error instanceof PluginError) throw error;
-    throw new PluginError(safeErrorMessage(error), 502, "tool_failed", { cause: error });
+    if (error instanceof PluginError) {
+      throw new PluginError(message, error.status, error.code);
+    }
+    throw new PluginError(message, 502, "tool_failed", { cause: error });
   }
 }
 
