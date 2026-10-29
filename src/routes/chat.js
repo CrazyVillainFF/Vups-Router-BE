@@ -1049,6 +1049,36 @@ function providerFailure(provider, error) {
         code: "shared_empty_response"
       };
     }
+    // "Try again later" has to stay true to its word. A permanent rejection
+    // routed through the transient branch tells the user to wait for something
+    // that will never change, and hides the only action that works.
+    if (error.code === "invalid_api_key" || error.code === "forbidden" || error.category === "invalid_credentials") {
+      return {
+        status: 503,
+        message:
+          "The shared free-model catalog rejected this server's key, so no shared model will work until it is fixed. Connect your own provider in API settings to keep going.",
+        code: "shared_auth_failed"
+      };
+    }
+    if (
+      ["invalid_model", "not_found", "model_unavailable", "shared_model_unavailable"].includes(error.code) ||
+      error.category === "invalid_model"
+    ) {
+      return {
+        status: 400,
+        message:
+          "This shared model is not available. Pick another shared model from the model menu, or connect your own provider in API settings.",
+        code: "shared_model_unavailable"
+      };
+    }
+    if (error.code === "bad_request" || error.category === "invalid_request" || error.classification === "permanent") {
+      return {
+        status: 400,
+        message:
+          "The shared model rejected this request as invalid. Sending it again will not change the outcome — pick another shared model, shorten the conversation, or connect your own provider in API settings.",
+        code: "shared_request_rejected"
+      };
+    }
     return {
       status: 503,
       message: "The shared AI model is temporarily unavailable. Try again later, or connect your own provider in API settings.",

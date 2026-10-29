@@ -2070,6 +2070,70 @@ test("an enabled but unavailable shared model is reported with a clear alternati
   );
 });
 
+test("a permanent provider rejection is never reported as a temporary outage", async () => {
+  await withOpenRouterEnv({ apiKey: FAKE_API_KEY, baseUrl: fakeProvider.baseUrl, model: "fake-model-mini" }, async () => {
+    const { cookie } = await signupUser();
+    fakeProvider.state.set({
+      chatStatus: 400,
+      chatErrorPayload: { error: { message: "upstream rejected the prompt shape", code: "internal_nonsense_code" } }
+    });
+    const chat = await api("/api/chat", {
+      method: "POST",
+      cookie,
+      body: { stream: false, model: "fake-model-mini", messages: [{ role: "user", content: "hi" }] }
+    });
+    assert.equal(chat.status, 400);
+    assert.equal(chat.body.code, "shared_request_rejected");
+    // The old behaviour: a permanent failure wearing transient wording.
+    assert.doesNotMatch(chat.body.message, /temporarily unavailable|try again later/i);
+    assert.match(chat.body.message, /will not change the outcome/i);
+    assert.equal(chat.body.diagnostic.classification, "permanent");
+    assert.equal(chat.body.diagnostic.retryable, false);
+    assert.doesNotMatch(JSON.stringify(chat.body), /internal_nonsense_code|upstream rejected the prompt shape/);
+  });
+});
+
+test("a rejected shared key is reported as the server's problem, not the user's", async () => {
+  await withOpenRouterEnv({ apiKey: FAKE_API_KEY, baseUrl: fakeProvider.baseUrl, model: "fake-model-mini" }, async () => {
+    const { cookie } = await signupUser();
+    fakeProvider.state.set({
+      chatStatus: 401,
+      chatErrorPayload: { error: { message: "Invalid Key: sk-super-secret-server-key" } }
+    });
+    const chat = await api("/api/chat", {
+      method: "POST",
+      cookie,
+      body: { stream: false, model: "fake-model-mini", messages: [{ role: "user", content: "hi" }] }
+    });
+    assert.equal(chat.status, 503);
+    assert.equal(chat.body.code, "shared_auth_failed");
+    assert.match(chat.body.message, /this server's key/i);
+    assert.match(chat.body.message, /own provider/i);
+    assert.doesNotMatch(chat.body.message, /temporarily unavailable/i);
+    // The upstream message can carry the server's own credential; it must never
+    // be echoed to a client.
+    assert.doesNotMatch(JSON.stringify(chat.body), /sk-super-secret|Invalid Key/);
+  });
+});
+
+test("a genuine upstream outage still tells the user to try again", async () => {
+  await withOpenRouterEnv({ apiKey: FAKE_API_KEY, baseUrl: fakeProvider.baseUrl, model: "fake-model-mini" }, async () => {
+    const { cookie } = await signupUser();
+    fakeProvider.state.set({
+      chatStatus: 503,
+      chatErrorPayload: { error: { message: "No available connections for this model" } }
+    });
+    const chat = await api("/api/chat", {
+      method: "POST",
+      cookie,
+      body: { stream: false, model: "fake-model-mini", messages: [{ role: "user", content: "hi" }] }
+    });
+    assert.equal(chat.body.code, "shared_unavailable");
+    assert.match(chat.body.message, /temporarily unavailable/i);
+    assert.notEqual(chat.body.code, "shared_request_rejected");
+  });
+});
+
 test("OpenRouter server-side key problems never leak details to users", async () => {
   await withOpenRouterEnv({ apiKey: FAKE_API_KEY, baseUrl: fakeProvider.baseUrl, model: "fake-model-pro" }, async () => {
     const { cookie } = await signupUser();
@@ -2080,7 +2144,9 @@ test("OpenRouter server-side key problems never leak details to users", async ()
       body: { stream: false, messages: [{ role: "user", content: "key issue" }] }
     });
     assert.equal(chat.status, 503);
-    assert.equal(chat.body.code, "shared_unavailable");
+    // A rejected server key is the deployment's problem, so it gets its own
+    // code instead of the generic outage one.
+    assert.equal(chat.body.code, "shared_auth_failed");
     assert.ok(!/your api key|check the key/i.test(chat.body.message), "shared key failures must not tell users to check a nonexistent personal key");
     assert.equal(fakeProvider.state.chatRequests.length, 1, "invalid shared credentials must not trigger a model retry");
   });
