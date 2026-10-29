@@ -108,7 +108,7 @@ async function discoverPersonal(config) {
     );
   }
   const models = await listProviderModels(
-    { baseUrl: config.baseUrl, apiKey, providerType: config.providerType },
+    { baseUrl: config.baseUrl, apiKey, providerType: config.providerType, authMode: config.authMode, openapiBaseUrl: config.openapiBaseUrl },
     AbortSignal.timeout(DISCOVERY_TIMEOUT_MS)
   );
   const rows = personalRows(config, models, maskApiKey(apiKey));

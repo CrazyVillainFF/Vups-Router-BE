@@ -1,7 +1,7 @@
 import { Router } from "express";
 import connectToDatabase from "../db.js";
 import User from "../user.js";
-import ProviderConfig, { ensureProviderIndexes, newConfigId, providerIdFromName } from "../providerConfig.js";
+import ProviderConfig, { ensureProviderIndexes, invalidatedTestFields, newConfigId, providerBehaviorChanged, providerIdFromName } from "../providerConfig.js";
 import { decryptSecret, encryptSecret, maskApiKey } from "../encryption.js";
 import {
   ProviderError,
@@ -13,7 +13,8 @@ import {
   normalizeProviderType,
   testProviderConnection,
   testProviderModel,
-  validateProviderFields
+  validateProviderFields,
+  validateQoderSettings
 } from "../providerClient.js";
 import { requireAuth, settingsRateLimiter } from "../middleware.js";
 import { SHARED_OWNER_LABEL, sharedModelStatus } from "../sharedModel.js";
@@ -38,6 +39,8 @@ function publicConfig(config) {
       provider: "",
       providerType: "openai_compatible",
       baseUrl: "",
+      authMode: "pat",
+      openapiBaseUrl: "",
       model: "",
       models: [],
       defaultModel: "",
@@ -55,6 +58,8 @@ function publicConfig(config) {
     provider: config.provider,
     providerType: config.providerType || "openai_compatible",
     baseUrl: config.baseUrl,
+    authMode: config.authMode || "pat",
+    openapiBaseUrl: config.openapiBaseUrl || "",
     model: config.model || "",
     models: Array.isArray(config.models) ? config.models : [],
     defaultModel: config.defaultModel || config.model || "",
@@ -84,6 +89,13 @@ function safeMask(encryptedApiKey) {
 
 function testStatusFor(error) {
   if (error.code === "invalid_api_key") return "invalid_key";
+  if (error.code === "insufficient_scope") return "insufficient_scope";
+  if (error.code === "incorrect_region") return "incorrect_region";
+  if (error.code === "not_found") return "not_found";
+  if (error.code === "invalid_response") return "invalid_response";
+  if (error.code === "rate_limited") return "rate_limited";
+  if (error.code === "provider_unavailable") return "provider_unavailable";
+  if (error.code === "bad_request") return "bad_request";
   if (error.code === "insufficient_credits") return "insufficient_balance";
   if (error.code === "model_unavailable") return "model_unavailable";
   if (error.code === "free_tier_client_only") return "restricted";
@@ -175,6 +187,30 @@ function sanitizeProviderId(value) {
   return PROVIDER_ID_PATTERN.test(candidate) ? candidate : "";
 }
 
+function qoderSettingsForInput(input, existing, providerType, normalizedBaseUrl) {
+  if (providerType !== "qoder_cloud_agents") return { authMode: "pat", openapiBaseUrl: "" };
+  if (input.authMode !== undefined && !["pat", "service_account"].includes(input.authMode)) {
+    return { error: "Choose Personal access token or Service account key for Qoder." };
+  }
+  const authMode = (input.authMode || existing?.authMode || "pat") === "service_account" ? "service_account" : "pat";
+  const openapiBaseUrl = input.openapiBaseUrl !== undefined ? String(input.openapiBaseUrl || "").trim() : existing?.openapiBaseUrl || "";
+  try {
+    validateQoderSettings({ baseUrl: normalizedBaseUrl, authMode, openapiBaseUrl });
+  } catch (error) {
+    if (error instanceof ProviderError) return { error: error.message };
+    throw error;
+  }
+  return { authMode, openapiBaseUrl };
+}
+
+function qoderTestSettings(input, stored, providerType) {
+  if (providerType !== "qoder_cloud_agents") return { authMode: "pat", openapiBaseUrl: "" };
+  return {
+    authMode: input.authMode || stored?.authMode || "pat",
+    openapiBaseUrl: String(input.openapiBaseUrl ?? stored?.openapiBaseUrl ?? "").trim()
+  };
+}
+
 function buildProviderUpdate(input, existing) {
   const apiKey = typeof input.apiKey === "string" ? input.apiKey.trim() : "";
   const validationError = validateProviderFields(
@@ -187,14 +223,26 @@ function buildProviderUpdate(input, existing) {
   assertAllowedProviderUrl(normalizedBaseUrl);
 
   const providerType = normalizeProviderType(input.providerType || existing?.providerType || "openai_compatible");
+  const qoder = qoderSettingsForInput(input, existing, providerType, normalizedBaseUrl);
+  if (qoder.error) return { error: qoder.error };
+  const { authMode, openapiBaseUrl } = qoder;
+
   const update = {
     providerId: sanitizeProviderId(input.providerId) || providerIdFromName(input.provider),
     provider: input.provider.trim(),
     providerType,
     baseUrl: normalizedBaseUrl,
+    authMode,
+    openapiBaseUrl,
     model: typeof input.model === "string" ? input.model.trim() : existing?.model || ""
   };
   if (apiKey.length > 0) update.encryptedApiKey = encryptSecret(apiKey);
+
+  // Editing anything that can change the outcome invalidates a saved
+  // verification so the UI cannot keep showing "Connected" for old values.
+  if (providerBehaviorChanged(existing, update, apiKey.length > 0)) {
+    Object.assign(update, invalidatedTestFields());
+  }
   return { update };
 }
 
@@ -453,7 +501,7 @@ router.post("/providers/:identifier/test", async (req, res, next) => {
     }
 
     try {
-      const result = await testProviderConnection({ baseUrl: normalizedBaseUrl, apiKey, providerType });
+      const result = await testProviderConnection({ baseUrl: normalizedBaseUrl, apiKey, providerType, ...qoderTestSettings(input, stored, providerType) });
       const parts = [result.listingSupported ? "Connection succeeded." : "Endpoint reached."];
       if (result.availableModels.length > 0) {
         parts.push(`${result.availableModels.length} models available.`);
@@ -524,7 +572,7 @@ router.post("/providers/:identifier/test-model", async (req, res, next) => {
     }
 
     try {
-      const result = await testProviderModel({ baseUrl: normalizedBaseUrl, apiKey, providerType, model });
+      const result = await testProviderModel({ baseUrl: normalizedBaseUrl, apiKey, providerType, model, ...qoderTestSettings(input, stored, providerType) });
       const message = `Model "${model}" responded correctly. A small amount of provider tokens may have been used.`;
       await recordTestResult(req.userId, stored, "connected", "", message);
       return res.json({
@@ -619,12 +667,20 @@ router.put("/provider", async (req, res, next) => {
     const normalizedBaseUrl = normalizeBaseUrl(input.baseUrl);
     assertAllowedProviderUrl(normalizedBaseUrl);
     const providerId = existing?.providerId || providerIdFromName(input.provider);
+    const providerType = normalizeProviderType(input.providerType || existing?.providerType || "openai_compatible");
+    const qoder = qoderSettingsForInput(input, existing, providerType, normalizedBaseUrl);
+    if (qoder.error) return res.status(400).json({ message: qoder.error });
     const update = {
       provider: input.provider.trim(),
-      providerType: normalizeProviderType(input.providerType || existing?.providerType || "openai_compatible"),
+      providerType,
       baseUrl: normalizedBaseUrl,
+      authMode: qoder.authMode,
+      openapiBaseUrl: qoder.openapiBaseUrl,
       model: typeof input.model === "string" ? input.model.trim() : existing?.model || ""
     };
+    if (providerBehaviorChanged(existing, update, apiKey.length > 0)) {
+      Object.assign(update, invalidatedTestFields());
+    }
     if (!existing) {
       update.providerId = providerId;
       update.configId = providerId;
@@ -690,7 +746,7 @@ router.post("/provider/test", async (req, res, next) => {
     }
 
     try {
-      const result = await testProviderConnection({ baseUrl: normalizedBaseUrl, apiKey, providerType });
+      const result = await testProviderConnection({ baseUrl: normalizedBaseUrl, apiKey, providerType, ...qoderTestSettings(input, stored, providerType) });
       const parts = [result.listingSupported ? "Connection succeeded." : "Endpoint reached."];
       if (result.availableModels.length > 0) parts.push(`${result.availableModels.length} models available.`);
       else if (result.warning) parts.push(result.warning);
@@ -749,7 +805,7 @@ router.post("/provider/test-model", async (req, res, next) => {
     }
 
     try {
-      const result = await testProviderModel({ baseUrl: normalizedBaseUrl, apiKey, providerType, model });
+      const result = await testProviderModel({ baseUrl: normalizedBaseUrl, apiKey, providerType, model, ...qoderTestSettings(input, stored, providerType) });
       const message = `Model "${model}" responded correctly. A small amount of provider tokens may have been used.`;
       if (stored) await recordTestResult(req.userId, stored, "connected", "", message);
       return res.json({
@@ -840,7 +896,7 @@ router.get("/models", async (req, res, next) => {
         return res.status(500).json({ message: "The stored API key could not be decrypted. Re-enter and save your key." });
       }
       try {
-        const models = await listProviderModels({ baseUrl: stored.baseUrl, apiKey, providerType: stored.providerType });
+        const models = await listProviderModels({ baseUrl: stored.baseUrl, apiKey, providerType: stored.providerType, authMode: stored.authMode, openapiBaseUrl: stored.openapiBaseUrl });
         const liveEntries = models.map(model => ({
           ...model,
           name: model.name || model.id,
@@ -901,7 +957,7 @@ router.get("/models", async (req, res, next) => {
         warning = { message: "The stored API key could not be decrypted. Re-enter and save your key.", code: "key_decryption_failed" };
       } else {
         try {
-          const models = await listProviderModels({ baseUrl: active.baseUrl, apiKey, providerType: active.providerType });
+          const models = await listProviderModels({ baseUrl: active.baseUrl, apiKey, providerType: active.providerType, authMode: active.authMode, openapiBaseUrl: active.openapiBaseUrl });
           const liveEntries = models.map(model => ({
             ...model,
             name: model.name || model.id,

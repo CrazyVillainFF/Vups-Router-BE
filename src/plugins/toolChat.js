@@ -50,6 +50,8 @@ export async function runPluginToolLoop({
   for (let round = 0; round <= MAX_TOOL_ROUNDS; round += 1) {
     const result = await chatCompletion({
       baseUrl: provider.baseUrl,
+      authMode: provider.authMode,
+      openapiBaseUrl: provider.openapiBaseUrl,
       apiKey: provider.apiKey,
       providerType: provider.providerType,
       model,

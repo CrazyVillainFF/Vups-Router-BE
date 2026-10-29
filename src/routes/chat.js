@@ -298,6 +298,8 @@ function sharedRoute(shared, requestedModel = "") {
     provider: provider.provider,
     providerType: provider.providerType || "openai_compatible",
     baseUrl: provider.baseUrl,
+    authMode: provider.authMode,
+    openapiBaseUrl: provider.openapiBaseUrl,
     apiKey: provider.apiKey,
     defaultModel: model,
     fallbackModel,
@@ -1512,6 +1514,8 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
             attempts = attempt + 1;
             return chatCompletion({
               baseUrl: provider.baseUrl,
+              authMode: provider.authMode,
+              openapiBaseUrl: provider.openapiBaseUrl,
               apiKey: provider.apiKey,
               providerType: provider.providerType,
               model: provider.model,
@@ -1638,6 +1642,8 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
           return startChatCompletionStream(
             {
               baseUrl: provider.baseUrl,
+              authMode: provider.authMode,
+              openapiBaseUrl: provider.openapiBaseUrl,
               apiKey: provider.apiKey,
               providerType: provider.providerType,
               model: provider.model,
@@ -2137,6 +2143,8 @@ router.post("/desktop-tools", requireAuth, chatRateLimiter, async (req, res, nex
             return chatCompletion(
               {
                 baseUrl: provider.baseUrl,
+                authMode: provider.authMode,
+                openapiBaseUrl: provider.openapiBaseUrl,
                 apiKey: provider.apiKey,
                 providerType: provider.providerType,
                 model,
@@ -2370,7 +2378,7 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
       while (!pluginRun) {
         try {
           result = await chatCompletion(
-            { baseUrl: provider.baseUrl, apiKey: provider.apiKey, providerType: provider.providerType, model: usedModel, messages: upstreamMessages, temperature, maxTokens: provider.maxTokens, reasoning: provider.reasoning },
+            { baseUrl: provider.baseUrl, apiKey: provider.apiKey, providerType: provider.providerType, authMode: provider.authMode, openapiBaseUrl: provider.openapiBaseUrl, model: usedModel, messages: upstreamMessages, temperature, maxTokens: provider.maxTokens, reasoning: provider.reasoning },
             undefined
           );
           break;
@@ -2495,7 +2503,7 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
         if (provider.shared && provider.fallbackModel) streamRetry.maxRetries = 0;
         upstream = await withProviderRetry(
           () => startChatCompletionStream(
-            { baseUrl: provider.baseUrl, apiKey: provider.apiKey, providerType: provider.providerType, model: usedModel, messages: upstreamMessages, temperature, maxTokens: provider.maxTokens, reasoning: provider.reasoning },
+            { baseUrl: provider.baseUrl, apiKey: provider.apiKey, providerType: provider.providerType, authMode: provider.authMode, openapiBaseUrl: provider.openapiBaseUrl, model: usedModel, messages: upstreamMessages, temperature, maxTokens: provider.maxTokens, reasoning: provider.reasoning },
             controller.signal
           ),
           { ...streamRetry, signal: controller.signal }

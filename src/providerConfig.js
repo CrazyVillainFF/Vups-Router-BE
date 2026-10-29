@@ -18,6 +18,23 @@ export function newConfigId() {
   return crypto.randomUUID();
 }
 
+// Anything that can change the outcome of a verification invalidates the saved
+// result, so an old "Connected" badge cannot describe new credentials or URLs.
+export function providerBehaviorChanged(existing, update, apiKeyChanged = false) {
+  if (!existing) return false;
+  return (
+    existing.baseUrl !== update.baseUrl ||
+    (existing.providerType || "openai_compatible") !== update.providerType ||
+    (existing.authMode || "pat") !== update.authMode ||
+    (existing.openapiBaseUrl || "") !== (update.openapiBaseUrl || "") ||
+    Boolean(apiKeyChanged)
+  );
+}
+
+export function invalidatedTestFields() {
+  return { lastTestStatus: "", lastTestCode: "", lastTestMessage: "", lastTestAt: null };
+}
+
 const providerConfigSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
   configId: { type: String, required: true, trim: true, maxlength: 80, index: true },
@@ -29,6 +46,10 @@ const providerConfigSchema = new mongoose.Schema({
     default: "openai_compatible"
   },
   baseUrl: { type: String, required: true, trim: true, maxlength: 500 },
+  // Qoder Cloud Agents accept a personal access token directly or a service
+  // account key that is exchanged for a short-lived SAT on the OpenAPI host.
+  authMode: { type: String, enum: ["pat", "service_account"], default: "pat" },
+  openapiBaseUrl: { type: String, trim: true, maxlength: 500, default: "" },
   model: { type: String, trim: true, maxlength: 200, default: "" },
   models: { type: [String], default: [] },
   // Models whose zero price was verified from provider metadata during free

@@ -4,6 +4,7 @@ import http from "node:http";
 // tail-only SSE stream, and the buffered agent.message that repeats whatever
 // was already streamed.
 export const FAKE_QODER_API_KEY = "qoder-fake-pat-1234567890";
+export const FAKE_QODER_SA_KEY = "qoder-fake-sa-key-0987654321";
 export const FAKE_QODER_MODELS = ["ultimate", "giga"];
 export const FAKE_QODER_MODEL = FAKE_QODER_MODELS[0];
 export const FAKE_QODER_REPLY = "Hello world";
@@ -37,15 +38,42 @@ export async function startFakeQoder() {
     agents: [],
     mode: "delta",
     unauthorized: false,
+    serviceTokensIssued: 0,
+    issuedTokens: new Set(),
+    currentSat: "",
+    exchangeStatus: 0,
+    exchangePayload: null,
+    scopeDenied: false,
+    modelsStatus: 0,
+    modelsDelayMs: 0,
+    modelsInvalidShape: false,
+    rejectSatOnce: false,
     clearRequests() {
       // Mutates in place so test files can keep a stable reference to the log.
       state.requests.length = 0;
       state.mode = "delta";
       state.unauthorized = false;
+      state.serviceTokensIssued = 0;
+      state.issuedTokens.clear();
+      state.currentSat = "";
+      state.exchangeStatus = 0;
+      state.exchangePayload = null;
+      state.scopeDenied = false;
+      state.modelsStatus = 0;
+      state.modelsDelayMs = 0;
+      state.modelsInvalidShape = false;
+      state.rejectSatOnce = false;
     },
     paths(method, prefix) {
       return state.requests.filter(entry => entry.method === method && entry.path.startsWith(prefix));
     }
+  };
+
+  const bearerToken = req => String(req.headers.authorization || "").replace(/^Bearer\s+/i, "").trim();
+  const authorized = req => {
+    const token = bearerToken(req);
+    if (token.startsWith(FAKE_QODER_API_KEY)) return true;
+    return state.issuedTokens.has(token);
   };
 
   let resolvePosted = null;
@@ -64,10 +92,45 @@ export async function startFakeQoder() {
     }
     state.requests.push({ method: req.method, path: url.pathname, search: url.search, headers: req.headers, body });
 
-    if (url.pathname === "/api/v1/cloud/models") {
-      if (state.unauthorized || req.headers.authorization === "Bearer bad-key") {
+    if (url.pathname === "/api/v1/serviceToken/exchange" && req.method === "POST") {
+      if (state.exchangeStatus) {
+        return json(res, state.exchangeStatus, { type: "error", error: { type: "api_error", message: `Injected exchange ${state.exchangeStatus}.` } });
+      }
+      if (req.headers.authorization !== `Bearer ${FAKE_QODER_SA_KEY}`) {
+        return json(res, 401, { type: "error", error: { type: "authentication_error", message: "Invalid service account key." } });
+      }
+      if (state.scopeDenied || !String(body?.scope || "").split(/\s+/).includes("qca.access")) {
+        return json(res, 403, { type: "error", error: { type: "permission_error", message: "Scope qca.access is not allowed for this key." } });
+      }
+      if (body?.grant_type !== "client_credentials" || body?.audience !== "qoder") {
+        return json(res, 400, { type: "error", error: { type: "invalid_request_error", message: "Unsupported grant." } });
+      }
+      if (state.exchangePayload) return json(res, 200, state.exchangePayload);
+      state.serviceTokensIssued += 1;
+      const token = `sat-fake-${state.serviceTokensIssued}`;
+      state.issuedTokens.add(token);
+      state.currentSat = token;
+      return json(res, 200, { access_token: token, token_type: "Bearer", expires_in: 3600 });
+    }
+
+    if (url.pathname.startsWith("/api/v1/cloud/")) {
+      const token = bearerToken(req);
+      if (state.rejectSatOnce && token && token === state.currentSat) {
+        state.rejectSatOnce = false;
+        state.issuedTokens.delete(token);
+        return json(res, 401, { type: "error", error: { type: "authentication_error", message: "Access token expired." } });
+      }
+      if (state.unauthorized || !authorized(req)) {
         return json(res, 401, { type: "error", error: { type: "authentication_error", message: "Invalid access token." } });
       }
+    }
+
+    if (url.pathname === "/api/v1/cloud/models") {
+      if (state.modelsDelayMs) await new Promise(done => setTimeout(done, state.modelsDelayMs));
+      if (state.modelsStatus) {
+        return json(res, state.modelsStatus, { type: "error", error: { type: "api_error", message: `Injected models ${state.modelsStatus}.` } });
+      }
+      if (state.modelsInvalidShape) return json(res, 200, { ok: true });
       return json(res, 200, {
         data: [
           { id: "ultimate", type: "model", display_name: "Ultimate", source: "system", is_enabled: true, max_input_tokens: 1000000 },

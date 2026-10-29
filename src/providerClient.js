@@ -246,28 +246,366 @@ function requireWatsonxProjectId(baseUrl) {
 // and never replays history, so the stream is opened before the message is sent.
 // A reply arrives as incremental `event_delta` frames plus one authoritative
 // buffered `agent.message`; the turn ends with `session.status_idle`.
-const QODER_HOSTS = new Set(["api.qoder.com", "www.api.qoder.com"]);
+// Qoder documents one region pair per deployment: token exchange happens on the
+// OpenAPI host, business calls on the API host, and the two must share a region.
+const QODER_REGIONS = {
+  global: {
+    label: "Global",
+    businessBase: "https://api.qoder.com",
+    openapiBase: "https://openapi.qoder.sh"
+  },
+  cn: {
+    label: "China mainland",
+    businessBase: "https://api.qoder.com.cn",
+    openapiBase: "https://openapi.qoder.com.cn"
+  }
+};
+const QODER_BUSINESS_HOSTS = new Map([
+  ["api.qoder.com", "global"],
+  ["www.api.qoder.com", "global"],
+  ["api.qoder.com.cn", "cn"],
+  ["www.api.qoder.com.cn", "cn"]
+]);
+const QODER_OPENAPI_HOSTS = new Map([
+  ["openapi.qoder.sh", "global"],
+  ["openapi.qoder.com.cn", "cn"]
+]);
+const QODER_CLOUD_PATH = "/api/v1/cloud";
+// Cloud Agents is a Managed API. Forward is not implemented here, so only the
+// scope this feature actually uses is requested — never forward.access.
+const QODER_CLOUD_SCOPE = "qca.access";
+const QODER_SAT_TTL_SECONDS = 3600;
+const QODER_SAT_REFRESH_MARGIN_MS = 60000;
+const QODER_AUTH_MODES = new Set(["pat", "service_account"]);
 const QODER_ROLE_LABELS = { user: "User", assistant: "Assistant", system: "System" };
 // Keyed on the credential fingerprint so two users of the same public host
 // never share an environment or an agent.
 const qoderEnvironmentCache = new Map();
 const qoderAgentCache = new Map();
+// Service account tokens are short-lived. They stay in process memory only and
+// are refreshed from the SA key when they near expiry or are rejected.
+const qoderSatCache = new Map();
 
-function isQoderHost(hostname) {
-  return QODER_HOSTS.has(String(hostname || "").toLowerCase());
+export function qoderRegionForHost(hostname) {
+  const host = String(hostname || "").toLowerCase();
+  return QODER_BUSINESS_HOSTS.get(host) || QODER_OPENAPI_HOSTS.get(host) || null;
 }
 
-function qoderApiBase(baseUrl) {
+function qoderCloudPath(pathname) {
+  let path = String(pathname || "").replace(/\/+$/, "");
+  if (/\/api\/v\d+\/forward(?:\/|$)/i.test(path)) {
+    throw new ProviderError(
+      "This build supports Qoder Cloud Agents (Managed) at /api/v1/cloud. Qoder Forward API endpoints are not implemented, so use the Cloud Agents base URL.",
+      400,
+      "unsupported_qoder_mode"
+    );
+  }
+  const cloud = path.match(/^(.*\/api\/v\d+\/cloud)(?:\/|$)/i);
+  if (cloud) return cloud[1];
+  if (/\/api\/v\d+$/i.test(path)) return `${path}/cloud`;
+  // A pasted /api/v1 root must not become /api/v1/api/v1/cloud.
+  path = path.replace(/\/api\/v\d+(?=\/|$)/gi, "");
+  return `${path}${QODER_CLOUD_PATH}`.replace(/\/{2,}/g, "/");
+}
+
+// The documented base URL may be a host, a host with /api/v1/cloud, or a host
+// with extra path segments. Every form resolves to one canonical Cloud root.
+export function qoderApiBase(baseUrl) {
   const parsed = new URL(normalizeBaseUrl(baseUrl));
-  const path = parsed.pathname.replace(/\/+$/, "");
-  if (isQoderHost(parsed.hostname)) return `${parsed.origin}/api/v1/cloud`;
-  if (/\/api\/v\d+\/cloud$/i.test(path) || /\/cloud$/i.test(path)) return parsed.origin + path;
-  return parsed.origin + `${path}/api/v1/cloud`.replace(/\/{2,}/g, "/");
+  const host = parsed.hostname.toLowerCase();
+  const businessRegion = QODER_BUSINESS_HOSTS.get(host);
+  if (businessRegion) return `${QODER_REGIONS[businessRegion].businessBase}${QODER_CLOUD_PATH}`;
+  const openapiRegion = QODER_OPENAPI_HOSTS.get(host);
+  if (openapiRegion) return `${QODER_REGIONS[openapiRegion].businessBase}${QODER_CLOUD_PATH}`;
+  return `${parsed.origin}${qoderCloudPath(parsed.pathname)}${parsed.search}`;
 }
 
-function qoderCacheKey(baseUrl, apiKey) {
-  const fingerprint = createHash("sha256").update(String(apiKey || "")).digest("hex").slice(0, 16);
-  return `${qoderApiBase(baseUrl)}|${fingerprint}`;
+function qoderJoin(base, suffix) {
+  const url = new URL(base);
+  const extra = String(suffix || "").replace(/^\/+/, "").replace(/\/+$/, "");
+  const path = url.pathname.replace(/\/+$/, "");
+  url.pathname = extra ? `${path}/${extra}`.replace(/\/{2,}/g, "/") : path;
+  return url.toString();
+}
+
+export function qoderOpenApiRoot(openapiBaseUrl) {
+  const value = String(openapiBaseUrl || "").trim();
+  if (!value) return "";
+  const parsed = new URL(normalizeBaseUrl(value));
+  const host = parsed.hostname.toLowerCase();
+  const region = QODER_OPENAPI_HOSTS.get(host) || QODER_BUSINESS_HOSTS.get(host);
+  if (region) return QODER_REGIONS[region].openapiBase;
+  const path = parsed.pathname
+    .replace(/\/+$/, "")
+    .replace(/\/api\/v\d+\/serviceToken\/exchange$/i, "")
+    .replace(/\/api\/v\d+$/i, "");
+  return `${parsed.origin}${path}`;
+}
+
+export function qoderServiceTokenUrl(openapiBaseUrl) {
+  const root = qoderOpenApiRoot(openapiBaseUrl);
+  if (!root) {
+    throw new ProviderError(
+      "Qoder service account keys need the OpenAPI base URL for token exchange. Use https://openapi.qoder.sh (global) or https://openapi.qoder.com.cn (China).",
+      400,
+      "missing_openapi_url"
+    );
+  }
+  const parsed = new URL(root);
+  let path = parsed.pathname.replace(/\/+$/, "");
+  if (!/\/api\/v\d+$/i.test(path)) path = `${path}/api/v1`.replace(/\/{2,}/g, "/");
+  parsed.pathname = `${path}/serviceToken/exchange`.replace(/\/{2,}/g, "/");
+  parsed.search = "";
+  return parsed.toString();
+}
+
+function qoderCredentials({ baseUrl, apiKey, authMode = "pat", openapiBaseUrl = "" }) {
+  if (typeof apiKey !== "string" || !apiKey.trim()) {
+    throw new ProviderError("Enter a Qoder PAT or service account key first.", 400, "missing_api_key");
+  }
+  const mode = QODER_AUTH_MODES.has(authMode) ? authMode : "pat";
+  const businessBase = qoderApiBase(baseUrl);
+  const businessHost = new URL(businessBase).hostname.toLowerCase();
+  const region = qoderRegionForHost(businessHost) || qoderRegionForHost(new URL(normalizeBaseUrl(baseUrl)).hostname) || null;
+  if (new URL(businessBase).protocol !== "https:" && !privateProviderUrlsAllowed()) {
+    throw new ProviderError("Qoder's API URL must use HTTPS. Use https://api.qoder.com or https://api.qoder.com.cn.", 400, "invalid_base_url");
+  }
+  let openapiRoot = "";
+  if (mode === "service_account") {
+    const configured = String(openapiBaseUrl || "").trim() || (region ? QODER_REGIONS[region].openapiBase : "");
+    openapiRoot = qoderOpenApiRoot(configured);
+    if (!openapiRoot) {
+      throw new ProviderError(
+        "Qoder service account keys need the OpenAPI base URL for token exchange. Use https://openapi.qoder.sh (global) or https://openapi.qoder.com.cn (China).",
+        400,
+        "missing_openapi_url"
+      );
+    }
+    const openapiHost = new URL(openapiRoot).hostname.toLowerCase();
+    const openapiRegion = qoderRegionForHost(openapiHost);
+    if (region && openapiRegion && region !== openapiRegion) {
+      const label = value => (value === "cn" ? "China mainland" : "Global");
+      throw new ProviderError(
+        `The Qoder API URL is ${label(region)} but the OpenAPI URL is ${label(openapiRegion)}. Token exchange and business calls must use the same region.`,
+        400,
+        "incorrect_region"
+      );
+    }
+    if (new URL(openapiRoot).protocol !== "https:" && !privateProviderUrlsAllowed()) {
+      throw new ProviderError("Qoder's OpenAPI URL must use HTTPS.", 400, "invalid_base_url");
+    }
+  }
+  return {
+    apiKey: apiKey.trim(),
+    authMode: mode,
+    businessBase,
+    businessHost,
+    region,
+    openapiRoot,
+    exchangeUrl: openapiRoot ? qoderServiceTokenUrl(openapiRoot) : ""
+  };
+}
+
+// URL/region validation without a credential, reused by the settings routes
+// before anything is saved.
+export function validateQoderSettings({ baseUrl, authMode = "pat", openapiBaseUrl = "" }) {
+  qoderCredentials({ baseUrl, apiKey: "validation-placeholder", authMode, openapiBaseUrl });
+}
+
+function qoderSatCacheKey(credentials) {
+  return createHash("sha256").update(`qoder-sat|${credentials.openapiRoot}|${credentials.apiKey}`).digest("hex");
+}
+
+function qoderTokenExpiryMs(payload, token) {
+  const now = Date.now();
+  const expiresIn = Number(payload?.expires_in ?? payload?.expiresIn);
+  if (Number.isFinite(expiresIn) && expiresIn > 0) return now + Math.min(expiresIn, 43200) * 1000;
+  const rawExpiry = payload?.expires_at ?? payload?.expiresAt;
+  if (typeof rawExpiry === "string" && rawExpiry.trim()) {
+    const parsed = Date.parse(rawExpiry);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  const numeric = Number(rawExpiry);
+  if (Number.isFinite(numeric) && numeric > 0) return numeric > 1e12 ? numeric : numeric * 1000;
+  const parts = String(token || "").split(".");
+  if (parts.length === 3) {
+    try {
+      const claims = JSON.parse(Buffer.from(parts[1].replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8"));
+      const exp = Number(claims?.exp);
+      if (Number.isFinite(exp) && exp > 0) return exp * 1000;
+    } catch {
+      /* not a JWT; fall back to the requested TTL */
+    }
+  }
+  return now + QODER_SAT_TTL_SECONDS * 1000;
+}
+
+function qoderExchangeFailure(config, status, payload) {
+  const detail = sanitizedErrorDetail(payload);
+  const suffix = detail ? ` Qoder said: ${detail}` : "";
+  if (status === 400) {
+    return new ProviderError(
+      `Qoder rejected the service token request (HTTP 400). Check the qca.access scope and the service account key.${suffix}`,
+      status,
+      "bad_request"
+    );
+  }
+  if (status === 401) {
+    return new ProviderError(
+      `Qoder rejected the service account key (HTTP 401). Create a new key in the Qoder organization console and try again.${suffix}`,
+      status,
+      "invalid_api_key"
+    );
+  }
+  if (status === 403) {
+    return new ProviderError(
+      `The service account key is not allowed to request qca.access (HTTP 403). Grant the Cloud Agents scope to this key.${suffix}`,
+      status,
+      "insufficient_scope"
+    );
+  }
+  if (status === 404) {
+    return new ProviderError(
+      "The Qoder OpenAPI host has no service token endpoint (HTTP 404). Check the region: https://openapi.qoder.sh for Global or https://openapi.qoder.com.cn for China mainland.",
+      status,
+      "incorrect_region"
+    );
+  }
+  if (status === 429) {
+    return new ProviderError(`Qoder is rate-limiting token exchanges (HTTP 429). Wait a moment and try again.${suffix}`, status, "rate_limited");
+  }
+  if (typeof status === "number" && status >= 500) {
+    return new ProviderError(`Qoder's token service is temporarily unavailable (HTTP ${status}).${suffix}`, status, "provider_unavailable");
+  }
+  return new ProviderError(`Qoder's token service returned an unexpected error (HTTP ${status}).${suffix}`, status, "provider_error");
+}
+
+async function qoderExchangeServiceToken(config, signal) {
+  const url = config.exchangeUrl;
+  const context = { stage: "token_exchange", authMode: config.authMode, region: config.region };
+  let response;
+  try {
+    response = await guardedProviderFetch(url, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${config.apiKey}`, "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({
+        grant_type: "client_credentials",
+        audience: "qoder",
+        scope: QODER_CLOUD_SCOPE,
+        ttl_seconds: QODER_SAT_TTL_SECONDS
+      }),
+      signal: signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+    });
+  } catch (error) {
+    if (error?.name === "TimeoutError" || error?.name === "AbortError") {
+      const timeout = attachProviderDiagnostic(
+        new ProviderError("Timed out while exchanging the Qoder service account key (token exchange).", null, "timeout"),
+        { url, context, classification: { category: "timeout", classification: "transient", retryable: true } }
+      );
+      timeout.qoderStage = "token_exchange";
+      throw timeout;
+    }
+    if (error instanceof ProviderError) {
+      error.qoderStage = error.qoderStage || "token_exchange";
+      throw error;
+    }
+    const failure = networkError(error, url, context);
+    failure.qoderStage = "token_exchange";
+    throw failure;
+  }
+  const payload = await readJsonSafely(response);
+  if (!response.ok) {
+    // Never include access_token from an unexpected 2xx-shaped body in logs.
+    const safePayload = payload && typeof payload === "object" ? { ...payload, access_token: undefined } : payload;
+    const failure = attachProviderDiagnostic(
+      qoderExchangeFailure(config, response.status, safePayload),
+      { url, status: response.status, payload: safePayload, headers: response.headers, context, retryAfter: parseRetryAfter(response.headers.get("retry-after")) }
+    );
+    failure.qoderStage = "token_exchange";
+    throw failure;
+  }
+  const token = typeof payload?.access_token === "string" ? payload.access_token.trim() : "";
+  if (!token) {
+    const failure = attachProviderDiagnostic(
+      new ProviderError(
+        "Qoder's token exchange returned no access_token. Check that the service account key is active and that qca.access is allowed.",
+        502,
+        "invalid_response"
+      ),
+      { url, status: response.status, context, headers: response.headers, classification: { category: "invalid_response", classification: "permanent", retryable: false } }
+    );
+    failure.qoderStage = "token_exchange";
+    throw failure;
+  }
+  const expiresAt = qoderTokenExpiryMs(payload, token);
+  if (!Number.isFinite(expiresAt) || expiresAt <= Date.now() + 5000) {
+    const failure = attachProviderDiagnostic(
+      new ProviderError("Qoder returned a service token that is already expired. Check the server clock and try again.", 502, "invalid_response"),
+      { url, status: response.status, context, classification: { category: "invalid_response", classification: "permanent", retryable: false } }
+    );
+    failure.qoderStage = "token_exchange";
+    throw failure;
+  }
+  return { token, expiresAt };
+}
+
+async function qoderAccessToken(credentials, signal) {
+  if (credentials.authMode !== "service_account") return credentials.apiKey;
+  const key = qoderSatCacheKey(credentials);
+  const cached = qoderSatCache.get(key);
+  if (cached && cached.expiresAt > Date.now() + QODER_SAT_REFRESH_MARGIN_MS) return cached.token;
+  const issued = await qoderExchangeServiceToken(credentials, signal);
+  qoderSatCache.set(key, issued);
+  if (qoderSatCache.size > 200) {
+    for (const [entryKey, entry] of qoderSatCache) {
+      if (entry.expiresAt <= Date.now()) qoderSatCache.delete(entryKey);
+    }
+    while (qoderSatCache.size > 200) qoderSatCache.delete(qoderSatCache.keys().next().value);
+  }
+  return issued.token;
+}
+
+async function qoderAuthHeaders(credentials, accept, signal) {
+  const headers = {
+    "Content-Type": "application/json",
+    Accept: accept || "application/json",
+    Authorization: `Bearer ${await qoderAccessToken(credentials, signal)}`
+  };
+  return headers;
+}
+
+function qoderBusinessError(url, response, payload, credentials, context) {
+  const error = providerHttpError(
+    url,
+    response.status,
+    payload,
+    parseRetryAfter(response.headers.get("retry-after")),
+    response.headers,
+    { ...context, authMode: credentials.authMode, region: credentials.region }
+  );
+  error.qoderStage = "business_api";
+  const detail = sanitizedErrorDetail(payload);
+  const suffix = detail ? ` Qoder said: ${detail}` : "";
+  if (response.status === 401) {
+    error.code = "invalid_api_key";
+    error.message =
+      credentials.authMode === "service_account"
+        ? `Qoder rejected the service account token (HTTP 401) even after a fresh exchange. Check that the key is active and allowed to use Cloud Agents.${suffix}`
+        : `Qoder rejected the personal access token (HTTP 401). Create a new token in Qoder Settings → Personal Access Tokens.${suffix}`;
+  } else if (response.status === 403) {
+    error.code = "insufficient_scope";
+    error.message = `Qoder denied the request (HTTP 403). The credential is missing the qca.access scope or access to Cloud Agents.${suffix}`;
+  } else if (response.status === 404) {
+    error.code = "not_found";
+    error.message =
+      "Qoder returned HTTP 404. Check the API base URL: it must be the business host (https://api.qoder.com or https://api.qoder.com.cn) with /api/v1/cloud, not the OpenAPI host.";
+  }
+  return error;
+}
+
+function qoderCacheKey(credentials) {
+  const fingerprint = createHash("sha256").update(String(credentials.apiKey || "")).digest("hex").slice(0, 16);
+  return `${credentials.businessBase}|${fingerprint}`;
 }
 
 function qoderRemember(cache, key, value) {
@@ -276,44 +614,53 @@ function qoderRemember(cache, key, value) {
   return value;
 }
 
-async function qoderRequest(url, { method = "GET", body, accept, headers }, signal, context = {}) {
-  let response;
-  try {
-    response = await guardedProviderFetch(url, {
-      method,
-      headers: accept ? { ...headers, Accept: accept } : headers,
-      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-      signal: signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS)
-    });
-  } catch (error) {
-    if (error?.name === "TimeoutError" || error?.name === "AbortError") {
-      throw attachProviderDiagnostic(
-        new ProviderError("Timed out while contacting Qoder Cloud Agents.", null, "timeout"),
-        { url, context, classification: { category: "timeout", classification: "transient", retryable: true } }
-      );
+async function qoderRequest(url, { method = "GET", body, accept, credentials }, signal, context = {}) {
+  for (let attempt = 0; ; attempt += 1) {
+    const headers = await qoderAuthHeaders(credentials, accept, signal);
+    let response;
+    try {
+      response = await guardedProviderFetch(url, {
+        method,
+        headers,
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        signal: signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+      });
+    } catch (error) {
+      if (error?.name === "TimeoutError") {
+        throw attachProviderDiagnostic(
+          new ProviderError("Timed out while contacting Qoder Cloud Agents.", null, "timeout"),
+          { url, context, classification: { category: "timeout", classification: "transient", retryable: true } }
+        );
+      }
+      if (error?.name === "AbortError" && signal?.aborted) throw new ProviderError("Request cancelled.", null, "cancelled");
+      if (error instanceof ProviderError) throw error;
+      throw networkError(error, url, context);
     }
-    if (error instanceof ProviderError) throw error;
-    throw networkError(error, url, context);
+    if (response.ok) return response;
+    const payload = await readJsonSafely(response);
+    const error = qoderBusinessError(url, response, payload, credentials, context);
+    // A SAT can expire or be revoked between exchange and use. Discard it and
+    // retry once with a freshly exchanged token; the second 401 is final.
+    if (attempt === 0 && credentials.authMode === "service_account" && error.status === 401) {
+      qoderSatCache.delete(qoderSatCacheKey(credentials));
+      continue;
+    }
+    throw error;
   }
-  if (!response.ok) {
-    throw providerHttpError(
-      url,
-      response.status,
-      await readJsonSafely(response),
-      parseRetryAfter(response.headers.get("retry-after")),
-      response.headers,
-      context
-    );
-  }
-  return response;
 }
 
-async function qoderListModels({ baseUrl, apiKey }, signal) {
-  const url = `${qoderApiBase(baseUrl)}/models`;
-  const response = await qoderRequest(url, { headers: await authHeaders(apiKey, "qoder_cloud_agents", baseUrl) }, signal);
+async function qoderListModels(credentials, signal) {
+  const url = qoderJoin(credentials.businessBase, "models");
+  const context = { stage: "business_api", operation: "models", authMode: credentials.authMode, region: credentials.region };
+  const response = await qoderRequest(url, { credentials }, signal, context);
   const payload = await readJsonSafely(response);
-  const entries = Array.isArray(payload?.data) ? payload.data : [];
-  return entries
+  if (!payload || typeof payload !== "object" || !Array.isArray(payload.data)) {
+    throw attachProviderDiagnostic(
+      new ProviderError("Qoder's model list response was not in the documented shape (expected a data array).", 502, "invalid_response"),
+      { url, status: response.status, payload, headers: response.headers, context, classification: { category: "invalid_response", classification: "permanent", retryable: false } }
+    );
+  }
+  return payload.data
     .filter(entry => entry?.is_enabled !== false)
     .map(entry => {
       const id = typeof entry?.id === "string" ? entry.id.trim() : "";
@@ -333,19 +680,35 @@ async function qoderListModels({ baseUrl, apiKey }, signal) {
     .slice(0, 1000);
 }
 
+// Read-only fallback used when /models is unavailable: it still proves the
+// credential can reach the business API, without creating anything.
+async function qoderProbeAgents(credentials, signal) {
+  const url = new URL(qoderJoin(credentials.businessBase, "agents"));
+  url.searchParams.set("limit", "1");
+  const context = { stage: "business_api", operation: "agents", authMode: credentials.authMode, region: credentials.region };
+  const response = await qoderRequest(url.toString(), { credentials }, signal, context);
+  const payload = await readJsonSafely(response);
+  if (!payload || typeof payload !== "object" || !Array.isArray(payload.data)) {
+    throw attachProviderDiagnostic(
+      new ProviderError("Qoder's agents response was not in the documented shape (expected a data array).", 502, "invalid_response"),
+      { url: url.toString(), status: response.status, payload, headers: response.headers, context, classification: { category: "invalid_response", classification: "permanent", retryable: false } }
+    );
+  }
+  return payload;
+}
+
 // The API requires an existing environment. Use the account's first one and
 // only create the documented cloud default when the account has none.
-async function qoderEnvironmentId({ baseUrl, apiKey }, signal, context) {
-  const base = qoderApiBase(baseUrl);
-  const cacheKey = qoderCacheKey(baseUrl, apiKey);
+async function qoderEnvironmentId(credentials, signal, context) {
+  const base = credentials.businessBase;
+  const cacheKey = qoderCacheKey(credentials);
   if (qoderEnvironmentCache.has(cacheKey)) return qoderEnvironmentCache.get(cacheKey);
-  const headers = await authHeaders(apiKey, "qoder_cloud_agents", baseUrl);
-  const listed = await qoderRequest(`${base}/environments`, { headers }, signal, context);
+  const listed = await qoderRequest(qoderJoin(base, "environments"), { credentials }, signal, context);
   const existing = (await readJsonSafely(listed))?.data?.[0];
   if (existing?.id) return qoderRemember(qoderEnvironmentCache, cacheKey, existing.id);
-  const created = await qoderRequest(`${base}/environments`, {
+  const created = await qoderRequest(qoderJoin(base, "environments"), {
     method: "POST",
-    headers,
+    credentials,
     body: { name: "VupsRouter", config: { type: "cloud" } }
   }, signal, context);
   const id = (await readJsonSafely(created))?.id;
@@ -356,19 +719,16 @@ async function qoderEnvironmentId({ baseUrl, apiKey }, signal, context) {
 }
 
 // An agent fixes the model, so one agent per (credential, model) is reused.
-async function qoderAgentId({ baseUrl, apiKey, model }, signal, context) {
-  const base = qoderApiBase(baseUrl);
-  const cacheKey = `${qoderCacheKey(baseUrl, apiKey)}|${model}`;
+async function qoderAgentId(credentials, model, signal, context) {
+  const base = credentials.businessBase;
+  const cacheKey = `${qoderCacheKey(credentials)}|${model}`;
   if (qoderAgentCache.has(cacheKey)) return qoderAgentCache.get(cacheKey);
-  const headers = await authHeaders(apiKey, "qoder_cloud_agents", baseUrl);
   let page = "";
   for (let attempt = 0; attempt < 5; attempt += 1) {
-    const listed = await qoderRequest(
-      `${base}/agents?limit=100${page ? `&page=${encodeURIComponent(page)}` : ""}`,
-      { headers },
-      signal,
-      context
-    );
+    const listUrl = new URL(qoderJoin(base, "agents"));
+    listUrl.searchParams.set("limit", "100");
+    if (page) listUrl.searchParams.set("page", page);
+    const listed = await qoderRequest(listUrl.toString(), { credentials }, signal, context);
     const payload = await readJsonSafely(listed);
     const match = (Array.isArray(payload?.data) ? payload.data : [])
       .find(agent => agent?.archived_at === null && (agent?.model === model || agent?.model?.id === model));
@@ -376,9 +736,9 @@ async function qoderAgentId({ baseUrl, apiKey, model }, signal, context) {
     if (!payload?.has_more || !payload?.next_page) break;
     page = payload.next_page;
   }
-  const created = await qoderRequest(`${base}/agents`, {
+  const created = await qoderRequest(qoderJoin(base, "agents"), {
     method: "POST",
-    headers,
+    credentials,
     body: { name: `VupsRouter ${model}`, model, system: "You are a helpful assistant." }
   }, signal, context);
   const id = (await readJsonSafely(created))?.id;
@@ -412,28 +772,28 @@ export function qoderEventContent(messages = []) {
   return blocks;
 }
 
-async function qoderStartStream({ baseUrl, apiKey, model, messages, requestId = null, attempt = null }, signal) {
-  const base = qoderApiBase(baseUrl);
-  const context = { requestId, attempt, model };
-  const headers = await authHeaders(apiKey, "qoder_cloud_agents", baseUrl);
+async function qoderStartStream({ baseUrl, apiKey, authMode, openapiBaseUrl, model, messages, requestId = null, attempt = null }, signal) {
+  const credentials = qoderCredentials({ baseUrl, apiKey, authMode, openapiBaseUrl });
+  const base = credentials.businessBase;
+  const context = { requestId, attempt, model, authMode: credentials.authMode, region: credentials.region };
   const [environmentId, agentId] = await Promise.all([
-    qoderEnvironmentId({ baseUrl, apiKey }, signal, context),
-    qoderAgentId({ baseUrl, apiKey, model }, signal, context)
+    qoderEnvironmentId(credentials, signal, context),
+    qoderAgentId(credentials, model, signal, context)
   ]);
-  const sessionResponse = await qoderRequest(`${base}/sessions`, {
+  const sessionResponse = await qoderRequest(qoderJoin(base, "sessions"), {
     method: "POST",
-    headers,
+    credentials,
     body: { agent: agentId, environment_id: environmentId, title: "VupsRouter" }
   }, signal, context);
   const sessionId = (await readJsonSafely(sessionResponse))?.id;
   if (typeof sessionId !== "string" || !sessionId.startsWith("sess_")) {
     throw new ProviderError("Qoder Cloud Agents returned a session without an ID.", 502, "qoder_no_session");
   }
-  const streamUrl = new URL(`${base}/sessions/${sessionId}/events/stream`);
+  const streamUrl = new URL(qoderJoin(base, `sessions/${sessionId}/events/stream`));
   streamUrl.searchParams.append("event_deltas[]", "agent.message");
   const stream = await qoderRequest(
     streamUrl.toString(),
-    { headers, accept: "text/event-stream" },
+    { credentials, accept: "text/event-stream" },
     signal ?? AbortSignal.timeout(STREAM_TIMEOUT_MS),
     context
   );
@@ -445,9 +805,9 @@ async function qoderStartStream({ baseUrl, apiKey, model, messages, requestId = 
   }
   // Executing only after the stream is attached is what makes the first deltas
   // of this turn observable; Qoder does not replay earlier events.
-  await qoderRequest(`${base}/sessions/${sessionId}/events`, {
+  await qoderRequest(qoderJoin(base, `sessions/${sessionId}/events`), {
     method: "POST",
-    headers,
+    credentials,
     body: { events: [{ type: "user.message", content: qoderEventContent(messages) }] }
   }, signal, context);
   const response = new Response(qoderSSEToChatStream(stream.body), {
@@ -1468,9 +1828,9 @@ async function authHeaders(apiKey, providerType = "openai_compatible", baseUrl =
   };
 }
 
-export async function listProviderModels({ baseUrl, apiKey, providerType = "openai_compatible" }, signal) {
+export async function listProviderModels({ baseUrl, apiKey, providerType = "openai_compatible", authMode = "pat", openapiBaseUrl = "" }, signal) {
   const type = normalizeProviderType(providerType);
-  if (type === "qoder_cloud_agents") return qoderListModels({ baseUrl, apiKey }, signal);
+  if (type === "qoder_cloud_agents") return qoderListModels(qoderCredentials({ baseUrl, apiKey, authMode, openapiBaseUrl }), signal);
   const zen = isOpenCodeZenBase(baseUrl);
   const google = isGoogleGeminiBase(baseUrl);
   let url;
@@ -1737,10 +2097,10 @@ function responsesFinishReason(payload) {
   return payload?.status === "completed" ? "stop" : null;
 }
 
-export async function chatCompletion({ baseUrl, apiKey, model, messages, temperature, maxTokens, providerType = "openai_compatible", reasoning, requestId = null, attempt = null, tools = null, toolChoice = null }, signal) {
+export async function chatCompletion({ baseUrl, apiKey, model, messages, temperature, maxTokens, providerType = "openai_compatible", authMode = "pat", openapiBaseUrl = "", reasoning, requestId = null, attempt = null, tools = null, toolChoice = null }, signal) {
   const type = normalizeProviderType(providerType);
   if (type === "qoder_cloud_agents") {
-    return qoderCompletion({ baseUrl, apiKey, model, messages, requestId, attempt }, signal);
+    return qoderCompletion({ baseUrl, apiKey, authMode, openapiBaseUrl, model, messages, requestId, attempt }, signal);
   }
   const anthropic = usesAnthropicApi(baseUrl, model, type);
   const watsonx = !isOpenCodeZenBase(baseUrl) && type === "watsonx";
@@ -1834,7 +2194,7 @@ export async function chatCompletion({ baseUrl, apiKey, model, messages, tempera
   };
 }
 
-export async function startChatCompletionStream({ baseUrl, apiKey, model, messages, temperature, maxTokens, providerType = "openai_compatible", reasoning, requestId = null, attempt = null, responseTimeoutMs = null }, signal) {
+export async function startChatCompletionStream({ baseUrl, apiKey, model, messages, temperature, maxTokens, providerType = "openai_compatible", authMode = "pat", openapiBaseUrl = "", reasoning, requestId = null, attempt = null, responseTimeoutMs = null }, signal) {
   const type = normalizeProviderType(providerType);
   const anthropic = usesAnthropicApi(baseUrl, model, type);
   const watsonx = !isOpenCodeZenBase(baseUrl) && type === "watsonx";
@@ -1858,7 +2218,7 @@ export async function startChatCompletionStream({ baseUrl, apiKey, model, messag
   if (type === "qoder_cloud_agents") {
     try {
       return await qoderStartStream(
-        { baseUrl, apiKey, model, messages, requestId, attempt },
+        { baseUrl, apiKey, authMode, openapiBaseUrl, model, messages, requestId, attempt },
         requestSignal ?? AbortSignal.timeout(STREAM_TIMEOUT_MS)
       );
     } catch (error) {
@@ -1964,9 +2324,9 @@ export function extractStreamReasoning(payload) {
 
 const UNSUPPORTED_LISTING_CODES = new Set(["not_found", "method_not_allowed", "unsupported_listing", "bad_request"]);
 
-async function discoverModels({ baseUrl, apiKey, providerType }, signal) {
+async function discoverModels({ baseUrl, apiKey, providerType, authMode, openapiBaseUrl }, signal) {
   try {
-    return { availableModels: await listProviderModels({ baseUrl, apiKey, providerType }, signal), listingSupported: true, listError: null };
+    return { availableModels: await listProviderModels({ baseUrl, apiKey, providerType, authMode, openapiBaseUrl }, signal), listingSupported: true, listError: null };
   } catch (error) {
     if (error instanceof ProviderError && UNSUPPORTED_LISTING_CODES.has(error.code)) {
       return { availableModels: [], listingSupported: false, listError: error };
@@ -1975,11 +2335,45 @@ async function discoverModels({ baseUrl, apiKey, providerType }, signal) {
   }
 }
 
+// Qoder's documented read-only endpoints are the model list and agents?limit=1.
+// For service accounts the exchange runs first so a failure can be attributed to
+// the exchange or to the business API, never to "connected" after only stage 1.
+async function testQoderConnection({ baseUrl, apiKey, authMode, openapiBaseUrl }, signal) {
+  const credentials = qoderCredentials({ baseUrl, apiKey, authMode, openapiBaseUrl });
+  if (credentials.authMode === "service_account") await qoderAccessToken(credentials, signal);
+  const metadata = {
+    authMode: credentials.authMode,
+    region: credentials.region,
+    businessHost: credentials.businessHost,
+    openapiHost: credentials.openapiRoot ? new URL(credentials.openapiRoot).hostname : null
+  };
+  try {
+    const availableModels = await qoderListModels(credentials, signal);
+    return { availableModels, modelChecked: false, sample: null, listingSupported: true, warning: null, ...metadata };
+  } catch (error) {
+    if (!(error instanceof ProviderError) || !UNSUPPORTED_LISTING_CODES.has(error.code)) throw error;
+    // The model list is documented but an account may not expose it. A real
+    // read-only agents request still proves the business API works.
+    await qoderProbeAgents(credentials, signal);
+    return {
+      availableModels: [],
+      modelChecked: false,
+      sample: null,
+      listingSupported: false,
+      warning: "Connected to the Qoder business API, but the model list endpoint was not available. Use Test model to verify the saved model and credentials.",
+      ...metadata
+    };
+  }
+}
+
 // Connection checks are deliberately zero-inference: they contact the
-// documented model-list endpoint only. Some providers do not expose one, in
-// which case we report that the endpoint was reachable but credentials still
+// documented read-only endpoint only. Some providers do not expose a model list,
+// in which case we report that the endpoint was reached but credentials still
 // need an explicit model test.
-export async function testProviderConnection({ baseUrl, apiKey, providerType = "openai_compatible" }, signal) {
+export async function testProviderConnection({ baseUrl, apiKey, providerType = "openai_compatible", authMode = "pat", openapiBaseUrl = "" }, signal) {
+  if (normalizeProviderType(providerType) === "qoder_cloud_agents") {
+    return testQoderConnection({ baseUrl, apiKey, authMode, openapiBaseUrl }, signal);
+  }
   const discovery = await discoverModels({ baseUrl, apiKey, providerType }, signal);
   return {
     availableModels: discovery.availableModels,
@@ -1997,7 +2391,7 @@ export async function testProviderConnection({ baseUrl, apiKey, providerType = "
 export const checkProviderConnection = testProviderConnection;
 
 // Explicit, user-triggered inference used by the separate "Test model" action.
-export async function testProviderModel({ baseUrl, apiKey, model, providerType = "openai_compatible" }, signal) {
+export async function testProviderModel({ baseUrl, apiKey, model, providerType = "openai_compatible", authMode = "pat", openapiBaseUrl = "" }, signal) {
   if (typeof model !== "string" || model.trim().length === 0) {
     throw new ProviderError("Enter the exact model ID from your provider before testing a model.", 400, "missing_model");
   }
@@ -2008,7 +2402,7 @@ export async function testProviderModel({ baseUrl, apiKey, model, providerType =
   if (isOpenCodeZenBase(baseUrl)) rejectFreeZenModel(selectedModel);
   let availableModels = [];
   try {
-    const discovery = await discoverModels({ baseUrl, apiKey, providerType }, signal);
+    const discovery = await discoverModels({ baseUrl, apiKey, providerType, authMode, openapiBaseUrl }, signal);
     availableModels = discovery.availableModels;
   } catch (error) {
     // Authentication/network failures are authoritative even if listing is not
@@ -2019,7 +2413,7 @@ export async function testProviderModel({ baseUrl, apiKey, model, providerType =
     throw new ProviderError(`The provider does not list a model named "${selectedModel}". Refresh the model list and choose an available model.`, null, "model_unavailable");
   }
   const result = await chatCompletion(
-    { baseUrl, apiKey, providerType, model: selectedModel, messages: [{ role: "user", content: "Reply with OK." }], maxTokens: 64 },
+    { baseUrl, apiKey, providerType, authMode, openapiBaseUrl, model: selectedModel, messages: [{ role: "user", content: "Reply with OK." }], maxTokens: 64 },
     signal
   );
   return { availableModels, modelChecked: true, sample: result.content.slice(0, 40), listingSupported: availableModels.length > 0 };
