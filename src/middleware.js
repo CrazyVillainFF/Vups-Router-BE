@@ -161,6 +161,15 @@ export const authRateLimiter = rateLimit(
   rateLimitOptions(30, "Too many authentication attempts. Please wait 15 minutes and try again.")
 );
 
+// Apps poll a pending browser sign-in every few seconds for up to ten minutes.
+export const desktopAuthPollRateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: Number(process.env.DESKTOP_AUTH_RATE_LIMIT_MAX || 600),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: "Too many sign-in checks. Wait a moment and try again." }
+});
+
 export const chatRateLimiter = rateLimit({
   windowMs: 60 * 1000,
   limit: Number(process.env.CHAT_RATE_LIMIT_MAX || 30),

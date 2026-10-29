@@ -7,6 +7,7 @@ import helmet from "helmet";
 import mongoose from "mongoose";
 import connectToDatabase, { describeDatabaseError, isDatabaseFailure, safeDatabaseErrorText } from "./db.js";
 import authRoutes from "./routes/auth.js";
+import desktopAuthRoutes from "./routes/desktopAuth.js";
 import passwordResetRoutes from "./routes/passwordReset.js";
 import settingsRoutes from "./routes/settings.js";
 import conversationsRoutes from "./routes/conversations.js";
@@ -172,6 +173,7 @@ app.get("/api", (_req, res) => res.json({
   routes: ["/api/auth", "/api/forgot-password", "/api/verify-code", "/api/reset-password", "/api/settings", "/api/conversations", "/api/chat", "/api/images", "/api/plugins", "/api/admin"]
 }));
 
+app.use("/api/auth/desktop", desktopAuthRoutes);
 app.use("/api/auth", authRoutes);
 app.use("/api", passwordResetRoutes);
 app.use("/api/settings", settingsRoutes);
