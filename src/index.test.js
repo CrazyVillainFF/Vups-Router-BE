@@ -2134,6 +2134,36 @@ test("a genuine upstream outage still tells the user to try again", async () => 
   });
 });
 
+test("a shared desktop tool turn sends the real model upstream and the alias back", async () => {
+  await withOpenRouterEnv({ apiKey: FAKE_API_KEY, baseUrl: fakeProvider.baseUrl, model: "fake-model-pro" }, async () => {
+    // A dedicated Vups endpoint configured by another test would win over the
+    // shared OpenRouter one, so this turn has to state which path it means.
+    await withEnv({ VUPS_BASE_URL: undefined, VUPS_API_KEY: undefined, VUPS_UNDERLYING_MODEL: undefined }, async () => {
+      const { cookie } = await signupUser();
+      fakeProvider.state.set({
+        toolCalls: [{ name: "get_windows_known_folder", args: { name: "downloads" } }]
+      });
+      const response = await api("/api/chat/desktop-tools", {
+        method: "POST",
+        cookie,
+        body: {
+          runId: `desktop_alias_${Date.now()}`,
+          vups: true,
+          model: "vups-v3-galax",
+          messages: [{ role: "user", content: "What is in my Downloads folder?" }]
+        }
+      });
+      assert.equal(response.status, 200, JSON.stringify(response.body));
+      assert.equal(response.body.type, "tool_calls");
+
+      const upstream = fakeProvider.state.chatRequests.at(-1)?.body;
+      assert.equal(upstream.model, "fake-model-pro", "the public alias must never reach the provider");
+      assert.ok(Array.isArray(upstream.tools) && upstream.tools.length === 5, "the filesystem tools are offered");
+      assert.equal(response.body.model, "vups-v3-galax", "the client only ever sees the alias");
+    });
+  });
+});
+
 test("OpenRouter server-side key problems never leak details to users", async () => {
   await withOpenRouterEnv({ apiKey: FAKE_API_KEY, baseUrl: fakeProvider.baseUrl, model: "fake-model-pro" }, async () => {
     const { cookie } = await signupUser();

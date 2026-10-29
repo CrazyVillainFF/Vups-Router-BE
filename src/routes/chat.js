@@ -2025,7 +2025,10 @@ router.post("/desktop-tools", requireAuth, chatRateLimiter, async (req, res, nex
     try {
       if (body.vups === true) {
         provider = vupsProviderForChat({ images: false });
-        model = requestedModel || provider.model || VUPS_MODEL_ID;
+        // The client addresses the shared model by its public alias; the
+        // upstream call has to carry the model behind it. Sending
+        // "vups-v3-galax" upstream is a provider 400 "not a valid model ID".
+        model = provider.model || VUPS_MODEL_ID;
         if (requestedModel && requestedModel !== VUPS_MODEL_ID) {
           return res.status(400).json({ message: "This route only serves Vups v3 Galax.", code: "invalid_model" });
         }
@@ -2142,7 +2145,9 @@ router.post("/desktop-tools", requireAuth, chatRateLimiter, async (req, res, nex
             content: result.content || null,
             tool_calls: toolCalls
           },
-          model
+          // The alias, never the model behind it: the shared catalog's
+          // underlying provider stays server-side.
+          model: body.vups === true ? VUPS_MODEL_ID : model
         });
       }
 
