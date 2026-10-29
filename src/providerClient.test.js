@@ -21,6 +21,7 @@ import {
   listProviderModels,
   normalizeBaseUrl,
   parseRetryAfter,
+  providerErrorFields,
   resolveChatEndpoint,
   retryDelayMs,
   startChatCompletionStream,
@@ -74,6 +75,46 @@ test("Retry-After headers are parsed as bounded integer seconds", () => {
   assert.equal(parseRetryAfter("Wed, 21 Oct 2015 07:28:00 GMT", Date.parse("Wed, 21 Oct 2015 07:27:30 GMT")), 30);
   assert.equal(parseRetryAfter("Wed, 21 Oct 2015 07:28:00 GMT", Date.parse("Wed, 21 Oct 2015 07:29:00 GMT")), 0);
   assert.equal(parseRetryAfter("not-a-date"), null);
+});
+
+test("a transient OpenRouter upstream 429 stays a rate limit and never claims quota", () => {
+  const payload = {
+    error: {
+      message:
+        "recursive/flint-v1.0:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits.",
+      code: "429"
+    }
+  };
+  assert.equal(classifyProviderFailure({ status: 429, payload }).category, "rate_limit_requests");
+  const described = describeProviderError(429, payload);
+  assert.equal(described.code, "rate_limited");
+  assert.doesNotMatch(described.message, /quota/i);
+  assert.equal(isQuotaExhaustedError(described), false);
+});
+
+test("a genuine exhausted daily quota still becomes quota_exhausted", () => {
+  const described = describeProviderError(429, {
+    error: { message: "Rate limit reached for free-models-per-day. Add credits to continue.", code: 429 }
+  });
+  assert.equal(described.code, "quota_exhausted");
+  assert.match(described.message, /usage limit/i);
+});
+
+test("OpenRouter retry hints in error metadata are preserved", () => {
+  const payload = {
+    error: {
+      message: "Provider returned error",
+      code: 429,
+      metadata: { retry_after_seconds: 12 }
+    }
+  };
+  assert.equal(providerErrorFields(payload).retryAfterSeconds, 12);
+  const diagnostic = buildProviderFailureDiagnostic({
+    url: "https://openrouter.ai/api/v1/chat/completions",
+    status: 429,
+    payload
+  });
+  assert.equal(diagnostic.retryAfter, 12);
 });
 
 test("classifies transient limits separately from exhausted free quotas", () => {

@@ -918,6 +918,8 @@ const PROVIDER_STATUS_BY_CODE = {
   free_tier_client_only: 403,
   free_quota_exhausted: 429,
   quota_exhausted: 429,
+  shared_quota_exhausted: 429,
+  shared_model_rate_limited: 429,
   region_restricted: 403,
   model_unavailable: 400,
   dns_error: 502,
@@ -946,13 +948,13 @@ function resetMetadata(error) {
   return {
     retryAfterSeconds,
     resetAt: new Date(Date.now() + retryAfterSeconds * 1000).toISOString(),
-    resetSource: "retry-after"
+    resetSource: error.resetSource || "retry-after"
   };
 }
 
 function sendProviderFailure(res, failure, error, requestId = null, diagnostic = null, model = null) {
-  if (Number.isInteger(error?.retryAfter) && error.retryAfter >= 0) {
-    res.setHeader("Retry-After", String(error.retryAfter));
+  if (Number.isFinite(error?.retryAfter) && error.retryAfter >= 0) {
+    res.setHeader("Retry-After", String(Math.floor(error.retryAfter)));
   }
   return res.status(failure.status).json({
     message: failure.message,
@@ -1154,6 +1156,23 @@ function streamingProviderFailure(payload, detail, model) {
     context: { model, attempt: null, requestId: null }
   });
   const contextLimit = diagnostic.category === "context_limit";
+  let code = "stream_error";
+  if (contextLimit) code = "context_limit";
+  else if (diagnostic.category === "quota_exhausted") code = "quota_exhausted";
+  else if (
+    ["rate_limit_requests", "rate_limit_tokens", "concurrency_limit", "ambiguous_rate_limit"].includes(
+      diagnostic.category
+    )
+  ) {
+    code = "rate_limited";
+  } else if (diagnostic.category === "timeout") code = "timeout";
+  else if (["upstream_unavailable", "overloaded"].includes(diagnostic.category)) code = "provider_unavailable";
+  else if (diagnostic.category === "invalid_model") code = "invalid_model";
+  else if (diagnostic.category === "invalid_credentials") code = "invalid_api_key";
+  else if (diagnostic.category === "forbidden") code = "forbidden";
+  else if (diagnostic.category === "invalid_request") code = "bad_request";
+  else if (diagnostic.category === "request_too_large") code = "too_large";
+
   const error = new ProviderError(
     contextLimit
       ? CONTEXT_LIMIT_MESSAGE
@@ -1161,12 +1180,16 @@ function streamingProviderFailure(payload, detail, model) {
         ? `The provider reported an error during streaming: ${redactSecrets(detail)}`
         : "The provider reported an error during streaming.",
     null,
-    contextLimit ? "context_limit" : "stream_error"
+    code
   );
   error.category = diagnostic.category;
   error.classification = diagnostic.classification;
   error.retryable = diagnostic.retryable;
   error.diagnostics = diagnostic;
+  if (Number.isFinite(diagnostic.retryAfter) && diagnostic.retryAfter >= 0) {
+    error.retryAfter = diagnostic.retryAfter;
+    error.resetSource = diagnostic.retryAfterRaw ? "retry-after" : "provider-metadata";
+  }
   return error;
 }
 
@@ -2100,32 +2123,67 @@ router.post("/desktop-tools", requireAuth, chatRateLimiter, async (req, res, nex
         ...validated.messages
       ];
 
+      // The tool loop's follow-up call is the one that carries the real files
+      // back to the user, and it is also the call most likely to meet a
+      // transient 429 from a shared free model. Plain chat retries those; the
+      // tool loop has to as well, or finished filesystem work is thrown away
+      // because the model blinked.
+      let attempts = 1;
       let result;
       try {
-        result = await chatCompletion(
-          {
-            baseUrl: provider.baseUrl,
-            apiKey: provider.apiKey,
-            providerType: provider.providerType,
-            model,
-            messages: upstreamMessages,
-            temperature,
-            maxTokens: provider.maxTokens,
-            reasoning: provider.reasoning,
-            tools: DESKTOP_TOOLS,
-            toolChoice: "auto",
-            requestId: req.requestId
+        result = await withProviderRetry(
+          (attempt) => {
+            attempts = attempt + 1;
+            return chatCompletion(
+              {
+                baseUrl: provider.baseUrl,
+                apiKey: provider.apiKey,
+                providerType: provider.providerType,
+                model,
+                messages: upstreamMessages,
+                temperature,
+                maxTokens: provider.maxTokens,
+                reasoning: provider.reasoning,
+                tools: DESKTOP_TOOLS,
+                toolChoice: "auto",
+                requestId: req.requestId,
+                attempt: attempt + 1
+              },
+              controller.signal
+            );
           },
-          controller.signal
+          {
+            ...vupsRetryOptions(),
+            signal: controller.signal,
+            onRetry: event => logVupsRetry({
+              ...event,
+              requestId: req.requestId,
+              model,
+              providerHost: providerHostFromUrl(provider.baseUrl)
+            })
+          }
         );
       } catch (error) {
         if (controller.signal.aborted) return;
         if (error instanceof ProviderError) {
           logProviderFailure(provider, error);
-          return res.status(error.status && error.status >= 400 ? error.status : 502).json({
-            message: error.message,
-            code: error.code || "provider_error"
-          });
+          // A shared catalog has no user key to fix, so its failure has to say
+          // so; a dedicated provider keeps its own actionable code.
+          const failure = body.vups === true
+            ? vupsFailure(error, { hasImages: false })
+            : {
+              status: error.status && error.status >= 400 ? error.status : 502,
+              message: error.message,
+              code: error.code || "provider_error"
+            };
+          return sendProviderFailure(
+            res,
+            failure,
+            error,
+            req.requestId,
+            { providerAttempts: attempts },
+            body.vups === true ? VUPS_MODEL_ID : model
+          );
         }
         throw error;
       }

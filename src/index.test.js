@@ -2158,7 +2158,7 @@ test("a shared desktop tool turn sends the real model upstream and the alias bac
 
       const upstream = fakeProvider.state.chatRequests.at(-1)?.body;
       assert.equal(upstream.model, "fake-model-pro", "the public alias must never reach the provider");
-      assert.ok(Array.isArray(upstream.tools) && upstream.tools.length === 5, "the filesystem tools are offered");
+      assert.ok(Array.isArray(upstream.tools) && upstream.tools.length === 6, "the filesystem tools are offered");
       assert.equal(response.body.model, "vups-v3-galax", "the client only ever sees the alias");
     });
   });
@@ -2623,6 +2623,7 @@ test("chat errors include the affected model and only a reliable Retry-After res
   assert.equal(limited.status, 429);
   assert.equal(limited.body.code, "rate_limited");
   assert.equal(limited.body.model, "fake-model-mini");
+  assert.doesNotMatch(limited.body.message, /quota/i);
   assert.equal(limited.body.retryAfterSeconds, 17);
   assert.equal(limited.headers.get("retry-after"), "17");
   const resetAt = new Date(limited.body.resetAt).getTime();

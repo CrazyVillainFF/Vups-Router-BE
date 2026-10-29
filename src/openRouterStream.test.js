@@ -240,12 +240,74 @@ test("a persistent rate limit surfaces honestly without swapping the model", asy
 
   assert.equal(response.body.code, "rate_limited");
   assert.match(response.body.message, /rate limit|retry/i);
+  assert.doesNotMatch(response.body.message, /quota/i, "a transient 429 must not claim quota exhaustion");
   assert.equal(fakeProvider.state.chatRequests.length, 3, "two bounded retries, then the honest error");
   assert.deepEqual(
     [...new Set(fakeProvider.state.chatRequests.map(request => request.body.model))],
     ["fake-model-pro"],
     "the selected model must never be replaced silently"
   );
+});
+
+test("a rate-limit error delivered after the stream opened keeps its category and reset hint", async () => {
+  fakeProvider.state.reset();
+  const cookie = await signupUser();
+  await configureProvider(cookie, "fake-model-pro");
+  fakeProvider.state.set({
+    failStreamMidway: true,
+    streamErrorPayload: {
+      error: {
+        message: "recursive/flint-v1.0:free is temporarily rate-limited upstream.",
+        code: 429,
+        metadata: { retry_after_seconds: 12 }
+      }
+    }
+  });
+
+  const response = await api("/api/chat", {
+    method: "POST",
+    cookie,
+    body: { stream: true, model: "fake-model-pro", messages: [{ role: "user", content: "Hello" }] }
+  });
+
+  assert.equal(response.status, 200);
+  const events = sseEvents(response.body.raw || "");
+  const failure = events.find(event => event.type === "error");
+  assert.ok(failure, "a mid-stream provider error must surface");
+  assert.equal(failure.code, "rate_limited");
+  assert.equal(failure.model, "fake-model-pro");
+  assert.equal(failure.retryAfterSeconds, 12);
+  assert.ok(failure.resetAt, "the provider metadata reset hint must be forwarded");
+  assert.equal(failure.resetSource, "provider-metadata");
+  assert.equal(events.some(event => event.type === "done"), false);
+});
+
+test("a quota error delivered after the stream opened reports quota_exhausted", async () => {
+  fakeProvider.state.reset();
+  const cookie = await signupUser();
+  await configureProvider(cookie, "fake-model-pro");
+  fakeProvider.state.set({
+    failStreamMidway: true,
+    streamErrorPayload: {
+      error: {
+        message: "Rate limit reached for free-models-per-day. Add credits to continue.",
+        code: 429
+      }
+    }
+  });
+
+  const response = await api("/api/chat", {
+    method: "POST",
+    cookie,
+    body: { stream: true, model: "fake-model-pro", messages: [{ role: "user", content: "Hello" }] }
+  });
+
+  const events = sseEvents(response.body.raw || "");
+  const failure = events.find(event => event.type === "error");
+  assert.ok(failure);
+  assert.equal(failure.code, "quota_exhausted");
+  assert.equal(failure.model, "fake-model-pro");
+  assert.equal(events.some(event => event.type === "done"), false);
 });
 
 test("an account without its own credential never borrows another account's key", async () => {

@@ -129,9 +129,22 @@ test("the desktop route offers only the native filesystem tools and returns the 
   assert.equal(body.tool_choice, "auto");
   assert.deepEqual(
     body.tools.map(tool => tool.function.name),
-    ["get_windows_known_folder", "list_directory", "read_file", "search_files", "read_file_metadata"]
+    [
+      "get_windows_known_folder",
+      "list_directory",
+      "list_recent_files",
+      "read_file",
+      "search_files",
+      "read_file_metadata"
+    ]
   );
   assert.match(body.messages[0].content, /Local Windows tools are available/);
+  assert.match(
+    body.messages[0].content,
+    /Never call read_file_metadata once per file/,
+    "the prompt has to steer " +
+      "the model away from the per-file metadata pattern that produced one permission prompt per file"
+  );
   assert.doesNotMatch(JSON.stringify(body.messages), new RegExp(FAKE_API_KEY, "i"));
 
   const call = response.body.toolCalls[0];
@@ -307,4 +320,144 @@ test("the filesystem tool loop stops after the bounded number of rounds", async 
 
   assert.equal(lastStatus.status, 429);
   assert.equal(lastStatus.code, "tool_round_limit");
+});
+
+test("a busy provider on the follow-up call is retried and the tool result still answers", async () => {
+  process.env.VUPS_RETRY_BASE_MS = "1";
+  process.env.VUPS_MAX_RETRIES = "2";
+  const cookie = await newUser();
+  const id = runId("retry");
+  fakeProvider.state.set({
+    toolCalls: [{ id: "call_recent", name: "list_recent_files", args: { path: "C:\Users\test\Downloads", limit: 5 } }]
+  });
+
+  const first = await api("/api/chat/desktop-tools", {
+    method: "POST",
+    cookie,
+    body: { runId: id, messages: [{ role: "user", content: "Find my 5 latest downloaded files." }] }
+  });
+  assert.equal(first.status, 200);
+  assert.equal(first.body.type, "tool_calls");
+  assert.equal(first.body.toolCalls[0].function.name, "list_recent_files");
+
+  // The desktop app has already read the folder by now. The next model call is
+  // the one that turns those results into an answer, and it is the one a shared
+  // free model most often answers with a 429.
+  const toolResult = {
+    ok: true,
+    data: {
+      path: "C:\Users\test\Downloads",
+      files: [{ name: "setup.exe", size: 12, modifiedAt: 1_700_000_000_000 }],
+      sortedBy: "lastModified"
+    }
+  };
+  fakeProvider.state.set({
+    toolCalls: null,
+    chatResponseText: "Your five newest downloads are: setup.exe.",
+    chatStatus: 429,
+    chatFailuresRemaining: 1
+  });
+
+  const second = await api("/api/chat/desktop-tools", {
+    method: "POST",
+    cookie,
+    body: {
+      runId: id,
+      messages: [
+        { role: "user", content: "Find my 5 latest downloaded files." },
+        first.body.assistantMessage,
+        { role: "tool", tool_call_id: "call_recent", content: JSON.stringify(toolResult) }
+      ]
+    }
+  });
+
+  assert.equal(second.status, 200, JSON.stringify(second.body));
+  assert.equal(second.body.type, "final");
+  assert.match(second.body.content, /setup\.exe/);
+  const followUps = fakeProvider.state.chatRequests.slice(1);
+  assert.equal(followUps.length, 2, "the busy call was retried once, not abandoned");
+  assert.deepEqual(
+    followUps[0].body.messages.at(-1),
+    followUps[1].body.messages.at(-1),
+    "the retry resends the same tool result rather than dropping it"
+  );
+  assert.ok(
+    followUps.every(entry => entry.body.messages.some(message => message.role === "tool")),
+    "the completed filesystem work is present on every attempt"
+  );
+  delete process.env.VUPS_RETRY_BASE_MS;
+  delete process.env.VUPS_MAX_RETRIES;
+});
+
+test("a rejected provider key on a tool turn is not retried and is not called busy", async () => {
+  const cookie = await newUser();
+  fakeProvider.state.set({ toolCalls: null, chatResponseText: "unused", invalidKey: true });
+
+  const response = await api("/api/chat/desktop-tools", {
+    method: "POST",
+    cookie,
+    body: { runId: runId("auth"), messages: [{ role: "user", content: "List my Downloads folder." }] }
+  });
+
+  assert.equal(response.status, 401);
+  assert.equal(response.body.code, "invalid_api_key");
+  assert.doesNotMatch(String(response.body.message).toLowerCase(), /busy/);
+  assert.equal(fakeProvider.state.chatRequests.length, 1, "an auth failure must not be retried");
+  fakeProvider.state.set({ invalidKey: false });
+});
+
+test("a malformed request on a tool turn is reported as itself, not as a busy model", async () => {
+  const cookie = await newUser();
+  fakeProvider.state.set({
+    toolCalls: null,
+    chatResponseText: "unused",
+    chatStatus: 400,
+    chatErrorPayload: { error: { message: "Invalid parameter: tools is not supported by this model." } }
+  });
+
+  const response = await api("/api/chat/desktop-tools", {
+    method: "POST",
+    cookie,
+    body: { runId: runId("bad"), messages: [{ role: "user", content: "List my Downloads folder." }] }
+  });
+
+  assert.equal(response.status, 400);
+  assert.equal(response.body.code, "bad_request");
+  assert.match(response.body.message, /tools is not supported/);
+  assert.equal(fakeProvider.state.chatRequests.length, 1, "a permanent 400 must not be retried");
+  fakeProvider.state.set({ chatStatus: 200, chatErrorPayload: null });
+});
+
+test("an exhausted retry budget says the model is unavailable and reports how hard it tried", async () => {
+  process.env.VUPS_RETRY_BASE_MS = "1";
+  process.env.VUPS_MAX_RETRIES = "1";
+  const cookie = await newUser();
+  fakeProvider.state.set({ toolCalls: null, chatResponseText: "unused", chatStatus: 503 });
+
+  const response = await api("/api/chat/desktop-tools", {
+    method: "POST",
+    cookie,
+    body: { runId: runId("exhaust"), messages: [{ role: "user", content: "List my Downloads folder." }] }
+  });
+
+  assert.equal(response.status, 503);
+  assert.equal(fakeProvider.state.chatRequests.length, 2, "one retry, then stop");
+  assert.equal(response.body.diagnostic?.providerAttempts, 2);
+  fakeProvider.state.set({ chatStatus: 200 });
+  delete process.env.VUPS_RETRY_BASE_MS;
+  delete process.env.VUPS_MAX_RETRIES;
+});
+
+test("the desktop prompt bans invented Windows permission advice", async () => {
+  const { DESKTOP_TOOL_PROMPT, DESKTOP_TOOLS } = await import("./desktopTools.js");
+
+  assert.match(DESKTOP_TOOL_PROMPT, /Never tell the user to change NTFS permissions/);
+  assert.match(DESKTOP_TOOL_PROMPT, /app-level consent and does not change Windows access control/);
+  assert.match(DESKTOP_TOOL_PROMPT, /"access_denied" is the only code that means Windows itself refused/);
+  assert.match(DESKTOP_TOOL_PROMPT, /call list_recent_files once/);
+  assert.match(DESKTOP_TOOL_PROMPT, /say what it returned instead of calling the same tool again/);
+
+  const recent = DESKTOP_TOOLS.find(tool => tool.function.name === "list_recent_files");
+  assert.ok(recent, "the deterministic newest-files tool is offered to the model");
+  assert.match(recent.function.description, /sorted by last-modified time/);
 });

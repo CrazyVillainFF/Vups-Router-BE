@@ -874,6 +874,23 @@ function firstErrorMetadata(levels, names, limit = 120) {
   return "";
 }
 
+// OpenRouter and some OpenAI-compatible providers put the reset hint in
+// error.metadata instead of a Retry-After header. Accept both placements and
+// only keep a bounded, non-negative number of seconds.
+function firstErrorNumber(levels, names) {
+  for (const level of levels) {
+    for (const source of [level, diagnosticObject(level?.metadata)]) {
+      if (!source) continue;
+      for (const name of names) {
+        const raw = source?.[name];
+        const value = typeof raw === "number" ? raw : typeof raw === "string" && raw.trim() ? Number(raw) : NaN;
+        if (Number.isFinite(value) && value >= 0) return Math.min(Math.floor(value), 86400);
+      }
+    }
+  }
+  return null;
+}
+
 function sanitizedErrorDetail(payload) {
   let raw = typeof payload === "string" ? payload : "";
   if (!raw) {
@@ -922,6 +939,14 @@ export function providerErrorFields(payload) {
       diagnosticText(root.provider_name, 80),
     providerCode: firstErrorMetadata(levels, ["provider_error_code"], 80),
     limitSource: firstErrorMetadata(levels, ["limit_source"], 80),
+    retryAfterSeconds: firstErrorNumber(levels, [
+      "retry_after_seconds",
+      "retryAfterSeconds",
+      "retry_after",
+      "retryAfter",
+      "reset_after_seconds",
+      "resetAfterSeconds"
+    ]),
     remedyHint: firstErrorMetadata(levels, ["remedy_hint"], 240),
     detail: firstErrorMetadata(levels, ["raw"], 300),
     reasons,
@@ -930,7 +955,9 @@ export function providerErrorFields(payload) {
 }
 
 const QUOTA_ERROR_CODE = /insufficient_quota|billing_hard_limit|credit_balance|insufficient_credits|payment_required|quota_exceeded/i;
-const QUOTA_ERROR_TEXT = /quota|credit|billing|spend(?:ing)? limit|free-models-per-day|free models per day|per[- ]day|daily limit|requests per day|tokens per day|\bRPD\b|\bTPD\b|monthly limit|exceeded your current quota/i;
+// Only exhaustion wording counts. A 429 that says "rate limit or quota" is a
+// rate limit unless the payload actually reports an exhausted balance.
+const QUOTA_ERROR_TEXT = /insufficient (?:quota|credits?)|credit balance|billing (?:hard )?limit|payment required|exceeded (?:your|the) (?:current )?quota|quota (?:is )?(?:exhausted|depleted)|out of quota|spend(?:ing)? limit|free-models-per-day|free models per day|per[- ]day|daily limit|requests per day|tokens per day|\bRPD\b|\bTPD\b|monthly limit/i;
 const CONCURRENCY_ERROR_TEXT = /concurren|parallel|simultaneous|in.?flight/i;
 const TOKEN_RATE_ERROR_TEXT = /tokens? per min|\bTPM\b|token[- ]rate|tokens?.*(?:minute|min\b)/i;
 const REQUEST_RATE_ERROR_TEXT = /requests? per min|\bRPM\b|too many requests|rate.?limit|request rate/i;
@@ -1061,6 +1088,7 @@ export function buildProviderFailureDiagnostic({
   const target = diagnosticTarget(url);
   const fields = providerErrorFields(payload);
   const classified = classification ?? classifyProviderFailure({ status, payload, message: fields.message });
+  const effectiveRetryAfter = Number.isFinite(retryAfter) ? retryAfter : fields.retryAfterSeconds;
   return {
     event: "provider_upstream_failure",
     timestamp: new Date().toISOString(),
@@ -1083,7 +1111,7 @@ export function buildProviderFailureDiagnostic({
     category: classified.category,
     classification: classified.classification,
     retryable: classified.retryable,
-    retryAfter: Number.isFinite(retryAfter) ? retryAfter : null,
+    retryAfter: Number.isFinite(effectiveRetryAfter) ? effectiveRetryAfter : null,
     retryAfterRaw: diagnosticText(retryAfterRaw, 80) || null,
     responseHeaders: responseDiagnostics(headers)
   };
@@ -1101,9 +1129,18 @@ function attachProviderDiagnostic(error, options) {
     error.code = "context_limit";
     error.message = CONTEXT_LIMIT_MESSAGE;
   }
-  if (diagnostic.category === "quota_exhausted" && error.code === "rate_limited") error.code = "quota_exhausted";
+  if (
+    diagnostic.category === "quota_exhausted" &&
+    ["rate_limited", "forbidden", "bad_request"].includes(error.code)
+  ) {
+    error.code = "quota_exhausted";
+  }
   if (diagnostic.category === "invalid_model" && error.code === "bad_request") error.code = "invalid_model";
   if (diagnostic.category === "invalid_credentials" && error.code === "bad_request") error.code = "invalid_api_key";
+  if (Number.isFinite(diagnostic.retryAfter) && diagnostic.retryAfter >= 0) {
+    error.retryAfter = diagnostic.retryAfter;
+    error.resetSource = error.resetSource || (diagnostic.retryAfterRaw ? "retry-after" : "provider-metadata");
+  }
   console.warn(JSON.stringify(diagnostic));
   return error;
 }
@@ -1112,7 +1149,8 @@ export function describeProviderError(status, payload) {
   // Context overflow can arrive with 400, 401, 403, 413, or 422 depending on
   // the provider. Structured codes or explicit context wording win, but a
   // bare credential rejection is never inferred to be a context limit.
-  if (classifyProviderFailure({ status, payload }).category === "context_limit") {
+  const classification = classifyProviderFailure({ status, payload });
+  if (classification.category === "context_limit") {
     return new ProviderError(CONTEXT_LIMIT_MESSAGE, status, "context_limit");
   }
   const detail = sanitizedErrorDetail(payload);
@@ -1130,7 +1168,15 @@ export function describeProviderError(status, payload) {
   if (status === 408) return new ProviderError(`The provider timed out (HTTP 408).${suffix}`, status, "timeout");
   if (status === 413) return new ProviderError(`The conversation is too large for this provider (HTTP 413).${suffix}`, status, "too_large");
   if (status === 422) return new ProviderError(`The provider could not process the request (HTTP 422). Check the model ID.${suffix}`, status, "unprocessable");
-  if (status === 429) return new ProviderError(`Rate limit or quota exceeded (HTTP 429). Wait a moment and try again.${suffix}`, status, "rate_limited");
+  if (status === 429) {
+    if (classification.category === "quota_exhausted") {
+      return new ProviderError(`The provider account has reached its usage limit (HTTP 429).${suffix}`, status, "quota_exhausted");
+    }
+    if (classification.category === "concurrency_limit") {
+      return new ProviderError(`The provider is at its concurrency limit (HTTP 429). Wait a moment and try again.${suffix}`, status, "rate_limited");
+    }
+    return new ProviderError(`The provider is rate-limiting requests (HTTP 429). Wait a moment and try again.${suffix}`, status, "rate_limited");
+  }
   if (typeof status === "number" && status >= 500) return new ProviderError(`The provider is temporarily unavailable (HTTP ${status}).${suffix}`, status, "provider_unavailable");
   return new ProviderError(`The provider returned an unexpected error${status ? ` (HTTP ${status})` : ""}.${suffix}`, status ?? null, "provider_error");
 }
@@ -1177,7 +1223,7 @@ export function parseRetryAfter(value, now = Date.now()) {
 }
 
 const QUOTA_EXHAUSTED_PATTERN =
-  /free-models-per-day|free models per day|per[- ]day|daily|requests per day|\bRPD\b|quota is exhausted|free[- ]tier|insufficient credits|credit balance/i;
+  /free-models-per-day|free models per day|per[- ]day|daily limit|requests per day|tokens per day|\bRPD\b|\bTPD\b|quota is exhausted|quota (?:is )?depleted|insufficient credits|credit balance|exceeded (?:your|the) (?:current )?quota|billing hard limit|payment required/i;
 
 export function isQuotaExhaustedError(error) {
   if (!(error instanceof ProviderError)) return false;
@@ -1268,13 +1314,18 @@ function providerHttpError(url, status, payload, retryAfter = null, headers = nu
     }
     if (!error) error = describeProviderError(status, payload);
   }
-  if (retryAfter !== null) error.retryAfter = retryAfter;
+  const fields = providerErrorFields(payload);
+  const effectiveRetryAfter = Number.isFinite(retryAfter) ? retryAfter : fields.retryAfterSeconds;
+  if (Number.isFinite(effectiveRetryAfter) && effectiveRetryAfter >= 0) {
+    error.retryAfter = effectiveRetryAfter;
+    error.resetSource = Number.isFinite(retryAfter) ? "retry-after" : "provider-metadata";
+  }
   return attachProviderDiagnostic(error, {
     url,
     status,
     payload,
     headers,
-    retryAfter,
+    retryAfter: effectiveRetryAfter,
     retryAfterRaw: responseHeader(headers, "retry-after"),
     context,
     classification
