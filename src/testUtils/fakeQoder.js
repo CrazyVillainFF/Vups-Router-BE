@@ -47,6 +47,8 @@ export async function startFakeQoder() {
     modelsStatus: 0,
     modelsDelayMs: 0,
     modelsInvalidShape: false,
+    modelsPayload: null,
+    agentsStatus: 0,
     rejectSatOnce: false,
     clearRequests() {
       // Mutates in place so test files can keep a stable reference to the log.
@@ -55,6 +57,7 @@ export async function startFakeQoder() {
       state.unauthorized = false;
       state.serviceTokensIssued = 0;
       state.issuedTokens.clear();
+      satSequence.clear();
       state.currentSat = "";
       state.exchangeStatus = 0;
       state.exchangePayload = null;
@@ -62,6 +65,8 @@ export async function startFakeQoder() {
       state.modelsStatus = 0;
       state.modelsDelayMs = 0;
       state.modelsInvalidShape = false;
+      state.modelsPayload = null;
+      state.agentsStatus = 0;
       state.rejectSatOnce = false;
     },
     paths(method, prefix) {
@@ -70,6 +75,32 @@ export async function startFakeQoder() {
   };
 
   const bearerToken = req => String(req.headers.authorization || "").replace(/^Bearer\s+/i, "").trim();
+  // Requests are logged with a credential *label*, never the credential: the log
+  // is echoed by failing assertions, and tests still need to prove which token
+  // reached which host (for example that a service account key never appears on
+  // a business call). Issued SATs keep their sequence so a re-exchange is
+  // distinguishable from the original token.
+  const satSequence = new Map();
+  let nextSat = 0;
+  function authLabel(req) {
+    if (!req.headers.authorization) return undefined;
+    const token = bearerToken(req);
+    if (!token) return "Bearer ";
+    if (token === FAKE_QODER_API_KEY) return "Bearer <pat>";
+    if (token === FAKE_QODER_SA_KEY) return "Bearer <sa-key>";
+    if (state.issuedTokens.has(token)) return `Bearer <sat#${satSequence.get(token) ?? 0}>`;
+    return "Bearer <unknown>";
+  }
+  function tokenKindOf(req) {
+    const label = authLabel(req);
+    if (label === undefined) return "none";
+    const token = bearerToken(req);
+    if (!token) return "empty";
+    if (token.startsWith(FAKE_QODER_API_KEY)) return "pat";
+    if (token === FAKE_QODER_SA_KEY) return "sa-key";
+    if (state.issuedTokens.has(token)) return "sat";
+    return "unknown";
+  }
   const authorized = req => {
     const token = bearerToken(req);
     if (token.startsWith(FAKE_QODER_API_KEY)) return true;
@@ -90,7 +121,18 @@ export async function startFakeQoder() {
     } catch {
       body = raw;
     }
-    state.requests.push({ method: req.method, path: url.pathname, search: url.search, headers: req.headers, body });
+    // The log is printed by failing assertions, so the bearer token is never
+    // recorded verbatim; `auth` carries a label and `tokenKind` the credential
+    // class instead.
+    state.requests.push({
+      method: req.method,
+      path: url.pathname,
+      search: url.search,
+      headers: { ...req.headers, ...(authLabel(req) ? { authorization: authLabel(req) } : {}) },
+      auth: authLabel(req) || "",
+      tokenKind: tokenKindOf(req),
+      body
+    });
 
     if (url.pathname === "/api/v1/serviceToken/exchange" && req.method === "POST") {
       if (state.exchangeStatus) {
@@ -109,6 +151,7 @@ export async function startFakeQoder() {
       state.serviceTokensIssued += 1;
       const token = `sat-fake-${state.serviceTokensIssued}`;
       state.issuedTokens.add(token);
+      satSequence.set(token, state.serviceTokensIssued);
       state.currentSat = token;
       return json(res, 200, { access_token: token, token_type: "Bearer", expires_in: 3600 });
     }
@@ -131,6 +174,7 @@ export async function startFakeQoder() {
         return json(res, state.modelsStatus, { type: "error", error: { type: "api_error", message: `Injected models ${state.modelsStatus}.` } });
       }
       if (state.modelsInvalidShape) return json(res, 200, { ok: true });
+      if (state.modelsPayload) return json(res, 200, state.modelsPayload);
       return json(res, 200, {
         data: [
           { id: "ultimate", type: "model", display_name: "Ultimate", source: "system", is_enabled: true, max_input_tokens: 1000000 },
@@ -149,6 +193,9 @@ export async function startFakeQoder() {
       return json(res, 200, environment);
     }
     if (url.pathname === "/api/v1/cloud/agents" && req.method === "GET") {
+      if (state.agentsStatus) {
+        return json(res, state.agentsStatus, { type: "error", error: { type: "api_error", message: `Injected agents ${state.agentsStatus}.` } });
+      }
       return json(res, 200, { data: state.agents, first_id: null, last_id: null, has_more: false, next_page: null });
     }
     if (url.pathname === "/api/v1/cloud/agents" && req.method === "POST") {

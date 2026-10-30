@@ -128,11 +128,11 @@ test("testing a saved service account exchanges the key and never sends it to th
   assert.deepEqual(tested.body.availableModels.map(model => model.id), FAKE_QODER_MODELS);
   const exchange = fake.state.requests.filter(entry => entry.path === "/api/v1/serviceToken/exchange");
   assert.equal(exchange.length, 1, "exactly one exchange");
-  assert.equal(exchange[0].headers.authorization, `Bearer ${FAKE_QODER_SA_KEY}`, "the SA key is used only for the exchange");
+  assert.equal(exchange[0].auth, "Bearer <sa-key>", "the SA key is used only for the exchange");
   const business = fake.state.requests.filter(entry => entry.path.startsWith("/api/v1/cloud/"));
   assert.ok(business.length > 0);
-  assert.ok(business.every(entry => entry.headers.authorization !== `Bearer ${FAKE_QODER_SA_KEY}`), "SA key never reaches the business API");
-  assert.ok(business.every(entry => /^Bearer sat-fake-/.test(String(entry.headers.authorization))), "business calls use the exchanged token");
+  assert.ok(business.every(entry => entry.auth !== "Bearer <sa-key>"), "SA key never reaches the business API");
+  assert.ok(business.every(entry => entry.tokenKind === "sat"), "business calls use the exchanged token");
 });
 
 test("changing the Qoder auth mode clears a saved connection result", async () => {

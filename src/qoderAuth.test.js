@@ -34,7 +34,7 @@ test("a PAT is sent straight to the business API and never exchanged", async () 
     assert.ok(result.availableModels.some(model => model.id === "ultimate"));
     assert.equal(fake.state.requests.filter(entry => entry.path.includes("serviceToken")).length, 0);
     const models = fake.state.requests.find(entry => entry.path === "/api/v1/cloud/models");
-    assert.equal(models.headers.authorization, `Bearer ${FAKE_QODER_API_KEY}`);
+    assert.equal(models.auth, "Bearer <pat>");
   });
 });
 
@@ -46,7 +46,9 @@ test("a service account key is exchanged for a SAT used by the business API", as
     );
     const exchange = fake.state.requests.find(entry => entry.path === "/api/v1/serviceToken/exchange");
     assert.ok(exchange, "the documented exchange endpoint was called");
-    assert.equal(exchange.headers.authorization, `Bearer ${FAKE_QODER_SA_KEY}`);
+    // `auth` is the fake's credential label: it proves which token reached
+    // which host without putting a token string in the assertion output.
+    assert.equal(exchange.auth, "Bearer <sa-key>");
     assert.deepEqual(exchange.body, {
       grant_type: "client_credentials",
       audience: "qoder",
@@ -54,8 +56,8 @@ test("a service account key is exchanged for a SAT used by the business API", as
       ttl_seconds: 3600
     });
     const models = fake.state.requests.find(entry => entry.path === "/api/v1/cloud/models");
-    assert.equal(models.headers.authorization, `Bearer ${fake.state.currentSat}`);
-    assert.notEqual(models.headers.authorization, `Bearer ${FAKE_QODER_SA_KEY}`);
+    assert.equal(models.auth, "Bearer <sat#1>", "the business API gets the exchanged token");
+    assert.notEqual(models.auth, "Bearer <sa-key>", "the long-lived key never reaches the business API");
     assert.equal(result.authMode, "service_account");
     assert.equal(result.openapiHost, "127.0.0.1");
   });
@@ -206,7 +208,8 @@ test("an expired SAT is discarded and exchanged again once", async () => {
     assert.equal(fake.state.serviceTokensIssued, 2);
     const models = fake.state.requests.filter(entry => entry.path === "/api/v1/cloud/models");
     assert.equal(models.length, 2);
-    assert.equal(models[1].headers.authorization, `Bearer ${fake.state.currentSat}`);
+    assert.equal(models[0].auth, "Bearer <sat#1>");
+    assert.equal(models[1].auth, "Bearer <sat#2>", "the retry uses the freshly exchanged token");
   });
 });
 

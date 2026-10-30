@@ -2374,6 +2374,14 @@ export function extractStreamReasoning(payload) {
 
 const UNSUPPORTED_LISTING_CODES = new Set(["not_found", "method_not_allowed", "unsupported_listing", "bad_request"]);
 
+// Qoder only. A 400 from the business API means the request itself was rejected
+// (wrong mode, unexpected parameters, malformed base path) — not that the model
+// endpoint is absent. Reusing UNSUPPORTED_LISTING_CODES here turned a real
+// failure into a green "connected" result with zero models, so the picker lost
+// every Qoder row. Authentication, rate-limit, server and timeout errors were
+// already rethrown; this set only removes bad_request.
+const QODER_UNSUPPORTED_LISTING_CODES = new Set(["not_found", "method_not_allowed", "unsupported_listing"]);
+
 async function discoverModels({ baseUrl, apiKey, providerType, authMode, openapiBaseUrl }, signal) {
   try {
     return { availableModels: await listProviderModels({ baseUrl, apiKey, providerType, authMode, openapiBaseUrl }, signal), listingSupported: true, listError: null };
@@ -2399,9 +2407,18 @@ async function testQoderConnection({ baseUrl, apiKey, authMode, openapiBaseUrl }
   };
   try {
     const availableModels = await qoderListModels(credentials, signal);
-    return { availableModels, modelChecked: false, sample: null, listingSupported: true, warning: null, ...metadata };
+    return {
+      availableModels,
+      modelChecked: false,
+      sample: null,
+      listingSupported: true,
+      warning: availableModels.length > 0
+        ? null
+        : "Qoder answered the model list successfully, but it contains no enabled models. Enable the models you need in Qoder, then use Test model with an exact model ID.",
+      ...metadata
+    };
   } catch (error) {
-    if (!(error instanceof ProviderError) || !UNSUPPORTED_LISTING_CODES.has(error.code)) throw error;
+    if (!(error instanceof ProviderError) || !QODER_UNSUPPORTED_LISTING_CODES.has(error.code)) throw error;
     // The model list is documented but an account may not expose it. A real
     // read-only agents request still proves the business API works.
     await qoderProbeAgents(credentials, signal);

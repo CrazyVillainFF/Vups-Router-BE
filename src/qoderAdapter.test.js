@@ -77,7 +77,7 @@ test("Qoder model listing reads the enabled models from GET /models", async () =
   assert.equal(models[0].contextLength, 1000000);
   assert.equal(models[0].ownedBy, "Qoder · Ultimate");
   assert.equal(models[0].capabilities.streaming, true);
-  assert.equal(requests[0].headers.authorization, `Bearer ${FAKE_QODER_API_KEY}`);
+  assert.equal(requests[0].auth, "Bearer <pat>", "the personal access token goes straight to the business API");
   assert.equal(requests[0].path, "/api/v1/cloud/models");
 });
 
