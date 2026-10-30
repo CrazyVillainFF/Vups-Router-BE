@@ -148,6 +148,21 @@ test("malformed individual entries are dropped without losing the valid models",
   assert.equal(models[0].ownedBy, "Qoder · Qwen Flash", "the picker label is the human-readable display name");
 });
 
+test("an account-registered model is not labelled as a Qoder-hosted model", async () => {
+  fake.state.modelsPayload = {
+    data: [
+      { id: "qfmodel", display_name: "Qwen Flash", source: "system", is_enabled: true, max_input_tokens: 256000 },
+      { id: "myopenai", display_name: "My BYOK GPT", source: "user", is_enabled: true, max_input_tokens: 131072, default_context_window: 32768 }
+    ],
+    has_more: false
+  };
+  const models = await listProviderModels({ baseUrl, apiKey: FAKE_QODER_API_KEY, providerType: "qoder_cloud_agents" });
+  assert.equal(models[0].ownedBy, "Qoder · Qwen Flash");
+  assert.equal(models[1].ownedBy, "Qoder custom model · My BYOK GPT", "source: user is the account's own model, not a Qoder catalog entry");
+  assert.equal(models[1].contextLength, 32768, "the default window applies where one is published");
+  assert.equal(models[0].contextLength, 256000, "without a default window the documented ceiling applies");
+});
+
 test("the opaque id, not the display name, is what gets sent to Qoder", async () => {
   fake.state.modelsPayload = {
     data: [{ id: "ultimate", display_name: "Qwen3.8-Flash", is_enabled: true }],

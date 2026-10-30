@@ -473,6 +473,11 @@ async function resolveProvider(userId, requestedModel, requestedConfigId, reques
     baseUrl,
     defaultModel: config.defaultModel || config.model || "",
     apiKey,
+    // Qoder needs both: without them a service-account config is treated as a
+    // PAT and its SA key is sent straight to the business host, which answers
+    // 401. The connection check passes because settings.js sends these fields.
+    authMode: config.authMode,
+    openapiBaseUrl: config.openapiBaseUrl,
     maxTokens: undefined
   };
 }
@@ -1523,6 +1528,7 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
               temperature,
               maxTokens: execution.maxOutputTokens,
               reasoning: provider.reasoning,
+              conversationId,
               requestId,
               attempt: attempt + 1
             }, AbortSignal.any([requestController.signal, AbortSignal.timeout(execution.requestTimeoutMs)]));
@@ -1651,6 +1657,7 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
               temperature,
               maxTokens: execution.maxOutputTokens,
               reasoning: provider.reasoning,
+              conversationId: conversationId ?? prospectiveId,
               requestId,
               attempt: attempt + 1,
               responseTimeoutMs: execution.streamStartTimeoutMs
@@ -2154,6 +2161,7 @@ router.post("/desktop-tools", requireAuth, chatRateLimiter, async (req, res, nex
                 reasoning: provider.reasoning,
                 tools: DESKTOP_TOOLS,
                 toolChoice: "auto",
+                conversationId: requestedConversationId,
                 requestId: req.requestId,
                 attempt: attempt + 1
               },
@@ -2352,6 +2360,15 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
       ...(continuationState ? [{ role: "user", content: continuationState.plan.prompt }] : [])
     ];
 
+    // Both the streamed and the single-shot reply answer with this id, and a
+    // provider that keeps server-side state (Qoder Cloud Agents) keys that state
+    // by it, so it has to be settled before the upstream call.
+    let existingConversation = null;
+    if (conversationId && mongoose.isValidObjectId(conversationId)) {
+      existingConversation = await Conversation.findOne({ _id: conversationId, userId: req.userId }).select("_id");
+    }
+    const prospectiveId = existingConversation ? String(existingConversation._id) : String(new mongoose.Types.ObjectId());
+
     if (!stream) {
       let result;
       let usedModel = model;
@@ -2378,7 +2395,7 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
       while (!pluginRun) {
         try {
           result = await chatCompletion(
-            { baseUrl: provider.baseUrl, apiKey: provider.apiKey, providerType: provider.providerType, authMode: provider.authMode, openapiBaseUrl: provider.openapiBaseUrl, model: usedModel, messages: upstreamMessages, temperature, maxTokens: provider.maxTokens, reasoning: provider.reasoning },
+            { baseUrl: provider.baseUrl, apiKey: provider.apiKey, providerType: provider.providerType, authMode: provider.authMode, openapiBaseUrl: provider.openapiBaseUrl, model: usedModel, messages: upstreamMessages, temperature, maxTokens: provider.maxTokens, reasoning: provider.reasoning, conversationId: prospectiveId },
             undefined
           );
           break;
@@ -2437,7 +2454,7 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
       }
       const turn = await persistGeneratedTurn({
         userId: req.userId,
-        conversationId,
+        conversationId: prospectiveId,
         messages: validated.messages,
         fullText: result.content,
         messageId: assistantMessageId,
@@ -2456,12 +2473,6 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
         ...(fallbackUsed ? { model: usedModel, fallbackUsed: true } : {})
       });
     }
-
-    let existingConversation = null;
-    if (conversationId && mongoose.isValidObjectId(conversationId)) {
-      existingConversation = await Conversation.findOne({ _id: conversationId, userId: req.userId }).select("_id");
-    }
-    const prospectiveId = existingConversation ? String(existingConversation._id) : String(new mongoose.Types.ObjectId());
 
     const controller = new AbortController();
     let clientAborted = false;
@@ -2503,7 +2514,7 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
         if (provider.shared && provider.fallbackModel) streamRetry.maxRetries = 0;
         upstream = await withProviderRetry(
           () => startChatCompletionStream(
-            { baseUrl: provider.baseUrl, apiKey: provider.apiKey, providerType: provider.providerType, authMode: provider.authMode, openapiBaseUrl: provider.openapiBaseUrl, model: usedModel, messages: upstreamMessages, temperature, maxTokens: provider.maxTokens, reasoning: provider.reasoning },
+            { baseUrl: provider.baseUrl, apiKey: provider.apiKey, providerType: provider.providerType, authMode: provider.authMode, openapiBaseUrl: provider.openapiBaseUrl, model: usedModel, messages: upstreamMessages, temperature, maxTokens: provider.maxTokens, reasoning: provider.reasoning, conversationId: prospectiveId },
             controller.signal
           ),
           { ...streamRetry, signal: controller.signal }

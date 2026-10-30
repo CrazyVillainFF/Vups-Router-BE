@@ -74,7 +74,10 @@ test("Qoder is never routed through the OpenAI chat or responses endpoints", () 
 test("Qoder model listing reads the enabled models from GET /models", async () => {
   const models = await listProviderModels({ baseUrl, apiKey: FAKE_QODER_API_KEY, providerType: "qoder_cloud_agents" });
   assert.deepEqual(models.map(model => model.id), ["ultimate", "giga"]);
-  assert.equal(models[0].contextLength, 1000000);
+  // 200000, not the 1000000 ceiling: agents are created without a
+  // context_window, so Qoder applies default_context_window to this reply.
+  assert.equal(models[0].contextLength, 200000);
+  assert.equal(models[1].contextLength, null, "a model without token fields reports no context length");
   assert.equal(models[0].ownedBy, "Qoder · Ultimate");
   assert.equal(models[0].capabilities.streaming, true);
   assert.equal(requests[0].auth, "Bearer <pat>", "the personal access token goes straight to the business API");

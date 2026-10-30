@@ -287,6 +287,16 @@ const qoderModelIdCache = new Map();
 // Service account tokens are short-lived. They stay in process memory only and
 // are refreshed from the SA key when they near expiry or are rejected.
 const qoderSatCache = new Map();
+// One exchange per credential at a time: concurrent requests for the same key
+// await the same in-flight promise instead of each calling the token service.
+const qoderSatPending = new Map();
+// Qoder keeps the turn history inside the session, so one conversation reuses
+// one session instead of paying for a new sandbox on every message.
+const qoderSessionCache = new Map();
+const QODER_SESSION_TTL_MS = 30 * 60 * 1000;
+// A dropped SSE connection is resumed from the last event id, which Qoder
+// documents as continuing delivery after that event.
+const QODER_STREAM_RECONNECTS = 2;
 
 export function qoderRegionForHost(hostname) {
   const host = String(hostname || "").toLowerCase();
@@ -551,27 +561,43 @@ async function qoderExchangeServiceToken(config, signal) {
   return { token, expiresAt };
 }
 
-async function qoderAccessToken(credentials, signal) {
+async function qoderAccessToken(credentials) {
   if (credentials.authMode !== "service_account") return credentials.apiKey;
   const key = qoderSatCacheKey(credentials);
   const cached = qoderSatCache.get(key);
   if (cached && cached.expiresAt > Date.now() + QODER_SAT_REFRESH_MARGIN_MS) return cached.token;
-  const issued = await qoderExchangeServiceToken(credentials, signal);
-  qoderSatCache.set(key, issued);
-  if (qoderSatCache.size > 200) {
-    for (const [entryKey, entry] of qoderSatCache) {
-      if (entry.expiresAt <= Date.now()) qoderSatCache.delete(entryKey);
+  // Resolving an agent and an environment run concurrently, so without sharing
+  // the in-flight exchange each branch would spend a service account key on its
+  // own request to the token service.
+  const pending = qoderSatPending.get(key);
+  if (pending) return pending;
+  // The exchange belongs to every waiter, so it gets its own timeout instead of
+  // the first caller's: one client pressing Stop must not cancel a token another
+  // live request is waiting for.
+  const exchange = (async () => {
+    try {
+      const issued = await qoderExchangeServiceToken(credentials, AbortSignal.timeout(REQUEST_TIMEOUT_MS));
+      qoderSatCache.set(key, issued);
+      if (qoderSatCache.size > 200) {
+        for (const [entryKey, entry] of qoderSatCache) {
+          if (entry.expiresAt <= Date.now()) qoderSatCache.delete(entryKey);
+        }
+        while (qoderSatCache.size > 200) qoderSatCache.delete(qoderSatCache.keys().next().value);
+      }
+      return issued.token;
+    } finally {
+      if (qoderSatPending.get(key) === exchange) qoderSatPending.delete(key);
     }
-    while (qoderSatCache.size > 200) qoderSatCache.delete(qoderSatCache.keys().next().value);
-  }
-  return issued.token;
+  })();
+  qoderSatPending.set(key, exchange);
+  return exchange;
 }
 
-async function qoderAuthHeaders(credentials, accept, signal) {
+async function qoderAuthHeaders(credentials, accept) {
   const headers = {
     "Content-Type": "application/json",
     Accept: accept || "application/json",
-    Authorization: `Bearer ${await qoderAccessToken(credentials, signal)}`
+    Authorization: `Bearer ${await qoderAccessToken(credentials)}`
   };
   return headers;
 }
@@ -601,6 +627,14 @@ function qoderBusinessError(url, response, payload, credentials, context) {
     error.code = "not_found";
     error.message =
       "Qoder returned HTTP 404. Check the API base URL: it must be the business host (https://api.qoder.com or https://api.qoder.com.cn) with /api/v1/cloud, not the OpenAPI host.";
+  } else if (response.status === 409) {
+    // Qoder answers 409 while a turn is still running, so the message has to
+    // say what to do rather than report a generic failure.
+    const busy = String(url).endsWith("/events") || /processing a turn|rescheduling/i.test(detail);
+    error.code = busy ? "session_busy" : "provider_conflict";
+    error.message = busy
+      ? `Qoder is still working on the previous reply in this conversation (HTTP 409). Wait for it to finish, or press Stop and send again.${suffix}`
+      : `Qoder rejected the request because the session is in a conflicting state (HTTP 409).${suffix}`;
   }
   return error;
 }
@@ -616,14 +650,14 @@ function qoderRemember(cache, key, value) {
   return value;
 }
 
-async function qoderRequest(url, { method = "GET", body, accept, credentials }, signal, context = {}) {
+async function qoderRequest(url, { method = "GET", body, accept, credentials, extraHeaders = null }, signal, context = {}) {
   for (let attempt = 0; ; attempt += 1) {
-    const headers = await qoderAuthHeaders(credentials, accept, signal);
+    const headers = await qoderAuthHeaders(credentials, accept);
     let response;
     try {
       response = await guardedProviderFetch(url, {
         method,
-        headers,
+        headers: extraHeaders ? { ...headers, ...extraHeaders } : headers,
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
         signal: signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS)
       });
@@ -671,11 +705,20 @@ async function qoderListModels(credentials, signal) {
     .map(entry => {
       const id = typeof entry?.id === "string" ? entry.id.trim() : "";
       if (!id) return null;
-      const contextLength = Number.isFinite(entry?.max_input_tokens) ? entry.max_input_tokens : null;
+      const displayName = typeof entry?.display_name === "string" && entry.display_name.trim() ? entry.display_name.trim() : id;
+      // Agents are created without a context_window, so the documented default
+      // window is what actually applies to this conversation - not the model's
+      // ceiling. Warning at the real number keeps a Qoder rejection from
+      // arriving as a surprise mid-chat.
+      const defaultWindow = Number.isFinite(entry?.default_context_window) ? entry.default_context_window : null;
+      const ceiling = Number.isFinite(entry?.max_input_tokens) ? entry.max_input_tokens : null;
+      const contextLength = defaultWindow ?? ceiling;
       const capabilities = { chat: true, streaming: true, ...(contextLength ? { contextLength } : {}) };
       return {
         id,
-        ownedBy: typeof entry?.display_name === "string" && entry.display_name ? `Qoder · ${entry.display_name}` : "Qoder Cloud Agents",
+        // "user" means a model the account registered itself, which is not a
+        // Qoder-hosted model and must not be labelled as one.
+        ownedBy: entry?.source === "user" ? `Qoder custom model · ${displayName}` : `Qoder · ${displayName}`,
         vision: visionFromCapabilities(capabilities),
         capabilities,
         contextLength,
@@ -789,6 +832,11 @@ async function qoderAgentId(credentials, requestedModel, signal, context) {
   const created = await qoderRequest(qoderJoin(base, "agents"), {
     method: "POST",
     credentials,
+    // Qoder documents `model` as string | { id, effort, context_window }. Only
+    // the string form is sent: effort and context tiers are per-model choices
+    // this product never asks for, and inventing one would change how a reply is
+    // produced on the user's credit. The matcher above already reads both shapes
+    // back, so an agent tuned in the Qoder console is still reused.
     body: { name: `VupsRouter ${model}`, model, system: "You are a helpful assistant." }
   }, signal, context);
   const id = (await readJsonSafely(created))?.id;
@@ -798,9 +846,10 @@ async function qoderAgentId(credentials, requestedModel, signal, context) {
   return qoderRemember(qoderAgentCache, cacheKey, id);
 }
 
-// Qoder accepts one batch of events per turn and has no chat-style history, so
-// the conversation is flattened into labelled text blocks in a single
-// user.message. Images use Qoder's documented base64/url source blocks.
+// Images use Qoder's documented base64/url source blocks, and each turn is one
+// batch of events: a reused session receives only the newest user message, while
+// a brand new session receives the whole conversation flattened into its first
+// batch because it starts with no history of its own.
 export function qoderEventContent(messages = []) {
   const blocks = [];
   for (const message of messages) {
@@ -822,7 +871,70 @@ export function qoderEventContent(messages = []) {
   return blocks;
 }
 
-async function qoderStartStream({ baseUrl, apiKey, authMode, openapiBaseUrl, model, messages, requestId = null, attempt = null }, signal) {
+function qoderSessionCacheKey(credentials, conversationId, agentId) {
+  return `${qoderCacheKey(credentials)}|${agentId}|${conversationId}`;
+}
+
+function qoderLiveSession(key) {
+  const entry = qoderSessionCache.get(key);
+  if (!entry) return "";
+  if (entry.expiresAt <= Date.now()) {
+    qoderSessionCache.delete(key);
+    return "";
+  }
+  return entry.sessionId;
+}
+
+function qoderRememberSession(key, sessionId, posted) {
+  if (qoderSessionCache.size > 500) {
+    for (const [entryKey, entry] of qoderSessionCache) {
+      if (entry.expiresAt <= Date.now()) qoderSessionCache.delete(entryKey);
+    }
+    while (qoderSessionCache.size > 500) qoderSessionCache.delete(qoderSessionCache.keys().next().value);
+  }
+  qoderSessionCache.set(key, { sessionId, posted, expiresAt: Date.now() + QODER_SESSION_TTL_MS });
+}
+
+async function qoderCreateSession(credentials, { agentId, environmentId }, signal, context) {
+  const response = await qoderRequest(qoderJoin(credentials.businessBase, "sessions"), {
+    method: "POST",
+    credentials,
+    body: { agent: agentId, environment_id: environmentId, title: "VupsRouter" }
+  }, signal, context);
+  const sessionId = (await readJsonSafely(response))?.id;
+  if (typeof sessionId !== "string" || !sessionId.startsWith("sess_")) {
+    throw new ProviderError("Qoder Cloud Agents returned a session without an ID.", 502, "qoder_no_session");
+  }
+  return sessionId;
+}
+
+// Qoder rejects a new message with 409 while the session is still working, and
+// the only documented way to free it is an interrupt, so a cancelled request has
+// to interrupt its own turn or the next message in that conversation is blocked.
+async function qoderInterruptTurn(credentials, sessionId) {
+  try {
+    await qoderRequest(qoderJoin(credentials.businessBase, `sessions/${sessionId}/events`), {
+      method: "POST",
+      credentials,
+      body: { events: [{ type: "user.interrupt" }] }
+    }, AbortSignal.timeout(REQUEST_TIMEOUT_MS), { stage: "business_api", operation: "interrupt" });
+  } catch {
+    // The user is already walking away from this turn; nothing to report.
+  }
+}
+
+// Only the newest user turn goes to a session that already holds the
+// conversation: re-sending the flattened history would run the same turn twice.
+function qoderLatestTurnContent(messages = []) {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index]?.role !== "user") continue;
+    const blocks = qoderEventContent([messages[index]]);
+    if (blocks.length) return blocks;
+  }
+  return [];
+}
+
+async function qoderStartStream({ baseUrl, apiKey, authMode, openapiBaseUrl, model, messages, conversationId = null, clientSignal = null, requestId = null, attempt = null }, signal) {
   const credentials = qoderCredentials({ baseUrl, apiKey, authMode, openapiBaseUrl });
   const base = credentials.businessBase;
   const context = { requestId, attempt, model, authMode: credentials.authMode, region: credentials.region };
@@ -830,63 +942,165 @@ async function qoderStartStream({ baseUrl, apiKey, authMode, openapiBaseUrl, mod
     qoderEnvironmentId(credentials, signal, context),
     qoderAgentId(credentials, model, signal, context)
   ]);
-  const sessionResponse = await qoderRequest(qoderJoin(base, "sessions"), {
-    method: "POST",
-    credentials,
-    body: { agent: agentId, environment_id: environmentId, title: "VupsRouter" }
-  }, signal, context);
-  const sessionId = (await readJsonSafely(sessionResponse))?.id;
-  if (typeof sessionId !== "string" || !sessionId.startsWith("sess_")) {
-    throw new ProviderError("Qoder Cloud Agents returned a session without an ID.", 502, "qoder_no_session");
-  }
-  const streamUrl = new URL(qoderJoin(base, `sessions/${sessionId}/events/stream`));
-  streamUrl.searchParams.append("event_deltas[]", "agent.message");
-  const stream = await qoderRequest(
-    streamUrl.toString(),
-    { credentials, accept: "text/event-stream" },
+  const streamUrl = sessionId => {
+    const url = new URL(qoderJoin(base, `sessions/${sessionId}/events/stream`));
+    url.searchParams.append("event_deltas[]", "agent.message");
+    return url.toString();
+  };
+  const openStream = (sessionId, lastEventId) => qoderRequest(
+    streamUrl(sessionId),
+    { credentials, accept: "text/event-stream", extraHeaders: lastEventId ? { "Last-Event-ID": lastEventId } : null },
     signal ?? AbortSignal.timeout(STREAM_TIMEOUT_MS),
     context
   );
+  const key = conversationId ? qoderSessionCacheKey(credentials, conversationId, agentId) : "";
+  let sessionId = key ? qoderLiveSession(key) : "";
+  // A brand new session starts with no history of its own, so its first batch
+  // carries the whole conversation; a reused session already has it, so only the
+  // newest user message is sent.
+  let content = sessionId ? qoderLatestTurnContent(messages) : [];
+  if (!sessionId || !content.length) content = qoderEventContent(messages);
+  if (!content.length) {
+    throw new ProviderError("There was no message to send to Qoder.", 400, "empty_request");
+  }
+  let signature = JSON.stringify(content);
+  // The chat route retries a dropped turn with the same parameters. Re-sending
+  // that same batch would run the turn twice, so an already-posted batch is
+  // resumed by reading the stream instead.
+  let alreadyPosted = Boolean(key) && qoderSessionCache.get(key)?.posted === signature;
+  let stream = null;
+  if (sessionId) {
+    try {
+      stream = await openStream(sessionId, "");
+    } catch (error) {
+      // A session archived or deleted since the last turn is recoverable: a new
+      // one takes the whole transcript so the conversation still continues.
+      if (error?.status !== 404) throw error;
+      qoderSessionCache.delete(key);
+      sessionId = "";
+    }
+  }
+  if (!sessionId) {
+    sessionId = await qoderCreateSession(credentials, { agentId, environmentId }, signal, context);
+    content = qoderEventContent(messages);
+    signature = JSON.stringify(content);
+    alreadyPosted = false;
+    stream = await openStream(sessionId, "");
+  }
   if (!stream.body) {
     throw attachProviderDiagnostic(
       new ProviderError("Qoder Cloud Agents did not return an event stream.", stream.status, "empty_stream"),
-      { url: streamUrl.toString(), status: stream.status, context, headers: stream.headers, classification: { category: "empty_stream", classification: "permanent", retryable: false } }
+      { url: streamUrl(sessionId), status: stream.status, context, headers: stream.headers, classification: { category: "empty_stream", classification: "permanent", retryable: false } }
     );
   }
   // Executing only after the stream is attached is what makes the first deltas
-  // of this turn observable; Qoder does not replay earlier events.
-  await qoderRequest(qoderJoin(base, `sessions/${sessionId}/events`), {
-    method: "POST",
-    credentials,
-    body: { events: [{ type: "user.message", content: qoderEventContent(messages) }] }
-  }, signal, context);
-  const response = new Response(qoderSSEToChatStream(stream.body), {
+  // of this turn observable; since 2026-08-24 Qoder does not replay history.
+  if (!alreadyPosted) {
+    try {
+      await qoderRequest(qoderJoin(base, `sessions/${sessionId}/events`), {
+        method: "POST",
+        credentials,
+        body: { events: [{ type: "user.message", content }] }
+      }, signal, context);
+    } catch (error) {
+      stream.body.cancel().catch(() => {});
+      if (key && error?.status === 404) qoderSessionCache.delete(key);
+      throw error;
+    }
+  }
+  if (key) qoderRememberSession(key, sessionId, signature);
+  const turn = { finished: false };
+  // The route's own signal can abort while it deliberately retries a turn, so
+  // only the caller's signal means "the user stopped waiting".
+  const cancelSignal = clientSignal ?? null;
+  if (key && cancelSignal && !cancelSignal.aborted) {
+    const activeSession = sessionId;
+    cancelSignal.addEventListener("abort", () => {
+      if (!turn.finished) qoderInterruptTurn(credentials, activeSession);
+    }, { once: true });
+  }
+  const body = qoderSSEToChatStream(stream.body, {
+    turn,
+    reopen: lastEventId => openStream(sessionId, lastEventId),
+    aborted: () => Boolean(cancelSignal?.aborted),
+    onTerminal: () => {
+      if (key) qoderSessionCache.delete(key);
+    }
+  });
+  const response = new Response(body, {
     status: 200,
     headers: { "content-type": "text/event-stream" }
   });
-  Object.defineProperty(response, "url", { value: streamUrl.toString(), configurable: true });
+  Object.defineProperty(response, "url", { value: streamUrl(sessionId), configurable: true });
   return response;
 }
 
-function qoderSSEToChatStream(sourceBody) {
-  const reader = sourceBody.getReader();
+// Reads SSE frames until the turn finishes, the connection ends, or reading
+// fails. `state.reader` is exposed so the outer stream can cancel whichever
+// connection is live, including after a reconnect.
+async function qoderReadFrames(body, state, onFrame) {
+  const reader = body.getReader();
+  state.reader = reader;
   const decoder = new TextDecoder();
+  let pending = "";
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      pending += decoder.decode(value, { stream: true });
+      let boundary = pending.indexOf("\n\n");
+      while (boundary !== -1) {
+        const frame = pending.slice(0, boundary);
+        pending = pending.slice(boundary + 2);
+        onFrame(frame);
+        if (state.closed) {
+          reader.cancel().catch(() => {});
+          return { kind: "stopped" };
+        }
+        boundary = pending.indexOf("\n\n");
+      }
+    }
+    if (pending.trim()) {
+      onFrame(pending);
+      if (state.closed) {
+        reader.cancel().catch(() => {});
+        return { kind: "stopped" };
+      }
+    }
+    return { kind: "ended" };
+  } catch (error) {
+    return { kind: "error", error };
+  }
+}
+
+function qoderSSEToChatStream(sourceBody, { turn = null, reopen = null, aborted = null, onTerminal = null } = {}) {
   const encoder = new TextEncoder();
   const streamedByEvent = new Map();
   const deltaOnlyEvents = new Set();
-  let buffer = "";
+  const foldedEvents = new Set();
+  const state = { closed: false, reader: null, lastEventId: "" };
+  const finished = turn || { finished: false };
 
   return new ReadableStream({
     async start(controller) {
-      let closed = false;
-      const push = data => controller.enqueue(encoder.encode(`data: ${data}\n\n`));
+      const push = data => {
+        if (state.closed) return;
+        controller.enqueue(encoder.encode(`data: ${data}\n\n`));
+      };
       const sendText = text => push(JSON.stringify({ choices: [{ delta: { content: text } }] }));
       const finish = () => {
-        if (closed) return;
-        closed = true;
-        push(JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] }));
-        push("[DONE]");
-        controller.close();
+        if (state.closed) return;
+        state.closed = true;
+        finished.finished = true;
+        // The terminal frames go out after the guard flips, so they are written
+        // exactly once even when a reconnect races with the end of the turn.
+        try {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] })}\n\n`));
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+          controller.close();
+        } catch {
+          // The reader cancelled mid-turn, so there is nobody left to notify.
+        }
       };
       const handleFrame = frame => {
         let eventName = "";
@@ -895,6 +1109,7 @@ function qoderSSEToChatStream(sourceBody) {
           if (line.startsWith(":")) continue;
           if (line.startsWith("event:")) eventName = line.slice(6).trim();
           else if (line.startsWith("data:")) data += (data ? "\n" : "") + line.slice(5).trim();
+          else if (line.startsWith("id:")) state.lastEventId = line.slice(3).trim() || state.lastEventId;
         }
         if (!data) {
           // ": heartbeat" keeps the connection open; forward an empty chunk so
@@ -916,7 +1131,7 @@ function qoderSSEToChatStream(sourceBody) {
         }
         if (type === "event_delta") {
           const id = String(payload?.event_id || "");
-          if (deltaOnlyEvents.has(id)) return;
+          if (deltaOnlyEvents.has(id) || foldedEvents.has(id)) return;
           const text = payload?.delta?.type === "content_delta" ? payload.delta.content?.text : "";
           if (typeof text !== "string" || !text) return;
           streamedByEvent.set(id, (streamedByEvent.get(id) || "") + text);
@@ -925,6 +1140,8 @@ function qoderSSEToChatStream(sourceBody) {
         }
         if (type === "agent.message") {
           const id = String(payload?.id || "");
+          // A replayed buffered event after a reconnect is the same answer twice.
+          if (id && foldedEvents.has(id)) return;
           const full = (Array.isArray(payload?.content) ? payload.content : [])
             .filter(block => block?.type === "text" && typeof block.text === "string")
             .map(block => block.text)
@@ -935,39 +1152,51 @@ function qoderSSEToChatStream(sourceBody) {
             if (rest) sendText(rest);
             streamedByEvent.set(id, full);
           }
+          if (id) foldedEvents.add(id);
           return;
         }
-        if (type === "session.status_idle" || type === "session.status_terminated" || type === "session.deleted") finish();
+        if (type === "session.status_idle") {
+          finish();
+        } else if (type === "session.status_terminated" || type === "session.deleted") {
+          if (onTerminal) onTerminal();
+          finish();
+        }
       };
 
-      try {
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-          let boundary = buffer.indexOf("\n\n");
-          while (boundary !== -1) {
-            const frame = buffer.slice(0, boundary);
-            buffer = buffer.slice(boundary + 2);
-            handleFrame(frame);
-            if (closed) {
-              reader.cancel().catch(() => {});
-              return;
-            }
-            boundary = buffer.indexOf("\n\n");
+      let body = sourceBody;
+      let outcome = { kind: "ended" };
+      for (let connection = 0; !state.closed; connection += 1) {
+        outcome = await qoderReadFrames(body, state, handleFrame);
+        if (state.closed) break;
+        // A cancelled turn must not come back as a new connection: the interrupt
+        // already told Qoder to stop, and the reader is gone either way.
+        if (aborted?.()) break;
+        // Qoder resumes after the event id it last stamped on the wire, so a
+        // dropped connection continues the same turn instead of losing it.
+        if (!reopen || !state.lastEventId || connection >= QODER_STREAM_RECONNECTS) break;
+        try {
+          const next = await reopen(state.lastEventId);
+          if (!next?.body) break;
+          body = next.body;
+        } catch (error) {
+          if (!state.closed) {
+            state.closed = true;
+            finished.finished = true;
+            controller.error(error);
           }
-        }
-        if (buffer.trim()) handleFrame(buffer);
-        finish();
-      } catch (error) {
-        if (!closed) {
-          closed = true;
-          controller.error(error);
+          return;
         }
       }
+      if (outcome.kind === "error" && !state.closed && !aborted?.()) {
+        state.closed = true;
+        finished.finished = true;
+        controller.error(outcome.error);
+        return;
+      }
+      finish();
     },
     cancel(reason) {
-      reader.cancel(reason).catch(() => {});
+      state.reader?.cancel(reason).catch(() => {});
     }
   });
 }
@@ -2147,10 +2376,10 @@ function responsesFinishReason(payload) {
   return payload?.status === "completed" ? "stop" : null;
 }
 
-export async function chatCompletion({ baseUrl, apiKey, model, messages, temperature, maxTokens, providerType = "openai_compatible", authMode = "pat", openapiBaseUrl = "", reasoning, requestId = null, attempt = null, tools = null, toolChoice = null }, signal) {
+export async function chatCompletion({ baseUrl, apiKey, model, messages, temperature, maxTokens, providerType = "openai_compatible", authMode = "pat", openapiBaseUrl = "", reasoning, requestId = null, attempt = null, tools = null, toolChoice = null, conversationId = null }, signal) {
   const type = normalizeProviderType(providerType);
   if (type === "qoder_cloud_agents") {
-    return qoderCompletion({ baseUrl, apiKey, authMode, openapiBaseUrl, model, messages, requestId, attempt }, signal);
+    return qoderCompletion({ baseUrl, apiKey, authMode, openapiBaseUrl, model, messages, conversationId, requestId, attempt }, signal);
   }
   const anthropic = usesAnthropicApi(baseUrl, model, type);
   const watsonx = !isOpenCodeZenBase(baseUrl) && type === "watsonx";
@@ -2244,7 +2473,7 @@ export async function chatCompletion({ baseUrl, apiKey, model, messages, tempera
   };
 }
 
-export async function startChatCompletionStream({ baseUrl, apiKey, model, messages, temperature, maxTokens, providerType = "openai_compatible", authMode = "pat", openapiBaseUrl = "", reasoning, requestId = null, attempt = null, responseTimeoutMs = null }, signal) {
+export async function startChatCompletionStream({ baseUrl, apiKey, model, messages, temperature, maxTokens, providerType = "openai_compatible", authMode = "pat", openapiBaseUrl = "", reasoning, requestId = null, attempt = null, responseTimeoutMs = null, conversationId = null }, signal) {
   const type = normalizeProviderType(providerType);
   const anthropic = usesAnthropicApi(baseUrl, model, type);
   const watsonx = !isOpenCodeZenBase(baseUrl) && type === "watsonx";
@@ -2268,7 +2497,7 @@ export async function startChatCompletionStream({ baseUrl, apiKey, model, messag
   if (type === "qoder_cloud_agents") {
     try {
       return await qoderStartStream(
-        { baseUrl, apiKey, authMode, openapiBaseUrl, model, messages, requestId, attempt },
+        { baseUrl, apiKey, authMode, openapiBaseUrl, model, messages, conversationId, clientSignal: signal ?? null, requestId, attempt },
         requestSignal ?? AbortSignal.timeout(STREAM_TIMEOUT_MS)
       );
     } catch (error) {
@@ -2398,7 +2627,7 @@ async function discoverModels({ baseUrl, apiKey, providerType, authMode, openapi
 // the exchange or to the business API, never to "connected" after only stage 1.
 async function testQoderConnection({ baseUrl, apiKey, authMode, openapiBaseUrl }, signal) {
   const credentials = qoderCredentials({ baseUrl, apiKey, authMode, openapiBaseUrl });
-  if (credentials.authMode === "service_account") await qoderAccessToken(credentials, signal);
+  if (credentials.authMode === "service_account") await qoderAccessToken(credentials);
   const metadata = {
     authMode: credentials.authMode,
     region: credentials.region,

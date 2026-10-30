@@ -14,14 +14,21 @@ function json(res, status, payload) {
   res.end(JSON.stringify(payload));
 }
 
-function frame(res, event, data) {
-  res.write(`id: ${data.id || data.event?.id || "evt_x"}\nevent: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+function frame(res, event, data, frameId) {
+  res.write(`id: ${frameId || data.id || data.event?.id || "evt_x"}\nevent: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
+function eventStart(eventId, type) {
+  return { event: "event_start", data: { event: { id: eventId, type }, type: "event_start" } };
+}
+
+// Delta frames carry no top-level id, but Qoder stamps the owning event id on
+// the `id:` line, which is what Last-Event-ID resumes from.
 function deltaFrame(eventId, text) {
   return {
     event: "event_delta",
-    data: { delta: { content: { text, type: "text" }, index: 0, type: "content_delta" }, event_id: eventId, type: "event_delta" }
+    data: { id: undefined, delta: { content: { text, type: "text" }, index: 0, type: "content_delta" }, event_id: eventId, type: "event_delta" },
+    frameId: eventId
   };
 }
 
@@ -36,6 +43,11 @@ export async function startFakeQoder() {
     requests: [],
     environments: [],
     agents: [],
+    // Like environments and agents, sessions outlive a log clear: the adapter is
+    // expected to keep addressing a session it created on the next turn.
+    sessions: [],
+    interrupts: [],
+    sessionSeq: 0,
     mode: "delta",
     unauthorized: false,
     serviceTokensIssued: 0,
@@ -50,6 +62,14 @@ export async function startFakeQoder() {
     modelsPayload: null,
     agentsStatus: 0,
     rejectSatOnce: false,
+    // Session-lifecycle knobs: each one stands in for a documented Qoder
+    // behaviour the adapter has to survive.
+    busyOnce: 0,
+    eventsStatus: 0,
+    streamNotFoundOnce: 0,
+    dropAfterFrames: 0,
+    holdOpen: false,
+    replayBuffered: false,
     clearRequests() {
       // Mutates in place so test files can keep a stable reference to the log.
       state.requests.length = 0;
@@ -68,6 +88,15 @@ export async function startFakeQoder() {
       state.modelsPayload = null;
       state.agentsStatus = 0;
       state.rejectSatOnce = false;
+      state.interrupts.length = 0;
+      state.busyOnce = 0;
+      state.eventsStatus = 0;
+      state.streamNotFoundOnce = 0;
+      state.dropAfterFrames = 0;
+      state.holdOpen = false;
+      state.replayBuffered = false;
+      turnWaiters.clear();
+      readyTurns.clear();
     },
     paths(method, prefix) {
       return state.requests.filter(entry => entry.method === method && entry.path.startsWith(prefix));
@@ -107,10 +136,31 @@ export async function startFakeQoder() {
     return state.issuedTokens.has(token);
   };
 
-  let resolvePosted = null;
-  let posted = new Promise(done => {
-    resolvePosted = done;
-  });
+  // A session's stream only starts delivering once that same session has been
+  // given a message, in either arrival order, like the real service.
+  const turnWaiters = new Map();
+  const readyTurns = new Map();
+  function signalTurn(sessionId) {
+    const waiting = turnWaiters.get(sessionId);
+    if (waiting?.length) waiting.shift()();
+    else readyTurns.set(sessionId, (readyTurns.get(sessionId) || 0) + 1);
+  }
+  async function awaitTurn(sessionId) {
+    if (readyTurns.get(sessionId) > 0) {
+      readyTurns.set(sessionId, readyTurns.get(sessionId) - 1);
+      return;
+    }
+    let release;
+    const gate = new Promise(done => {
+      release = done;
+    });
+    if (!turnWaiters.has(sessionId)) turnWaiters.set(sessionId, []);
+    const waiting = turnWaiters.get(sessionId);
+    waiting.push(release);
+    await Promise.race([gate, new Promise(done => setTimeout(done, 3000))]);
+    const stale = waiting.indexOf(release);
+    if (stale !== -1) waiting.splice(stale, 1);
+  }
 
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, "http://localhost");
@@ -177,7 +227,20 @@ export async function startFakeQoder() {
       if (state.modelsPayload) return json(res, 200, state.modelsPayload);
       return json(res, 200, {
         data: [
-          { id: "ultimate", type: "model", display_name: "Ultimate", source: "system", is_enabled: true, max_input_tokens: 1000000 },
+          {
+            id: "ultimate",
+            type: "model",
+            display_name: "Ultimate",
+            source: "system",
+            is_enabled: true,
+            is_new: false,
+            price_factor: 1.6,
+            efforts: ["low", "medium", "high", "xhigh", "max"],
+            default_effort: "high",
+            max_input_tokens: 1000000,
+            default_context_window: 200000,
+            available_context_windows: [200000, 400000, 1000000]
+          },
           { id: "giga", type: "model", display_name: "Giga", source: "system", is_enabled: true },
           { id: "retired", type: "model", display_name: "Retired", source: "system", is_enabled: false }
         ],
@@ -219,56 +282,114 @@ export async function startFakeQoder() {
       if (!state.agents.some(agent => agent.id === body?.agent) || !state.environments.some(env => env.id === body?.environment_id)) {
         return json(res, 400, { type: "error", error: { type: "invalid_request_error", message: "Missing agent or environment_id." } });
       }
-      return json(res, 200, {
-        id: "sess_test",
-        type: "session",
-        status: "idle",
-        agent: { id: body.agent, model: body.model },
-        environment_id: body.environment_id
-      });
+      state.sessionSeq += 1;
+      const id = state.sessionSeq === 1 ? "sess_test" : `sess_test_${state.sessionSeq}`;
+      const session = { id, agent: body.agent, environmentId: body.environment_id, status: "idle", content: [] };
+      state.sessions.push(session);
+      return json(res, 200, { id, type: "session", status: "idle", agent: { id: body.agent, model: body.model }, environment_id: body.environment_id });
     }
-    if (url.pathname === "/api/v1/cloud/sessions/sess_test/events" && req.method === "POST") {
-      if (body?.events?.[0]?.type !== "user.message") {
-        return json(res, 400, { type: "error", error: { type: "invalid_request_error", message: "Unsupported event type." } });
+    const sessionMatch = url.pathname.match(/^\/api\/v1\/cloud\/sessions\/([^/]+?)(\/events(?:\/stream)?)?$/);
+    if (sessionMatch) {
+      const session = state.sessions.find(item => item.id === sessionMatch[1]);
+      const suffix = sessionMatch[2] || "";
+      if (!session || (suffix !== "/events" && suffix !== "/events/stream")) {
+        return json(res, 404, { type: "error", error: { type: "not_found_error", message: "Session not found." } });
       }
-      resolvePosted();
-      return json(res, 200, { data: [{ id: "evt_user", type: "user.message", content: body.events[0].content }] });
-    }
-    if (url.pathname === "/api/v1/cloud/sessions/sess_test/events/stream" && req.method === "GET") {
-      res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
-      res.write(": heartbeat\n\n");
-      // The stream is opened before the message is posted; wait for it so the
-      // adapter is exercised in the same order as the real service.
-      await Promise.race([posted, new Promise(done => setTimeout(done, 3000))]);
-      posted = new Promise(done => {
-        resolvePosted = done;
-      });
-      const buffered = {
-        id: "evt_am",
-        type: "agent.message",
-        content: [{ type: "text", text: FAKE_QODER_REPLY }],
-        processed_at: "2026-05-18T03:40:51Z"
-      };
-      if (state.mode === "delta") {
-        frame(res, "event_start", { event: { id: "evt_th", type: "agent.thinking" }, type: "event_start" });
-        frame(res, "event_delta", deltaFrame("evt_th", "hidden reasoning"));
-        frame(res, "event_start", { event: { id: "evt_am", type: "agent.message" }, type: "event_start" });
-        frame(res, "event_delta", deltaFrame("evt_am", "Hello"));
-        frame(res, "event_delta", deltaFrame("evt_am", " world"));
-      } else if (state.mode === "partial") {
-        frame(res, "event_start", { event: { id: "evt_am", type: "agent.message" }, type: "event_start" });
-        frame(res, "event_delta", deltaFrame("evt_am", FAKE_QODER_REPLY.slice(0, 3)));
+      if (suffix === "/events" && req.method === "POST") {
+        const eventType = body?.events?.[0]?.type;
+        if (eventType === "user.interrupt") {
+          state.interrupts.push(session.id);
+          session.status = "idle";
+          return json(res, 200, { data: [{ id: `evt_interrupt_${state.interrupts.length}`, type: "user.interrupt", processed_at: "2026-05-18T03:40:50Z" }] });
+        }
+        if (eventType !== "user.message") {
+          return json(res, 400, { type: "error", error: { type: "invalid_request_error", message: "Unsupported event type." } });
+        }
+        if (state.busyOnce > 0) {
+          state.busyOnce -= 1;
+          return json(res, 409, {
+            type: "error",
+            error: { type: "invalid_request_error", message: "Session is currently processing a turn. Cancel the current turn or wait for completion." }
+          });
+        }
+        if (state.eventsStatus) {
+          return json(res, state.eventsStatus, { type: "error", error: { type: "api_error", message: `Injected events ${state.eventsStatus}.` } });
+        }
+        session.content = body.events[0].content;
+        session.status = "running";
+        signalTurn(session.id);
+        return json(res, 200, { data: [{ id: "evt_user", type: "user.message", content: body.events[0].content }] });
       }
-      frame(res, "agent.message", buffered);
-      frame(res, "user.message", { id: "evt_user", type: "user.message", content: [{ type: "text", text: "[User]\nHello" }] });
-      frame(res, "session.status_idle", {
-        id: "evt_idle",
-        type: "session.status_idle",
-        stop_reason: { type: "end_turn" },
-        processed_at: "2026-05-18T03:40:52Z"
-      });
-      res.end();
-      return undefined;
+      if (state.streamNotFoundOnce > 0 && req.method === "GET") {
+        state.streamNotFoundOnce -= 1;
+        return json(res, 404, { type: "error", error: { type: "not_found_error", message: "Session not found." } });
+      }
+      if (suffix === "/events/stream" && req.method === "GET") {
+        res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
+        // The adapter cancels a stream it no longer needs; writing to that
+        // socket afterwards must not surface as an unhandled error.
+        res.on("error", () => {});
+        res.write(": heartbeat\n\n");
+        const cursor = req.headers["last-event-id"];
+        // The stream is opened before the message is posted; a fresh connection
+        // waits for that post so the adapter is exercised in the real order,
+        // while a resumed one already has its turn running.
+        if (!cursor) await awaitTurn(session.id);
+        const buffered = {
+          id: "evt_am",
+          type: "agent.message",
+          content: [{ type: "text", text: FAKE_QODER_REPLY }],
+          processed_at: "2026-05-18T03:40:51Z"
+        };
+        const echo = { event: "user.message", data: { id: "evt_user", type: "user.message", content: session.content || [{ type: "text", text: "[User]\nHello" }] } };
+        const idle = {
+          event: "session.status_idle",
+          data: { id: "evt_idle", type: "session.status_idle", stop_reason: { type: "end_turn" }, processed_at: "2026-05-18T03:40:52Z" }
+        };
+        // With a cursor, Qoder delivers what that event left over instead of
+        // replaying what the client already saw.
+        const frames = cursor
+          ? [{ event: "agent.message", data: buffered }, echo, ...(state.holdOpen ? [] : [idle])]
+          : [
+            ...(state.mode === "delta"
+              ? [
+                eventStart("evt_th", "agent.thinking"),
+                deltaFrame("evt_th", "hidden reasoning"),
+                eventStart("evt_am", "agent.message"),
+                deltaFrame("evt_am", "Hello"),
+                deltaFrame("evt_am", " world")
+              ]
+              : state.mode === "partial"
+                ? [eventStart("evt_am", "agent.message"), deltaFrame("evt_am", FAKE_QODER_REPLY.slice(0, 3))]
+                : []),
+            { event: "agent.message", data: buffered },
+            ...(state.replayBuffered ? [{ event: "agent.message", data: buffered }] : []),
+            echo,
+            ...(state.holdOpen ? [] : [idle])
+          ];
+        let sent = 0;
+        for (const entry of frames) {
+          if (state.dropAfterFrames && sent >= state.dropAfterFrames) {
+            // Socket writes are queued, so let the frames already handed over
+            // reach the client before hanging up: the adapter has to resume from
+            // the event id it actually saw rather than from an empty one.
+            await new Promise(done => setTimeout(done, 25));
+            res.destroy();
+            return undefined;
+          }
+          sent += 1;
+          frame(res, entry.event, entry.data, entry.frameId);
+        }
+        if (state.holdOpen) {
+          // A turn the client has to stop: Qoder keeps the stream open until the
+          // interrupt arrives, so nothing here can mark the turn finished.
+          await new Promise(done => res.on("close", done));
+          return undefined;
+        }
+        session.status = "idle";
+        res.end();
+        return undefined;
+      }
     }
     return json(res, 404, { type: "error", error: { type: "not_found_error", message: "Unknown path." } });
   });
