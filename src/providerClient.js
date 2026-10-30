@@ -282,6 +282,8 @@ const QODER_ROLE_LABELS = { user: "User", assistant: "Assistant", system: "Syste
 // never share an environment or an agent.
 const qoderEnvironmentCache = new Map();
 const qoderAgentCache = new Map();
+// Requested model name -> the id Qoder actually lists for that credential.
+const qoderModelIdCache = new Map();
 // Service account tokens are short-lived. They stay in process memory only and
 // are refreshed from the SA key when they near expiry or are rejected.
 const qoderSatCache = new Map();
@@ -649,9 +651,8 @@ async function qoderRequest(url, { method = "GET", body, accept, credentials }, 
   }
 }
 
-async function qoderListModels(credentials, signal) {
+async function qoderModelEntries(credentials, signal, context) {
   const url = qoderJoin(credentials.businessBase, "models");
-  const context = { stage: "business_api", operation: "models", authMode: credentials.authMode, region: credentials.region };
   const response = await qoderRequest(url, { credentials }, signal, context);
   const payload = await readJsonSafely(response);
   if (!payload || typeof payload !== "object" || !Array.isArray(payload.data)) {
@@ -660,8 +661,13 @@ async function qoderListModels(credentials, signal) {
       { url, status: response.status, payload, headers: response.headers, context, classification: { category: "invalid_response", classification: "permanent", retryable: false } }
     );
   }
-  return payload.data
-    .filter(entry => entry?.is_enabled !== false)
+  return payload.data.filter(entry => entry?.is_enabled !== false);
+}
+
+async function qoderListModels(credentials, signal) {
+  const context = { stage: "business_api", operation: "models", authMode: credentials.authMode, region: credentials.region };
+  const entries = await qoderModelEntries(credentials, signal, context);
+  return entries
     .map(entry => {
       const id = typeof entry?.id === "string" ? entry.id.trim() : "";
       if (!id) return null;
@@ -678,6 +684,49 @@ async function qoderListModels(credentials, signal) {
     })
     .filter(Boolean)
     .slice(0, 1000);
+}
+
+// Qoder's model ids are opaque (`qfmodel`) while its console shows a display
+// name (`Qwen3.8-Flash`), and creating a session with a name it does not list
+// fails with "Field 'model' must reference an available model". A saved model
+// may carry either spelling, so the requested name is resolved against the
+// account's own list before an agent is created.
+function qoderModelKey(value) {
+  return String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+async function qoderResolveModelId(credentials, requestedModel, signal, context) {
+  const wanted = String(requestedModel || "").trim();
+  if (!wanted) return wanted;
+  const cacheKey = `${qoderCacheKey(credentials)}|${qoderModelKey(wanted)}`;
+  if (qoderModelIdCache.has(cacheKey)) return qoderModelIdCache.get(cacheKey);
+  let entries;
+  try {
+    entries = await qoderModelEntries(credentials, signal, { ...context, operation: "models" });
+  } catch {
+    // Resolution is a convenience: when the list itself is unreachable, send the
+    // saved name through and let Qoder answer for itself.
+    return wanted;
+  }
+  const rows = entries
+    .map(entry => ({
+      id: typeof entry?.id === "string" ? entry.id.trim() : "",
+      name: typeof entry?.display_name === "string" ? entry.display_name.trim() : ""
+    }))
+    .filter(row => row.id);
+  const wantedKey = qoderModelKey(wanted);
+  const exact = rows.find(row => row.id.toLowerCase() === wanted.toLowerCase());
+  const byName = rows.filter(row => qoderModelKey(row.name || row.id) === wantedKey);
+  const match = exact || (byName.length === 1 ? byName[0] : null);
+  if (!match) {
+    const available = rows.map(row => row.id).slice(0, 8).join(", ");
+    throw new ProviderError(
+      `Qoder does not list a model called "${wanted}". ${available ? `This account has ${available}.` : "This account has no enabled models."}`,
+      400,
+      "invalid_model"
+    );
+  }
+  return qoderRemember(qoderModelIdCache, cacheKey, match.id);
 }
 
 // Read-only fallback used when /models is unavailable: it still proves the
@@ -719,8 +768,9 @@ async function qoderEnvironmentId(credentials, signal, context) {
 }
 
 // An agent fixes the model, so one agent per (credential, model) is reused.
-async function qoderAgentId(credentials, model, signal, context) {
+async function qoderAgentId(credentials, requestedModel, signal, context) {
   const base = credentials.businessBase;
+  const model = await qoderResolveModelId(credentials, requestedModel, signal, context);
   const cacheKey = `${qoderCacheKey(credentials)}|${model}`;
   if (qoderAgentCache.has(cacheKey)) return qoderAgentCache.get(cacheKey);
   let page = "";
@@ -1321,7 +1371,7 @@ const QUOTA_ERROR_TEXT = /insufficient (?:quota|credits?)|credit balance|billing
 const CONCURRENCY_ERROR_TEXT = /concurren|parallel|simultaneous|in.?flight/i;
 const TOKEN_RATE_ERROR_TEXT = /tokens? per min|\bTPM\b|token[- ]rate|tokens?.*(?:minute|min\b)/i;
 const REQUEST_RATE_ERROR_TEXT = /requests? per min|\bRPM\b|too many requests|rate.?limit|request rate/i;
-const INVALID_MODEL_ERROR_TEXT = /model.*(?:not found|does not exist|not available|invalid)|invalid model|unknown model|no endpoints found/i;
+const INVALID_MODEL_ERROR_TEXT = /model.*(?:not found|does not exist|not available|invalid)|invalid model|unknown model|no endpoints found|must reference an available model/i;
 const CREDENTIAL_ERROR_TEXT = /invalid.*(?:api.?key|token|credential)|unauthorized|authentication|api key.*(?:invalid|expired|disabled)/i;
 // Context-window failures arrive as HTTP 400 from most providers. They must be
 // classified before credential heuristics, because a bare 400 message often

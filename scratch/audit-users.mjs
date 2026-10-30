@@ -1,0 +1,12 @@
+﻿import dotenv from "dotenv";
+import mongoose from "mongoose";
+import { fileURLToPath } from "node:url";
+dotenv.config({ path: fileURLToPath(new URL("../.env", import.meta.url)) });
+const { default: connectToDatabase } = await import("../src/db.js");
+const { default: User } = await import("../src/user.js");
+await connectToDatabase();
+const total = await User.countDocuments({});
+const matches = await User.find({ $or: [{ name: /vishnu/i }, { email: /vishnu/i }] }).lean();
+const domains = await User.aggregate([{ $group: { _id: { $arrayElemAt: [{ $split: ["$email", "@"] }, 1] }, count: { $sum: 1 } } }, { $sort: { count: -1 } }]);
+console.log(JSON.stringify({ total, matches: matches.map(u => ({ name: u.name, email: u.email, createdAt: u.createdAt })), domains }, null, 2));
+await mongoose.disconnect();

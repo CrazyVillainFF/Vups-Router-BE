@@ -211,6 +211,42 @@ function qoderTestSettings(input, stored, providerType) {
   };
 }
 
+const MAX_SAVED_MODELS = 500;
+const MAX_MODEL_ID_LENGTH = 200;
+
+// Strict validation for a list a caller asks us to store. Invalid input is an
+// error: silently dropping entries would leave the saved catalogue looking
+// complete while models the user selected are gone.
+function normalizeModelList(input) {
+  if (input === undefined) return { models: undefined };
+  if (!Array.isArray(input) || input.length > MAX_SAVED_MODELS) {
+    return { error: `Models must be an array of at most ${MAX_SAVED_MODELS} model IDs.` };
+  }
+  const models = [];
+  for (const entry of input) {
+    if (typeof entry !== "string") {
+      return { error: `Every model ID must be a non-empty string of at most ${MAX_MODEL_ID_LENGTH} characters.` };
+    }
+    const id = entry.trim();
+    if (!id || id.length > MAX_MODEL_ID_LENGTH) {
+      return { error: `Every model ID must be a non-empty string of at most ${MAX_MODEL_ID_LENGTH} characters.` };
+    }
+    if (!models.includes(id)) models.push(id);
+  }
+  return { models };
+}
+
+// Discovery output is a different trust level from user input: one malformed
+// entry in a provider listing must not throw away the rest of that refresh.
+function discoveredModelIds(entries) {
+  const ids = [];
+  for (const entry of Array.isArray(entries) ? entries : []) {
+    const id = String(typeof entry === "string" ? entry : entry?.id || "").trim();
+    if (id && id.length <= MAX_MODEL_ID_LENGTH && !ids.includes(id)) ids.push(id);
+  }
+  return ids;
+}
+
 function buildProviderUpdate(input, existing) {
   const apiKey = typeof input.apiKey === "string" ? input.apiKey.trim() : "";
   const validationError = validateProviderFields(
@@ -237,6 +273,26 @@ function buildProviderUpdate(input, existing) {
     model: typeof input.model === "string" ? input.model.trim() : existing?.model || ""
   };
   if (apiKey.length > 0) update.encryptedApiKey = encryptSecret(apiKey);
+
+  const parsedModels = normalizeModelList(input.models);
+  if (parsedModels.error) return { error: parsedModels.error };
+  if (parsedModels.models !== undefined) {
+    if (parsedModels.models.length === 0) {
+      return { error: "The provider save cannot empty the model list. Use Save models & default to remove models." };
+    }
+    const sendsDefault = typeof input.defaultModel === "string";
+    const wantedDefault = (sendsDefault ? input.defaultModel : existing?.defaultModel || "").trim();
+    if (wantedDefault && !parsedModels.models.includes(wantedDefault) && sendsDefault) {
+      return { error: "The default model must be one of the saved model IDs." };
+    }
+    // A default the caller never mentioned survives a catalogue edit; a default
+    // that is no longer in the list cannot stay, or chat would request a model
+    // the user did not save.
+    const defaultModel = wantedDefault && parsedModels.models.includes(wantedDefault) ? wantedDefault : "";
+    update.models = parsedModels.models;
+    update.defaultModel = defaultModel;
+    if (!update.model && defaultModel) update.model = defaultModel;
+  }
 
   // Editing anything that can change the outcome invalidates a saved
   // verification so the UI cannot keep showing "Connected" for old values.
@@ -275,6 +331,7 @@ function savedModelRows(config) {
   const zen = isOpenCodeZenBase(config.baseUrl);
   return modelIdsFor(config).map(id => ({
     id,
+    identity: `${config.providerId || config.configId}:${id}`,
     name: id,
     ownedBy: config.provider,
     provider: config.provider,
@@ -290,6 +347,27 @@ function savedModelRows(config) {
     free: null,
     ...(zen ? { free: isOpenCodeZenFreeModel(id), restrictedProvider: isOpenCodeZenFreeModel(id) } : {})
   }));
+}
+
+// Discovery is additive. It never deletes a custom or manually saved model,
+// and a failed or partial refresh leaves the stored catalogue untouched.
+// $addToSet merges atomically, so two concurrent discoveries cannot overwrite
+// each other the way a read-modify-write $set would.
+async function persistDiscoveredModels(userId, config, entries) {
+  if (!config?._id) return 0;
+  const discovered = discoveredModelIds(entries);
+  if (discovered.length === 0) return 0;
+  const existing = new Set(Array.isArray(config.models) ? config.models : []);
+  const room = Math.max(0, MAX_SAVED_MODELS - existing.size);
+  const additions = discovered.filter(id => !existing.has(id)).slice(0, room);
+  if (additions.length === 0) return 0;
+  await ProviderConfig.updateOne(
+    { userId, _id: config._id },
+    { $addToSet: { models: { $each: additions } } },
+    { timestamps: false }
+  );
+  config.models = [...existing, ...additions];
+  return additions.length;
 }
 
 async function storedApiKey(config) {
@@ -380,8 +458,8 @@ router.post("/providers", async (req, res, next) => {
       ...built.update,
       active: false,
       enabled: true,
-      models: [],
-      defaultModel: ""
+      models: built.update.models ?? [],
+      defaultModel: built.update.defaultModel ?? ""
     });
     await activateProvider(req.userId, configId);
     const saved = await ProviderConfig.findOne({ _id: created._id }).select("+encryptedApiKey");
@@ -422,8 +500,8 @@ router.put("/providers/:identifier", async (req, res, next) => {
         ...built.update,
         active: false,
         enabled: true,
-        models: [],
-        defaultModel: ""
+        models: built.update.models ?? [],
+        defaultModel: built.update.defaultModel ?? ""
       });
     }
 
@@ -505,14 +583,9 @@ router.post("/providers/:identifier/test", async (req, res, next) => {
       const parts = [result.listingSupported ? "Connection succeeded." : "Endpoint reached."];
       if (result.availableModels.length > 0) {
         parts.push(`${result.availableModels.length} models available.`);
-        if (stored.models.length === 0) {
-          // First successful discovery: persist the list so it survives later
-          // outages. Never erases a list that already exists.
-          await ProviderConfig.updateOne(
-            { userId: req.userId, _id: stored._id, models: { $size: 0 } },
-            { $set: { models: result.availableModels.map(entry => entry.id).slice(0, 500) } }
-          );
-        }
+        // Merge discovery into the saved catalogue. A successful test must
+        // never erase custom models or models saved from an earlier listing.
+        await persistDiscoveredModels(req.userId, stored, result.availableModels);
       } else if (result.warning) {
         parts.push(result.warning);
       }
@@ -573,6 +646,9 @@ router.post("/providers/:identifier/test-model", async (req, res, next) => {
 
     try {
       const result = await testProviderModel({ baseUrl: normalizedBaseUrl, apiKey, providerType, model, ...qoderTestSettings(input, stored, providerType) });
+      if (Array.isArray(result.availableModels) && result.availableModels.length > 0) {
+        await persistDiscoveredModels(req.userId, stored, result.availableModels);
+      }
       const message = `Model "${model}" responded correctly. A small amount of provider tokens may have been used.`;
       await recordTestResult(req.userId, stored, "connected", "", message);
       return res.json({
@@ -604,18 +680,11 @@ router.put("/providers/:identifier/models", async (req, res, next) => {
 
     let models = [];
     if (input.models !== undefined) {
-      if (!Array.isArray(input.models) || input.models.length > 500) {
-        return res.status(400).json({ message: "Models must be an array of at most 500 model IDs." });
-      }
-      models = [...new Set(input.models
-        .filter(entry => typeof entry === "string")
-        .map(entry => entry.trim())
-        .filter(entry => entry.length > 0 && entry.length <= 200))];
-      if (models.length !== input.models.filter(entry => typeof entry === "string" && entry.trim()).length) {
-        return res.status(400).json({ message: "Every model ID must be a non-empty string of at most 200 characters." });
-      }
+      const parsed = normalizeModelList(input.models);
+      if (parsed.error) return res.status(400).json({ message: parsed.error });
+      models = parsed.models;
     } else {
-      models = stored.models;
+      models = Array.isArray(stored.models) ? stored.models : [];
     }
 
     let defaultModel = typeof input.defaultModel === "string" ? input.defaultModel.trim() : stored.defaultModel;
@@ -806,6 +875,9 @@ router.post("/provider/test-model", async (req, res, next) => {
 
     try {
       const result = await testProviderModel({ baseUrl: normalizedBaseUrl, apiKey, providerType, model, ...qoderTestSettings(input, stored, providerType) });
+      if (stored && Array.isArray(result.availableModels) && result.availableModels.length > 0) {
+        await persistDiscoveredModels(req.userId, stored, result.availableModels);
+      }
       const message = `Model "${model}" responded correctly. A small amount of provider tokens may have been used.`;
       if (stored) await recordTestResult(req.userId, stored, "connected", "", message);
       return res.json({
@@ -897,8 +969,10 @@ router.get("/models", async (req, res, next) => {
       }
       try {
         const models = await listProviderModels({ baseUrl: stored.baseUrl, apiKey, providerType: stored.providerType, authMode: stored.authMode, openapiBaseUrl: stored.openapiBaseUrl });
+        await persistDiscoveredModels(req.userId, stored, models);
         const liveEntries = models.map(model => ({
           ...model,
+          identity: `${stored.providerId || stored.configId}:${model.id}`,
           name: model.name || model.id,
           shared: false,
           vision: model.vision === true ? true : model.vision === false ? false : null,
@@ -958,8 +1032,10 @@ router.get("/models", async (req, res, next) => {
       } else {
         try {
           const models = await listProviderModels({ baseUrl: active.baseUrl, apiKey, providerType: active.providerType, authMode: active.authMode, openapiBaseUrl: active.openapiBaseUrl });
+          await persistDiscoveredModels(req.userId, active, models);
           const liveEntries = models.map(model => ({
             ...model,
+            identity: `${active.providerId || active.configId}:${model.id}`,
             name: model.name || model.id,
             shared: false,
             vision: model.vision === true ? true : model.vision === false ? false : null,

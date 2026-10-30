@@ -1,0 +1,602 @@
+✔ signup validation accepts valid account data (2.644ms)
+✔ signup validation rejects short names, invalid email and short passwords (2.0728ms)
+✔ signin validation rejects malformed credentials (2.4158ms)
+✔ signup validation enforces the maximum input lengths (1.7547ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:37.540Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"fake-model-mini","httpStatus":403,"providerCode":"context_length_exceeded","providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"This model's maximum context length is 131072 tokens. However, your messages resulted in 160000 tokens.","providerDetail":null,"remedyHint":null,"category":"context_limit","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+Chat provider failure: personal context_limit HTTP 403
+✔ a 403 context-window response is serialized as a safe context limit, not Access denied (2596.5805ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:38.417Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"fake-model-mini","httpStatus":401,"providerCode":"prompt_too_long","providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"input length exceeds the context length","providerDetail":null,"remedyHint":null,"category":"context_limit","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+Chat provider failure: personal context_limit HTTP 401
+✔ a 401 context-window response is not mislabeled as an invalid key (866.0442ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:39.476Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"fake-model-mini","httpStatus":403,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Access denied for this model.","providerDetail":null,"remedyHint":null,"category":"forbidden","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+Chat provider failure: personal forbidden HTTP 403
+✔ a genuine 403 still keeps the access-denied classification (1059.1911ms)
+Chat provider failure: personal context_limit -
+✔ a context error delivered inside an open stream is still a context limit (905.0464ms)
+✔ an oversized conversation is rejected before the provider call as a context limit (870.6183ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:42.071Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"fake-model-mini","httpStatus":500,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Internal failure","providerDetail":null,"remedyHint":null,"category":"upstream_unavailable","classification":"transient","retryable":true,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+Chat provider failure: personal provider_unavailable HTTP 500
+✔ ordinary server failures keep their existing provider-unavailable handling (816.9247ms)
+✔ validateImages accepts PNG, JPEG, GIF, and WebP payloads (10.5814ms)
+✔ validateImages accepts public https image URLs without fetching them (2.0893ms)
+✔ validateImages rejects unsafe or ambiguous image URLs (1.5497ms)
+✔ validateImages rejects unknown types, bad base64, and mismatched magic bytes (1.2605ms)
+✔ validateImages enforces count, per-image size, and total size limits (90.3317ms)
+✔ images are forwarded upstream as OpenAI content parts (1646.4631ms)
+✔ image-only messages are accepted and omit the text part (860.2072ms)
+✔ remote image URLs are forwarded as OpenAI content parts and stored as metadata only (844.3378ms)
+✔ text-only messages still send a plain string payload (850.0906ms)
+✔ images attached to earlier messages are rejected (835.7899ms)
+✔ invalid attachment payloads are rejected with clear errors (803.6797ms)
+✔ unauthenticated chat requests with images are rejected (7.7227ms)
+✔ shared model without vision support returns a clear 400 (699.0766ms)
+✔ vision-capable shared model accepts images end to end (827.9132ms)
+✔ shared model list exposes vision capabilities to the client (731.9058ms)
+✔ Vups v3 Galax keeps text on the text model and routes images to the vision model (802.418ms)
+✔ Vups streaming image requests use the configured vision model (913.3799ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:44.918Z","requestId":"c2cfe0f4-48f0-4719-96e1-14a5356e20a3","attempt":1,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"fake-model-mini","httpStatus":404,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"No endpoints found for model fake-model-mini","providerDetail":null,"remedyHint":null,"category":"invalid_model","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+{"event":"vups_provider_outcome","timestamp":"2026-10-30T02:27:44.920Z","outcome":"failed","requestId":"c2cfe0f4-48f0-4719-96e1-14a5356e20a3","providerHost":"127.0.0.1","model":"fake-model-mini","attempts":1,"totalDurationMs":19,"httpStatus":404,"providerCode":null,"providerType":null,"providerStatus":null,"providerErrorCode":null,"providerDetail":null,"remedyHint":null,"category":"invalid_model","classification":"permanent","retryable":false,"retryAfter":null,"finalCode":"vups_model_unavailable"}
+✔ a missing Vups vision model is reported as model unavailable, not an unreadable image (716.2715ms)
+✔ VUPS_VISION=false rejects Vups image requests before calling the provider (663.5587ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:46.380Z","requestId":"3170b3d4-7031-4fff-a7c3-5101c50ead86","attempt":1,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"fake-model-mini","httpStatus":404,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"No endpoints found that support image input","providerDetail":null,"remedyHint":null,"category":"invalid_model","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+{"event":"vups_provider_outcome","timestamp":"2026-10-30T02:27:46.380Z","outcome":"failed","requestId":"3170b3d4-7031-4fff-a7c3-5101c50ead86","providerHost":"127.0.0.1","model":"fake-model-mini","attempts":1,"totalDurationMs":7,"httpStatus":404,"providerCode":null,"providerType":null,"providerStatus":null,"providerErrorCode":null,"providerDetail":null,"remedyHint":null,"category":"invalid_model","classification":"permanent","retryable":false,"retryAfter":null,"finalCode":"vups_vision_rejected"}
+✔ a no-image-endpoint provider error is reported as a vision rejection, not a missing model (796.6003ms)
+✔ history stores attachment metadata and never image bytes (840.9476ms)
+✔ image-only conversations get a sensible stored title (783.1123ms)
+✔ a genuine generation failure is the single terminal error (6.9015ms)
+✔ artifact persistence failure after a complete answer is done with a save warning (0.5321ms)
+✔ conversation persistence failure after a complete answer is done with a save warning (0.4712ms)
+✔ a completed answer with no save problem is a plain done (0.7163ms)
+✔ a client abort produces no terminal event (0.6133ms)
+✔ save warnings never expose provider or database detail (1.0673ms)
+✔ the SSE writer refuses every event after a done event (1.5449ms)
+✔ the SSE writer refuses every event after an error event (0.6056ms)
+✔ the SSE writer never writes to a closed response (0.6898ms)
+✔ the standard chat route declares clientAborted in its own scope (2.4952ms)
+✔ neither streaming route sends an error event for a save failure (2.1255ms)
+✔ continuation merges saved subdocuments without losing their paths (8.5401ms)
+✔ continuation reports a missing target file instead of crashing (1.6175ms)
+✔ creating a continuation conversation requires a signed-in user (313.2848ms)
+✔ a continuation is persisted with its handoff and remains owned by its creator (2438.4607ms)
+✔ continuation input is bounded and titles stay compact (741.7801ms)
+✔ the first model request in the new chat receives the persisted handoff (1278.0661ms)
+✔ task history can be renamed and searched by title or conversation content (1674.6103ms)
+✔ signed-in users can read their real daily request usage (855.9718ms)
+✔ message feedback requires a signed-in user (130.8971ms)
+✔ feedback persists on the assistant message and can be changed or cleared (2735.2835ms)
+✔ feedback input is validated and never crosses conversation ownership (1660.4336ms)
+Health check failed: not_configured | Error Database is not configured.
+Database configuration missing.
+✔ health reports a degraded service when MongoDB is not configured (352.5502ms)
+✔ describes a missing MONGODB_URI as not_configured (4.1739ms)
+✔ describes a rejected Atlas user as auth_failed (7.7225ms)
+✔ describes a malformed connection string as invalid_uri (1.3337ms)
+✔ redacts credentials from logged database errors (1.1869ms)
+✔ describes an unresolvable host as dns_error (1.1392ms)
+✔ describes a server selection failure as timeout (4.5223ms)
+✔ describes a refused connection as unreachable (0.803ms)
+✔ falls back to a generic reason without echoing the raw error text (3.3927ms)
+✔ describes unusual error shapes without throwing (0.8949ms)
+✔ classifies only confirmed database failures as database failures (1.6278ms)
+✔ never classifies provider, HTTP, or validation errors as database failures (0.9634ms)
+✔ a pending sign-in stays pending until the browser approves it (1466.2585ms)
+✔ approval requires a signed-in browser session (177.7512ms)
+✔ approval then poll hands the session to the app exactly once (889.2265ms)
+✔ a wrong verifier cannot redeem an approved ticket (812.8979ms)
+✔ expired tickets are rejected by approve and poll (898.8925ms)
+✔ a second account cannot take over an approved ticket (1522.887ms)
+✔ malformed tickets and challenges are rejected before touching the database (13.8718ms)
+✔ the desktop route offers only the native filesystem tools and returns the model's calls (2498.7477ms)
+✔ a native tool result round-trips and the final answer is persisted to a conversation (970.4859ms)
+✔ another account cannot resume a desktop tool run it does not own (1798.0655ms)
+✔ an invented tool name in the assistant transcript is rejected before any provider call (808.4494ms)
+✔ image attachments cannot ride the text-only filesystem route (856.3636ms)
+✔ a request that does not end with a user or tool message is refused (879.7285ms)
+✔ an anonymous run id is rejected before any lookup (12.985ms)
+✔ the filesystem tool loop stops after the bounded number of rounds (1120.6364ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:44.821Z","requestId":"bfac4fc3-b037-4683-b50b-4f6fa3505cb2","attempt":1,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"fake-model-mini","httpStatus":429,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Rate limit reached for this model.","providerDetail":null,"remedyHint":null,"category":"rate_limit_requests","classification":"transient","retryable":true,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+{"event":"vups_provider_retry","timestamp":"2026-10-30T02:27:44.823Z","requestId":"bfac4fc3-b037-4683-b50b-4f6fa3505cb2","providerHost":"127.0.0.1","model":"fake-model-mini","retry":1,"nextAttempt":2,"delayMs":1,"httpStatus":429,"providerCode":null,"providerType":null,"providerStatus":null,"providerErrorCode":null,"providerDetail":null,"remedyHint":null,"category":"rate_limit_requests","classification":"transient","retryable":true,"retryAfter":null}
+✔ a busy provider on the follow-up call is retried and the tool result still answers (876.3936ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:45.705Z","requestId":"93b0b162-75cf-4d69-b328-6f452a7f54b3","attempt":1,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"fake-model-mini","httpStatus":401,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Invalid API key provided.","providerDetail":null,"remedyHint":null,"category":"invalid_credentials","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+Chat provider failure: personal invalid_api_key HTTP 401
+✔ a rejected provider key on a tool turn is not retried and is not called busy (847.4794ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:46.472Z","requestId":"63fad57d-8e1f-4f0e-88d1-cc5f7d6891ce","attempt":1,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"fake-model-mini","httpStatus":400,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Invalid parameter: tools is not supported by this model.","providerDetail":null,"remedyHint":null,"category":"invalid_request","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+Chat provider failure: personal bad_request HTTP 400
+✔ a malformed request on a tool turn is reported as itself, not as a busy model (765.0032ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:47.202Z","requestId":"19961aef-2f69-4ecc-931d-1ebcd7d6a840","attempt":1,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"fake-model-mini","httpStatus":503,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Provider failure.","providerDetail":null,"remedyHint":null,"category":"upstream_unavailable","classification":"transient","retryable":true,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+{"event":"vups_provider_retry","timestamp":"2026-10-30T02:27:47.202Z","requestId":"19961aef-2f69-4ecc-931d-1ebcd7d6a840","providerHost":"127.0.0.1","model":"fake-model-mini","retry":1,"nextAttempt":2,"delayMs":1,"httpStatus":503,"providerCode":null,"providerType":null,"providerStatus":null,"providerErrorCode":null,"providerDetail":null,"remedyHint":null,"category":"upstream_unavailable","classification":"transient","retryable":true,"retryAfter":null}
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:47.217Z","requestId":"19961aef-2f69-4ecc-931d-1ebcd7d6a840","attempt":2,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"fake-model-mini","httpStatus":503,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Provider failure.","providerDetail":null,"remedyHint":null,"category":"upstream_unavailable","classification":"transient","retryable":true,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+Chat provider failure: personal provider_unavailable HTTP 503
+✔ an exhausted retry budget says the model is unavailable and reports how hard it tried (745.7477ms)
+✔ the desktop prompt bans invented Windows permission advice (1.7492ms)
+✔ encryptSecret round-trips the exact plaintext (135.9706ms)
+✔ encryptSecret produces different ciphertexts for the same input (7.5647ms)
+✔ decryptSecret rejects tampered ciphertext (3.196ms)
+✔ decryptSecret rejects malformed and plaintext values (2.9122ms)
+✔ legacy v1 ciphertext remains readable with the current secret (129.9345ms)
+✔ key rotation keeps previous ciphertext readable and new payloads use the new key (468.4703ms)
+✔ maskApiKey never reveals the full key (2.2552ms)
+✔ validates image prompts at the Cloudflare model limit (7.2357ms)
+✔ generates an image from the documented JSON base64 response (253.0622ms)
+✔ accepts a binary image response and preserves its content type (68.3818ms)
+✔ missing Cloudflare configuration fails clearly without a request (2.9845ms)
+Cloudflare image generation rejected request: 401
+Cloudflare image generation rejected request: 429
+Cloudflare image generation rejected request: 500
+✔ maps Cloudflare authentication, rate-limit, and provider failures (82.012ms)
+✔ maps request timeouts to a retryable 504 without leaking the token (10.2912ms)
+✔ rejects malformed base64 images instead of returning a broken data URL (23.3604ms)
+✔ trust proxy accepts explicit Express values instead of hardcoding production (21.6986ms)
+✔ GET / returns the backend online response (253.0595ms)
+✔ GET /api/health reports MongoDB, release metadata, features, and a request ID (284.8331ms)
+✔ GET /api/health reports the active vision model without credentials (14.401ms)
+✔ unknown API routes return a JSON 404 (9.2611ms)
+✔ CORS allows the Vite frontend with credentials (13.2393ms)
+✔ CORS rejects unknown origins (7.7472ms)
+✔ state-changing requests from unknown origins are blocked (22.7649ms)
+✔ API responses are not cacheable so proxies never serve stale sessions (8.4364ms)
+✔ registration succeeds, hashes the password, and sets an HTTP-only session cookie (1005.1464ms)
+✔ registration rejects invalid input with clear messages (9.5092ms)
+✔ duplicate registration is rejected (768.8527ms)
+✔ login succeeds with the correct password and sets a session cookie (1810.0941ms)
+✔ login fails with the wrong password and does not set a cookie (1482.703ms)
+✔ login fails for an unknown email with the same generic message (10.2481ms)
+✔ /me returns the signed-in user, protected routes reject anonymous requests (817.9098ms)
+✔ logout clears the session cookie and invalidates the session (762.9039ms)
+✔ a session survives repeated requests, as when the page is refreshed (766.4622ms)
+✔ a valid duplicate session cookie is accepted when an older cookie is expired (685.0497ms)
+✔ provider config starts empty and saves encrypted keys without echoing them (875.9249ms)
+✔ provider config rejects invalid URLs and short keys (824.5892ms)
+✔ provider config can be updated and deleted (883.3768ms)
+✔ updating provider config without a new key keeps the saved key and it still works (788.5861ms)
+✔ test connection lists models without sending an inference request (623.9425ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:49.644Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/models","model":null,"httpStatus":401,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Invalid API key provided.","providerDetail":null,"remedyHint":null,"category":"invalid_credentials","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+✔ test connection reports an invalid API key clearly (691.8767ms)
+✔ explicit model testing validates the model and uses one tiny inference request (695.5054ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:51.049Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/models","model":null,"httpStatus":null,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":null,"providerDetail":null,"remedyHint":null,"category":"network_error","classification":"transient","retryable":true,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+✔ test connection reports unreachable endpoints and bad URLs (707.4705ms)
+✔ model listing offers the shared model to users with no provider configuration (593.5342ms)
+✔ saved configuration lists provider models plus the shared model (591.1123ms)
+✔ chat returns a real provider response (non-streaming), persists it, and never substitutes models (547.0013ms)
+✔ chat requires a configured provider and a selected model (576.7245ms)
+✔ chat validates the message payload (536.1822ms)
+✔ chat modes change the system prompt and reject unknown modes (577.5321ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:55.078Z","requestId":"e7065887-4f25-4772-a6f6-d8e1c6eeb23d","attempt":1,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"fake-model-mini","httpStatus":401,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Invalid API key provided.","providerDetail":null,"remedyHint":null,"category":"invalid_credentials","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+{"event":"vups_provider_outcome","timestamp":"2026-10-30T02:27:55.079Z","outcome":"failed","requestId":"e7065887-4f25-4772-a6f6-d8e1c6eeb23d","providerHost":"127.0.0.1","model":"fake-model-mini","attempts":1,"totalDurationMs":9,"httpStatus":401,"providerCode":null,"providerType":null,"providerStatus":null,"providerErrorCode":null,"providerDetail":null,"remedyHint":null,"category":"invalid_credentials","classification":"permanent","retryable":false,"retryAfter":null,"finalCode":"vups_unavailable"}
+✔ Vups v3 Galax uses the trusted prompt and only the configured upstream model (616.0827ms)
+✔ Vups v3 Galax fails safely when its server configuration is missing (480.2744ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:56.032Z","requestId":"6f5b917c-991c-4475-8441-ed535f31e61d","attempt":1,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"fake-model-mini","httpStatus":503,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Provider failure.","providerDetail":null,"remedyHint":null,"category":"upstream_unavailable","classification":"transient","retryable":true,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+{"event":"vups_provider_retry","timestamp":"2026-10-30T02:27:56.033Z","requestId":"6f5b917c-991c-4475-8441-ed535f31e61d","providerHost":"127.0.0.1","model":"fake-model-mini","retry":1,"nextAttempt":2,"delayMs":1,"httpStatus":503,"providerCode":null,"providerType":null,"providerStatus":null,"providerErrorCode":null,"providerDetail":null,"remedyHint":null,"category":"upstream_unavailable","classification":"transient","retryable":true,"retryAfter":null}
+{"event":"vups_provider_outcome","timestamp":"2026-10-30T02:27:56.035Z","outcome":"recovered","requestId":"6f5b917c-991c-4475-8441-ed535f31e61d","providerHost":"127.0.0.1","model":"fake-model-mini","attempts":2,"totalDurationMs":13,"httpStatus":null,"providerCode":null,"providerType":null,"providerStatus":null,"providerErrorCode":null,"providerDetail":null,"remedyHint":null,"category":null,"classification":null,"retryable":null,"retryAfter":null,"finalCode":null}
+✔ Vups retries a transient upstream 503 once and then succeeds (470.9655ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:56.511Z","requestId":"26014e82-a796-4db6-9760-c174fc7a4066","attempt":1,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"fake-model-mini","httpStatus":503,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Provider failure.","providerDetail":null,"remedyHint":null,"category":"upstream_unavailable","classification":"transient","retryable":true,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+{"event":"vups_provider_retry","timestamp":"2026-10-30T02:27:56.512Z","requestId":"26014e82-a796-4db6-9760-c174fc7a4066","providerHost":"127.0.0.1","model":"fake-model-mini","retry":1,"nextAttempt":2,"delayMs":1,"httpStatus":503,"providerCode":null,"providerType":null,"providerStatus":null,"providerErrorCode":null,"providerDetail":null,"remedyHint":null,"category":"upstream_unavailable","classification":"transient","retryable":true,"retryAfter":null}
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:56.544Z","requestId":"26014e82-a796-4db6-9760-c174fc7a4066","attempt":2,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"fake-model-mini","httpStatus":503,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Provider failure.","providerDetail":null,"remedyHint":null,"category":"upstream_unavailable","classification":"transient","retryable":true,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+{"event":"vups_provider_outcome","timestamp":"2026-10-30T02:27:56.544Z","outcome":"failed","requestId":"26014e82-a796-4db6-9760-c174fc7a4066","providerHost":"127.0.0.1","model":"fake-model-mini","attempts":2,"totalDurationMs":40,"httpStatus":503,"providerCode":null,"providerType":null,"providerStatus":null,"providerErrorCode":null,"providerDetail":null,"remedyHint":null,"category":"upstream_unavailable","classification":"transient","retryable":true,"retryAfter":null,"finalCode":"vups_upstream_unavailable"}
+✔ Vups preserves an exhausted upstream 503 after bounded retries (503.5634ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:56.978Z","requestId":"ed3c8626-afd2-4b05-83ad-e12674ded9e2","attempt":1,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"fake-model-mini","httpStatus":429,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Rate limit reached for free-models-per-day. Add credits to continue.","providerDetail":null,"remedyHint":null,"category":"quota_exhausted","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+{"event":"vups_provider_outcome","timestamp":"2026-10-30T02:27:56.978Z","outcome":"failed","requestId":"ed3c8626-afd2-4b05-83ad-e12674ded9e2","providerHost":"127.0.0.1","model":"fake-model-mini","attempts":1,"totalDurationMs":9,"httpStatus":429,"providerCode":null,"providerType":null,"providerStatus":null,"providerErrorCode":null,"providerDetail":null,"remedyHint":null,"category":"quota_exhausted","classification":"permanent","retryable":false,"retryAfter":null,"finalCode":"vups_quota_exhausted"}
+✔ Vups does not retry an exhausted free-model daily quota (435.1694ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:57.412Z","requestId":"5537eda8-4fd3-47ac-896d-937ca94875a7","attempt":1,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"fake-model-mini","httpStatus":429,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Too many requests. Please retry later.","providerDetail":null,"remedyHint":null,"category":"rate_limit_requests","classification":"transient","retryable":true,"retryAfter":17,"retryAfterRaw":"17","responseHeaders":{}}
+{"event":"vups_provider_outcome","timestamp":"2026-10-30T02:27:57.412Z","outcome":"failed","requestId":"5537eda8-4fd3-47ac-896d-937ca94875a7","providerHost":"127.0.0.1","model":"fake-model-mini","attempts":1,"totalDurationMs":7,"httpStatus":429,"providerCode":null,"providerType":null,"providerStatus":null,"providerErrorCode":null,"providerDetail":null,"remedyHint":null,"category":"rate_limit_requests","classification":"transient","retryable":true,"retryAfter":17,"finalCode":"vups_rate_limited"}
+✔ Vups forwards upstream Retry-After and does not wait beyond the configured cap (433.6992ms)
+✔ Vups returns safe structured upstream diagnostics and a request ID (421.7787ms)
+{"event":"vups_provider_outcome","timestamp":"2026-10-30T02:27:58.338Z","outcome":"failed","requestId":"1f3799d6-b504-4b32-aef4-8db19fd83999","providerHost":"127.0.0.1","model":"fake-model-mini","attempts":1,"totalDurationMs":67,"httpStatus":null,"providerCode":null,"providerType":null,"providerStatus":null,"providerErrorCode":null,"providerDetail":null,"remedyHint":null,"category":"unknown","classification":"ambiguous","retryable":false,"retryAfter":null,"finalCode":"vups_stream_interrupted"}
+✔ Vups reports a mid-stream failure without retrying or faking success (502.3852ms)
+{"event":"vups_provider_outcome","timestamp":"2026-10-30T02:27:58.757Z","outcome":"failed","requestId":"600c26a1-a2ab-4df1-9577-a94eb19b7496","providerHost":"127.0.0.1","model":"fake-model-mini","attempts":1,"totalDurationMs":74,"httpStatus":null,"providerCode":null,"providerType":null,"providerStatus":null,"providerErrorCode":null,"providerDetail":null,"remedyHint":null,"category":null,"classification":null,"retryable":null,"retryAfter":null,"finalCode":"vups_stream_interrupted"}
+✔ Vups preserves partial output when the upstream closes without a terminal event (419.1797ms)
+{"event":"vups_provider_outcome","timestamp":"2026-10-30T02:27:59.161Z","outcome":"failed","requestId":"e5733bc7-56a2-4356-b608-6496d372be9f","providerHost":"127.0.0.1","model":"fake-model-mini","attempts":1,"totalDurationMs":77,"httpStatus":null,"providerCode":"429","providerType":null,"providerStatus":"429","providerErrorCode":"rate_limit_tokens","providerDetail":"Upstream rate limit; key [redacted] was not sent.","remedyHint":null,"category":"rate_limit_tokens","classification":"transient","retryable":false,"retryAfter":null,"finalCode":"vups_token_rate_limited"}
+✔ Vups classifies structured mid-stream upstream errors without leaking details to the client (403.2936ms)
+✔ Vups sends a bounded output budget for streaming and non-streaming requests (434.5827ms)
+✔ Vups keeps the SSE connection alive while the upstream is quiet (1702.3968ms)
+✔ Vups v3 Galax streams SSE and enforces configured vision support (478.4028ms)
+{"event":"vups_provider_outcome","timestamp":"2026-10-30T02:28:02.120Z","outcome":"failed","requestId":"c810a182-e5ff-4d12-8f41-303f2e262258","providerHost":"127.0.0.1","model":"fake-model-mini","attempts":1,"totalDurationMs":12,"httpStatus":null,"providerCode":null,"providerType":null,"providerStatus":null,"providerErrorCode":null,"providerDetail":null,"remedyHint":null,"category":null,"classification":null,"retryable":null,"retryAfter":null,"finalCode":"vups_output_limit"}
+✔ Vups v3 Galax reports a reasoning-only length stream as output_limit (344.0422ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:28:02.511Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"fake-model-mini","httpStatus":401,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Invalid API key provided.","providerDetail":null,"remedyHint":null,"category":"invalid_credentials","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+Chat provider failure: personal invalid_api_key HTTP 401
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:28:02.557Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"fake-model-mini","httpStatus":429,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Rate limit reached for this model.","providerDetail":null,"remedyHint":null,"category":"rate_limit_requests","classification":"transient","retryable":true,"retryAfter":17,"retryAfterRaw":"17","responseHeaders":{}}
+Chat provider failure: personal rate_limited HTTP 429
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:28:02.602Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"model-that-does-not-exist","httpStatus":404,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"The model `model-that-does-not-exist` does not exist.","providerDetail":null,"remedyHint":null,"category":"invalid_model","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+Chat provider failure: personal not_found HTTP 404
+✔ chat surfaces provider errors clearly (invalid key, rate limit, unavailable model) (482.4596ms)
+✔ chat streams SSE deltas from the provider and persists the final text (431.768ms)
+Chat provider failure: personal stream_error -
+✔ chat stream reports a mid-stream provider failure without faking success (454.3467ms)
+✔ streaming preserves finish_reason and final usage chunks without ending early (548.6893ms)
+✔ conversation history can be listed and deleted, and is capped per user (547.1192ms)
+✔ users cannot read, delete, or continue each other's conversations or configs (1038.2875ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:28:05.972Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"fake-model-mini","httpStatus":402,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Insufficient credits.","providerDetail":null,"remedyHint":null,"category":"quota_exhausted","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+Chat provider failure: personal insufficient_credits HTTP 402
+✔ chat reports insufficient balance (HTTP 402) with a stable code (348.3491ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:28:06.376Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"fake-model-mini","httpStatus":503,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Provider failure.","providerDetail":null,"remedyHint":null,"category":"upstream_unavailable","classification":"transient","retryable":true,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+Chat provider failure: personal provider_unavailable HTTP 503
+✔ chat surfaces provider timeouts and outages with stable codes (404.1635ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:28:06.827Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/models","model":null,"httpStatus":401,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Listing rejected with 401","providerDetail":null,"remedyHint":null,"category":"invalid_credentials","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+✔ test connection records its status for the settings page without leaking the key (475.1203ms)
+✔ per-user daily quota is enforced and reported clearly (481.2092ms)
+✔ administrators can verify the OpenRouter key and probe an exact model without exposing secrets (445.9501ms)
+✔ only administrators can manage AI access and disabled users cannot chat (811.0847ms)
+✔ malformed JSON bodies are rejected with a clear 400 (10.4531ms)
+✔ shared model status is visible to signed-in users and never leaks the private server URL (357.4364ms)
+✔ a brand-new user can chat through the shared model without configuring anything (397.7198ms)
+✔ new users can stream from the shared model (410.6038ms)
+✔ users with their own provider keep it, and shared requests never use personal credentials (776.6477ms)
+✔ a user without a provider cannot borrow another user's personal model or credentials (697.9372ms)
+✔ unauthorized requests cannot use the shared model (23.8872ms)
+✔ missing Ollama configuration is reported honestly (373.5817ms)
+✔ an unreachable Ollama server is reported as unreachable (368.6562ms)
+✔ a missing shared model is reported instead of pretending it is available (412.8102ms)
+✔ chat requests are rate limited and return a clear 429 (1088.7605ms)
+✔ administrators can disable and re-enable the shared model for everyone (862.6605ms)
+✔ OpenRouter becomes the shared model when OPENROUTER_API_KEY is configured (402.8742ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:28:15.132Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"fake-model-mini","httpStatus":404,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"The model `fake-model-mini` is temporarily unavailable.","providerDetail":null,"remedyHint":null,"category":"invalid_model","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+Chat provider failure: shared not_found HTTP 404
+✔ a failed shared model retries the configured free fallback exactly once (365.4553ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:28:15.491Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"fake-model-mini","httpStatus":503,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"The model `fake-model-mini` is temporarily unavailable.","providerDetail":null,"remedyHint":null,"category":"overloaded","classification":"transient","retryable":true,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+Chat provider failure: shared provider_unavailable HTTP 503
+✔ a shared stream falls back before headers are sent and reports the fallback model (431.1212ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:28:15.909Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"fake-model-pro","httpStatus":429,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Rate limit reached for this model.","providerDetail":null,"remedyHint":null,"category":"rate_limit_requests","classification":"transient","retryable":true,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+Chat provider failure: shared rate_limited HTTP 429
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:28:15.924Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"fake-model-mini","httpStatus":429,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Rate limit reached for this model.","providerDetail":null,"remedyHint":null,"category":"rate_limit_requests","classification":"transient","retryable":true,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+Chat provider failure: shared rate_limited HTTP 429
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:28:15.955Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"fake-model-pro","httpStatus":429,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day","providerDetail":null,"remedyHint":null,"category":"quota_exhausted","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+Chat provider failure: shared quota_exhausted HTTP 429
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:28:15.987Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"fake-model-pro","httpStatus":402,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Insufficient credits.","providerDetail":null,"remedyHint":null,"category":"quota_exhausted","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+Chat provider failure: shared insufficient_credits HTTP 402
+✔ OpenRouter quota exhaustion is handled safely with a clear 429 (415.8635ms)
+✔ multiple shared models are listed, selectable, and validated server-side (411.563ms)
+✔ an enabled but unavailable shared model is reported with a clear alternative (387.6635ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:28:17.176Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"fake-model-mini","httpStatus":400,"providerCode":"internal_nonsense_code","providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"upstream rejected the prompt shape","providerDetail":null,"remedyHint":null,"category":"invalid_request","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+Chat provider failure: shared bad_request HTTP 400
+✔ a permanent provider rejection is never reported as a temporary outage (389.0962ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:28:17.566Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"fake-model-mini","httpStatus":401,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Invalid Key: [redacted]","providerDetail":null,"remedyHint":null,"category":"invalid_credentials","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+Chat provider failure: shared invalid_api_key HTTP 401
+✔ a rejected shared key is reported as the server's problem, not the user's (390.9429ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:28:17.940Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"fake-model-mini","httpStatus":503,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"No available connections for this model","providerDetail":null,"remedyHint":null,"category":"upstream_unavailable","classification":"transient","retryable":true,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+Chat provider failure: shared provider_unavailable HTTP 503
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:28:17.956Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"fake-model-pro","httpStatus":503,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"No available connections for this model","providerDetail":null,"remedyHint":null,"category":"upstream_unavailable","classification":"transient","retryable":true,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+Chat provider failure: shared provider_unavailable HTTP 503
+✔ a genuine upstream outage still tells the user to try again (390.2857ms)
+✔ a shared desktop tool turn sends the real model upstream and the alias back (370.4078ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:28:18.683Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"fake-model-pro","httpStatus":401,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Invalid API key provided.","providerDetail":null,"remedyHint":null,"category":"invalid_credentials","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+Chat provider failure: shared invalid_api_key HTTP 401
+✔ OpenRouter server-side key problems never leak details to users (355.6296ms)
+✔ an unreachable OpenRouter server is reported as unreachable (369.7615ms)
+✔ a missing OpenRouter model is reported instead of pretending it is available (437.5602ms)
+✔ the shared output limit defaults to 4096 and is clamped to a safe maximum (0.953ms)
+✔ switching between shared and personal models sends exactly the selected model with no database error (493.1381ms)
+✔ OpenRouter without an API key falls back to the Ollama shared model (296.9387ms)
+✔ image generation endpoint returns the generated image from Cloudflare (291.8292ms)
+✔ image generation requires authentication and Cloudflare configuration (299.9306ms)
+✔ image generation is rate limited per user (353.9604ms)
+✔ GET /api returns an informative index instead of a bare 404 (3.3073ms)
+✔ CORS allows Vite preview origins and pattern-configured Vercel aliases (88.7144ms)
+✔ model type is persisted explicitly and rejects unknown values (364.2791ms)
+✔ the first saved provider preserves the free default without changing existing choices (390.3106ms)
+✔ the free catalogue only includes verified free models and persists them for routing (467.9804ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:28:22.900Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"fake-model-mini","httpStatus":429,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Rate limit reached for this model.","providerDetail":null,"remedyHint":null,"category":"rate_limit_requests","classification":"transient","retryable":true,"retryAfter":17,"retryAfterRaw":"17","responseHeaders":{}}
+Chat provider failure: personal rate_limited HTTP 429
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:28:22.949Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"fake-model-mini","httpStatus":429,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Rate limit reached for free-models-per-day. Add credits to continue.","providerDetail":null,"remedyHint":null,"category":"quota_exhausted","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+Chat provider failure: personal quota_exhausted HTTP 429
+✔ chat errors include the affected model and only a reliable Retry-After reset (405.8552ms)
+(node:13640) [MONGOOSE] Warning: mongoose: the `new` option for `findOneAndUpdate()` and `findOneAndReplace()` is deprecated. Use `returnDocument: 'after'` instead.
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ long coding responses persist an exact artifact and keep the conversation summary small (414.4202ms)
+(node:13640) [MONGOOSE] Warning: mongoose: the `new` option for `findOneAndUpdate()` and `findOneAndReplace()` is deprecated. Use `returnDocument: 'after'` instead.
+✔ streaming multi-file code emits truthful progress and a complete artifact (486.3235ms)
+(node:13640) [MONGOOSE] Warning: mongoose: the `new` option for `findOneAndUpdate()` and `findOneAndReplace()` is deprecated. Use `returnDocument: 'after'` instead.
+✔ an interrupted artifact can be continued without duplicating the assistant turn (442.2294ms)
+✔ OpenRouter model metadata becomes explicit capabilities (4.8199ms)
+✔ declared provider capabilities are honored without inventing unknowns (1.9796ms)
+✔ missing metadata stays unknown rather than claiming support (3.6211ms)
+✔ Gemini metadata maps token limits and modalities (1.013ms)
+✔ Gemini models without modality metadata do not claim vision (0.6906ms)
+✔ saving a provider persists its model list and default model (1783.3732ms)
+✔ a provider save without a models field keeps the saved catalogue and rotates the key (822.2294ms)
+✔ an explicit empty model list is rejected instead of erasing the catalogue (935.2358ms)
+✔ an invalid default model is rejected and a dropped default never points outside the catalogue (742.0491ms)
+✔ the models editor accepts duplicate IDs and rejects malformed lists without touching stored data (862.3262ms)
+✔ discovery merges additively and never removes a manually saved model (925.9298ms)
+✔ one malformed discovery entry does not block persisting the valid models (1006.7288ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:45.150Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/models","model":null,"httpStatus":500,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Listing rejected with 500","providerDetail":null,"remedyHint":null,"category":"upstream_unavailable","classification":"transient","retryable":true,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:45.168Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/models","model":null,"httpStatus":500,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Listing rejected with 500","providerDetail":null,"remedyHint":null,"category":"upstream_unavailable","classification":"transient","retryable":true,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+✔ a failed discovery keeps saved models and the default visible (780.1845ms)
+✔ each configuration keeps its own catalogue when both providers are refreshed (1001.174ms)
+✔ concurrent discovery on one configuration never drops a model (816.9409ms)
+✔ the 500-model cap is enforced consistently across saving and discovery (837.1318ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:48.594Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/models","model":null,"httpStatus":401,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Invalid API key provided.","providerDetail":null,"remedyHint":null,"category":"invalid_credentials","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:48.640Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/models","model":null,"httpStatus":401,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Invalid API key provided.","providerDetail":null,"remedyHint":null,"category":"invalid_credentials","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+✔ model payloads and errors never echo the API key (801.2228ms)
+✔ a Qoder configuration keeps models, auth mode, region and default across a re-save (829.3264ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:50.272Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/api/v1/cloud/models","model":null,"httpStatus":503,"providerCode":null,"providerType":"error","providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Injected models 503.","providerDetail":null,"remedyHint":null,"category":"upstream_unavailable","classification":"transient","retryable":true,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+✔ a Qoder catalogue survives a model-listing outage (826.7433ms)
+✔ OmniRoute base URLs normalize to a single protocol root and never duplicate /v1 (4.889ms)
+✔ invalid OmniRoute base URLs are rejected with a clear code (2.5803ms)
+✔ configuration stays optional and defaults to enabled only when credentials exist (5.5174ms)
+✔ endpoint construction appends exactly one /v1 path segment (3.5115ms)
+✔ model lists are normalized, deduplicated, and bounded (18.4671ms)
+✔ model discovery uses the bearer key, caches results, and can force a refresh (165.5096ms)
+✔ model discovery reports disabled, unauthorized, empty, unreachable, and timeout states (224.2851ms)
+✔ public status and model rows never expose the server key or base URL (35.9308ms)
+✔ gateway chat resolution validates the exact model and returns safe provider settings (36.2686ms)
+✔ status errors are distinct, sanitized, and actionable (2.605ms)
+✔ client cancellation aborts an in-flight OmniRoute request cleanly (60.8154ms)
+✔ OmniRoute models are listed with safe metadata and duplicate free IDs are not repeated (1815.8268ms)
+✔ existing personal providers keep working while OmniRoute is enabled (992.476ms)
+✔ non-streaming gateway chat uses the exact model and the server-side key (911.7438ms)
+✔ streaming gateway chat forwards deltas in order and finishes cleanly (998.7763ms)
+✔ gateway model and source input is validated before any upstream call (701.7363ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:44.090Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"openai/gpt-5.2","httpStatus":401,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"OmniRoute upstream failure 401","providerDetail":null,"remedyHint":null,"category":"invalid_credentials","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+Chat provider failure: gateway invalid_api_key HTTP 401
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:44.131Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"openai/gpt-5.2","httpStatus":403,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"OmniRoute upstream failure 403","providerDetail":null,"remedyHint":null,"category":"forbidden","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+Chat provider failure: gateway forbidden HTTP 403
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:44.177Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"openai/gpt-5.2","httpStatus":404,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"OmniRoute upstream failure 404","providerDetail":null,"remedyHint":null,"category":"invalid_model","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+Chat provider failure: gateway not_found HTTP 404
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:44.204Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"openai/gpt-5.2","httpStatus":405,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"OmniRoute upstream failure 405","providerDetail":null,"remedyHint":null,"category":"unknown","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+Chat provider failure: gateway method_not_allowed HTTP 405
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:44.238Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"openai/gpt-5.2","httpStatus":429,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"OmniRoute upstream failure 429","providerDetail":null,"remedyHint":null,"category":"ambiguous_rate_limit","classification":"ambiguous","retryable":true,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+Chat provider failure: gateway rate_limited HTTP 429
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:44.287Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"openai/gpt-5.2","httpStatus":500,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"OmniRoute upstream failure 500","providerDetail":null,"remedyHint":null,"category":"upstream_unavailable","classification":"transient","retryable":true,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+Chat provider failure: gateway provider_unavailable HTTP 500
+✔ upstream gateway HTTP failures map to distinct, sanitized errors (980.9291ms)
+✔ gateway discovery failures leave existing models visible and block only the gateway (747.2138ms)
+✔ disabling OmniRoute removes only gateway models and keeps other providers working (1025.1861ms)
+✔ an unreachable gateway is reported without breaking the rest of the app (738.848ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:50.119Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"openai/gpt-5.2","httpStatus":null,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":null,"providerDetail":null,"remedyHint":null,"category":"timeout","classification":"transient","retryable":true,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+Chat provider failure: gateway timeout -
+✔ a slow gateway surfaces a timeout without hanging the request (3320.5392ms)
+✔ a streamed answer forwards the provider's final usage metadata (1846.0749ms)
+✔ reasoning text becomes its own step and never enters the answer (967.98ms)
+Chat provider failure: personal output_limit -
+✔ a model that reasons past its output budget reports the output limit (974.2117ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:43.612Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"fake-model-mini","httpStatus":429,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Rate limit reached for this model.","providerDetail":null,"remedyHint":null,"category":"rate_limit_requests","classification":"transient","retryable":true,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+✔ a transient upstream rate limit is retried and the answer still streams (917.1477ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:44.504Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"fake-model-pro","httpStatus":429,"providerCode":"429","providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"recursive/flint-v1.0:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits.","providerDetail":null,"remedyHint":null,"category":"rate_limit_requests","classification":"transient","retryable":true,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:44.536Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"fake-model-pro","httpStatus":429,"providerCode":"429","providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"recursive/flint-v1.0:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits.","providerDetail":null,"remedyHint":null,"category":"rate_limit_requests","classification":"transient","retryable":true,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:44.567Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"fake-model-pro","httpStatus":429,"providerCode":"429","providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"recursive/flint-v1.0:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits.","providerDetail":null,"remedyHint":null,"category":"rate_limit_requests","classification":"transient","retryable":true,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+Chat provider failure: personal rate_limited HTTP 429
+✔ a persistent rate limit surfaces honestly without swapping the model (854.2842ms)
+Chat provider failure: personal rate_limited -
+✔ a rate-limit error delivered after the stream opened keeps its category and reset hint (816.6487ms)
+Chat provider failure: personal quota_exhausted -
+✔ a quota error delivered after the stream opened reports quota_exhausted (888.2763ms)
+✔ an account without its own credential never borrows another account's key (1432.2248ms)
+✔ cancelling the client mid-stream ends the turn without a provider error (797.9ms)
+✔ a saved OpenRouter key is never swapped for the server's global key (878.8592ms)
+✔ only zero-price chat models are exposed and the configured default leads the list (193.829ms)
+✔ the pricing filter does not trust model names or assume missing pricing is free (1.8184ms)
+✔ an explicit allowlist enables paid IDs while keeping missing IDs unavailable (93.4395ms)
+✔ paid defaults never make paid models fallback candidates (56.7588ms)
+✔ a paid-only allowlist without a safe default does not silently choose a paid model (40.2527ms)
+✔ OpenRouter key verification reports safe account limits and rejects bad keys (21.2991ms)
+✔ the catalog is cached and forceRefresh bypasses the cache (44.6782ms)
+✔ a transient catalog failure serves a recent cached catalog with a stale marker (75.2635ms)
+✔ a rejected server key is reported as unauthorized instead of serving stale models (48.6025ms)
+✔ the shared OpenRouter provider leaves reasoning at each model's default (4.2717ms)
+✔ generateOtp always produces six digits and preserves leading zeroes (13.8667ms)
+✔ reset code and authorization TTLs are ten minutes and the attempt cap is five (0.3659ms)
+✔ reset authorization tokens are unique, URL-safe, and only stored as sha256 digests (1.7038ms)
+✔ forgot-password emails a six-digit code and stores only its bcrypt hash (3212.5918ms)
+✔ email normalization: mixed-case and padded addresses reach the same account (1535.1035ms)
+✔ nonexistent accounts receive the identical response and no email (43.8997ms)
+✔ missing Brevo configuration fails loudly and stores no code (859.3102ms)
+✔ Brevo 401, 429, and network failures invalidate the code, log the provider response, and never leak the code (3526.1472ms)
+✔ verify-code accepts the correct code and returns a single-use authorization (1900.0533ms)
+✔ wrong codes are rejected, increment the attempt counter, and never leak account existence (1459.8323ms)
+✔ the five-attempt limit blocks further verification even with the correct code (3937.2356ms)
+✔ expired codes cannot be verified (847.4979ms)
+✔ concurrent wrong verifications all count against the attempt limit (2089.0634ms)
+✔ authorized reset changes the password, consumes the authorization, and invalidates old sessions (2150.6138ms)
+✔ reset-password also accepts email + code directly without a prior verify call (1484.0027ms)
+✔ an authorization is bound to its own account and cannot reset another account (2151.6105ms)
+✔ requesting a new code revokes previously issued authorizations (1636.4002ms)
+✔ expired codes and expiry of authorizations are rejected (2032.26ms)
+✔ mismatched passwords and weak passwords are rejected without consuming the code (1373.8332ms)
+✔ the attempt limit also blocks reset-password with the correct code (2443.8412ms)
+✔ concurrent resets with the same authorization or code allow exactly one success (3492.4132ms)
+✔ a newer code replaces the previous one and only the newest authorizes a reset (2031.7125ms)
+✔ forgot-password, verify-code, and reset-password are independently rate limited per IP (305.4679ms)
+✔ the limit honors PASSWORD_RESET_SEND_LIMIT_MAX (1.7411ms)
+✔ four code requests are allowed per 24 hours and the fifth is rejected with a clear 429 (3887.3925ms)
+✔ unknown addresses share the identical counter and 429 behavior (no account enumeration) (2791.2798ms)
+✔ the rolling window forgets sends once they are older than 24 hours (177.3773ms)
+✔ concurrent requests cannot bypass the limit (2235.7285ms)
+Brevo OTP email rejected with HTTP 500: {"code":"error"}
+Password reset code email delivery failed: provider_unavailable
+Brevo OTP email rejected with HTTP 500: {"code":"error"}
+Password reset code email delivery failed: provider_unavailable
+Brevo OTP email rejected with HTTP 500: {"code":"error"}
+Password reset code email delivery failed: provider_unavailable
+Brevo OTP email rejected with HTTP 500: {"code":"error"}
+Password reset code email delivery failed: provider_unavailable
+✔ failed email deliveries still count against the limit (2194.5632ms)
+✔ catalog has at least 80 distinct, truthful plugins (2.5878ms)
+✔ every adapter has unique tools with object schemas (0.8652ms)
+✔ public tool views never expose executable functions (2.6435ms)
+✔ tool input validation enforces required fields and bounds (2.6066ms)
+✔ tool names round-trip and reject malformed names (0.7755ms)
+✔ OAuth state is signed, scoped, and tamper-resistant (13.417ms)
+✔ live provider verification attempts every credential-free adapter (37.79ms)
+✔ known credential values never survive a message (3.1051ms)
+✔ token shaped strings are redacted even when the value is unknown (0.5581ms)
+✔ authorization headers keep their scheme and lose the secret (0.3591ms)
+✔ credential query parameters and bodies are redacted (0.4318ms)
+✔ secretValues only collects values long enough to be credentials (3.7976ms)
+✔ safeErrorMessage redacts a provider error before it leaves the service (0.6551ms)
+✔ safeErrorMessage keeps a generic message for unknown failures (0.7325ms)
+✔ short values are not scanned as secrets (0.363ms)
+✔ chat request bodies include tool definitions only for chat-completions providers (2.5571ms)
+✔ tool calls and tool results survive message serialization (1.1031ms)
+✔ plugin tools are disabled for providers with incompatible protocols (0.9615ms)
+✔ Anthropic endpoint resolution adds the documented version path (18.5495ms)
+✔ Anthropic model listing uses x-api-key and the Messages protocol (76.9365ms)
+✔ redirects are followed only within the same origin (46.4025ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:45.154Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/models","model":null,"httpStatus":405,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Not supported","providerDetail":null,"remedyHint":null,"category":"unknown","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+✔ connection checks stay zero-inference when model listing is unsupported (47.0545ms)
+✔ Anthropic chat sends the native body and extracts text (14.8466ms)
+✔ Anthropic image parts use base64 sources (1.0944ms)
+✔ Anthropic image parts use URL sources for remote HTTPS images (0.7172ms)
+✔ Anthropic streaming surfaces text deltas and finish reason (21.3533ms)
+✔ explicit model tests are the only path that runs inference (65.5055ms)
+✔ Azure OpenAI uses the api-key header instead of Bearer (17.7185ms)
+✔ watsonx resolves its versioned endpoint and requires a project ID (11.3482ms)
+✔ watsonx exchanges the API key for a cached IAM token and lists models zero-inference (60.8638ms)
+✔ Bedrock hosts are recognized so listing fallbacks stay honest (0.7528ms)
+✔ normalizes AgentRouter base URLs without duplicating /v1 (3.9168ms)
+✔ keeps other provider base URLs unchanged (0.5477ms)
+✔ Retry-After headers are parsed as bounded integer seconds (0.6548ms)
+✔ a transient OpenRouter upstream 429 stays a rate limit and never claims quota (9.2461ms)
+✔ a genuine exhausted daily quota still becomes quota_exhausted (0.7714ms)
+✔ OpenRouter retry hints in error metadata are preserved (3.0653ms)
+✔ classifies transient limits separately from exhausted free quotas (0.8529ms)
+✔ retries transient failures with bounded backoff but never retries quota exhaustion (1.5688ms)
+✔ AgentRouter GPT models resolve to /responses and other models keep /chat/completions (1.037ms)
+✔ builds a Responses payload with the exact model ID and stream flag (2.2553ms)
+✔ keeps the existing chat-completions payload shape (1.9035ms)
+✔ forwards an explicit reasoning policy only when one is provided (1.026ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:45.418Z","requestId":null,"attempt":null,"providerHost":"opencode.ai","endpoint":"/zen/v1/models","model":null,"httpStatus":401,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Invalid API key","providerDetail":null,"remedyHint":null,"category":"invalid_credentials","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+✔ sends POST to /v1/chat/completions for streaming and non-streaming requests (159.1762ms)
+✔ AgentRouter GPT requests are POSTed to /v1/responses for both modes (3.4078ms)
+✔ OpenCode Zen resolves each documented model family to its endpoint (4.0061ms)
+✔ OpenCode Zen discovers models from the Zen catalog with Bearer auth (2.5116ms)
+✔ OpenCode Zen free models are rejected before any upstream request (1.7533ms)
+✔ provider error details never echo a raw HTML error page (0.6337ms)
+✔ OpenCode Zen connection checks validate the key without inference (2.7375ms)
+✔ OpenCode Zen chat routes OpenAI, Responses, and Anthropic models with Bearer auth (2.9872ms)
+✔ OpenCode Zen streams Anthropic models through the Messages endpoint (0.9378ms)
+✔ OpenCode Zen rejects native-only model families before sending a request (0.5665ms)
+✔ classifies provider 429s by structured quota, token, concurrency, and shared-pool signals (0.4527ms)
+✔ HTTP 400 context-window failures are classified as context limits, not credentials (0.555ms)
+✔ context-window evidence wins even when the provider wraps it in 401 or 403 (0.5229ms)
+✔ genuine credential and permission failures are never context limits (0.441ms)
+✔ provider failure diagnostics expose safe classification and upstream metadata (0.6929ms)
+✔ provider failure diagnostics include only safe request context and a truncated body (0.4449ms)
+✔ provider failure diagnostics serialize JSON and redact credential fields (0.2138ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:45.500Z","requestId":null,"attempt":null,"providerHost":"generativelanguage.googleapis.com","endpoint":"/v1beta/models","model":null,"httpStatus":400,"providerCode":null,"providerType":null,"providerStatus":"INVALID_ARGUMENT","providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"API key not valid. Please pass a valid API key.","providerDetail":null,"remedyHint":null,"category":"invalid_credentials","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:45.502Z","requestId":null,"attempt":null,"providerHost":"generativelanguage.googleapis.com","endpoint":"/v1beta/openai/chat/completions","model":"gemini-3.8-flash","httpStatus":429,"providerCode":null,"providerType":null,"providerStatus":"RESOURCE_EXHAUSTED","providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Quota exceeded for quota metric 'Generate requests per day per project per model-free-tier'.","providerDetail":null,"remedyHint":null,"category":"quota_exhausted","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:45.504Z","requestId":null,"attempt":null,"providerHost":"generativelanguage.googleapis.com","endpoint":"/v1beta/openai/chat/completions","model":"gemini-3.8-flash","httpStatus":403,"providerCode":null,"providerType":null,"providerStatus":"PERMISSION_DENIED","providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"User location is not supported for the API use.","providerDetail":null,"remedyHint":null,"category":"forbidden","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:45.508Z","requestId":null,"attempt":null,"providerHost":"openrouter.ai","endpoint":"/api/v1/chat/completions","model":"recursive/flint-v1.0:free","httpStatus":200,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":null,"providerDetail":null,"remedyHint":null,"category":"output_limit","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+✔ propagates HTTP 405 with safe diagnostics for both request modes (60.5127ms)
+✔ parses streaming deltas from both API shapes (0.5267ms)
+✔ extracts non-streaming text from both API shapes (0.2486ms)
+✔ Google Gemini base URLs normalize to the OpenAI-compatible surface (0.4217ms)
+✔ Google Gemini model discovery uses the native catalogue and x-goog-api-key (2.3031ms)
+✔ Google Gemini chat posts OpenAI-shaped requests and streams deltas (2.1291ms)
+✔ Google Gemini invalid keys and free-tier quota errors stay actionable (10.9007ms)
+✔ OpenRouter reasoning increments are read once, never twice (0.6218ms)
+✔ OpenRouter stream requests opt into the final usage chunk (0.445ms)
+✔ the stream request body carries usage for OpenRouter and nothing for other hosts (1.1121ms)
+✔ a non-stream answer spent entirely on reasoning reports the output limit (1.5952ms)
+✔ saving FlagshipRouter does not modify DeepSeek and both persist independently (1396.6003ms)
+✔ saving DeepSeek after FlagshipRouter leaves FlagshipRouter untouched, and edits stay scoped (775.3353ms)
+✔ the active provider switches explicitly and is restored on reload (634.294ms)
+✔ deleting one provider keeps the other and promotes a fallback (573.701ms)
+✔ provider settings are owner-scoped and never leak keys (985.1919ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:55.235Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/models","model":null,"httpStatus":500,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Listing rejected with 500","providerDetail":null,"remedyHint":null,"category":"upstream_unavailable","classification":"transient","retryable":true,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+✔ a failed model-discovery request never erases saved models or defaults (1088.8884ms)
+✔ base URLs are normalized without duplicating endpoint paths (527.7975ms)
+✔ local endpoints get an actionable reachability error in production instead of 'invalid key' (535.6654ms)
+✔ chat uses exactly the active provider and switching cannot cross keys (584.6761ms)
+✔ personal OmniRoute uses only the user's key, never the server gateway key (560.8393ms)
+✔ legacy single-provider clients migrate without losing their configuration (463.0915ms)
+✔ with no saved keys the catalogue contains only free/shared models (1035.4244ms)
+✔ two configurations for the same provider coexist with distinct stable configIds (734.7477ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:52.973Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/models","model":null,"httpStatus":401,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Invalid API key provided.","providerDetail":null,"remedyHint":null,"category":"invalid_credentials","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+✔ saved rows from every configuration appear in the catalogue, duplicates included (622.4573ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:53.597Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"fake-model-mini","httpStatus":401,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Invalid API key provided.","providerDetail":null,"remedyHint":null,"category":"invalid_credentials","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+Chat provider failure: personal invalid_api_key HTTP 401
+✔ chat with a configId uses exactly that configuration's credentials (658.27ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:54.300Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/chat/completions","model":"fake-model-mini","httpStatus":401,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Invalid API key provided.","providerDetail":null,"remedyHint":null,"category":"invalid_credentials","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+Chat provider failure: personal invalid_api_key HTTP 401
+✔ provider identity cannot cross saved configurations (644.2707ms)
+✔ a deleted configuration reference fails clearly instead of switching keys (534.3246ms)
+✔ deleting one configuration preserves the other and its models (560.9358ms)
+✔ saving and editing a configuration never changes another configuration (592.2234ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:56.495Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/models","model":null,"httpStatus":500,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Listing rejected with 500","providerDetail":null,"remedyHint":null,"category":"upstream_unavailable","classification":"transient","retryable":true,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:56.543Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/v1/models","model":null,"httpStatus":500,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Listing rejected with 500","providerDetail":null,"remedyHint":null,"category":"upstream_unavailable","classification":"transient","retryable":true,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+✔ a failed discovery keeps saved rows and the free list visible (554.0593ms)
+✔ free shared models remain selectable when saved configurations exist (484.9497ms)
+✔ legacy rows without a configId migrate without losing settings (512.3108ms)
+Chat provider failure: personal free_tier_client_only HTTP 403
+Chat provider failure: personal unsupported_protocol HTTP 400
+✔ OpenCode Zen restricted models fail with actionable statuses before any upstream request (506.4012ms)
+✔ Qoder is never routed through the OpenAI chat or responses endpoints (37.1929ms)
+✔ Qoder model listing reads the enabled models from GET /models (108.5044ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:46.236Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/api/v1/cloud/models","model":null,"httpStatus":401,"providerCode":null,"providerType":"error","providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Invalid access token.","providerDetail":null,"remedyHint":null,"category":"invalid_credentials","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+✔ Check connection performs a real authenticated request, not a simulation (46.3746ms)
+✔ a turn opens the stream before sending the message and streams one reply (143.5142ms)
+✔ the buffered agent.message completes text missed by a late stream (75.9484ms)
+✔ a turn without deltas still yields the buffered reply exactly once (51.3658ms)
+✔ heartbeat comments keep the stream alive without producing text (47.3192ms)
+✔ environments and agents are provisioned once per credential and model (150.2071ms)
+✔ an unknown model is rejected by Qoder before a session is created (17.4422ms)
+✔ a model saved under its display name is resolved to the id Qoder lists (69.729ms)
+✔ an unlisted model name fails with the ids this account actually has (13.8494ms)
+✔ a disabled model cannot be selected even by its exact id (7.3845ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:46.839Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/api/v1/cloud/models","model":"ultimate","httpStatus":503,"providerCode":null,"providerType":"error","providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Injected models 503.","providerDetail":null,"remedyHint":null,"category":"upstream_unavailable","classification":"transient","retryable":true,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+✔ when the model list is unreachable the saved id is sent through unchanged (114.2139ms)
+✔ history is flattened into labelled text blocks with Qoder image sources (2.0398ms)
+✔ a PAT is sent straight to the business API and never exchanged (96.5647ms)
+✔ a service account key is exchanged for a SAT used by the business API (107.4735ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:49.393Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/api/v1/serviceToken/exchange","model":null,"httpStatus":200,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":null,"providerDetail":null,"remedyHint":null,"category":"invalid_response","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+✔ a token exchange without access_token is an authentication failure, not success (130.5974ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:49.419Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/api/v1/cloud/models","model":null,"httpStatus":401,"providerCode":null,"providerType":"error","providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Invalid access token.","providerDetail":null,"remedyHint":null,"category":"invalid_credentials","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:49.433Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/api/v1/serviceToken/exchange","model":null,"httpStatus":401,"providerCode":null,"providerType":"error","providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Invalid service account key.","providerDetail":null,"remedyHint":null,"category":"invalid_credentials","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+✔ HTTP 401 is reported as an invalid credential without leaking it (36.3742ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:49.448Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/api/v1/cloud/models","model":null,"httpStatus":403,"providerCode":null,"providerType":"error","providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Injected models 403.","providerDetail":null,"remedyHint":null,"category":"forbidden","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:49.481Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/api/v1/serviceToken/exchange","model":null,"httpStatus":403,"providerCode":null,"providerType":"error","providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Scope qca.access is not allowed for this key.","providerDetail":null,"remedyHint":null,"category":"forbidden","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+✔ HTTP 403 is reported as insufficient scope (52.6034ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:49.519Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/wrong/api/v1/cloud/models","model":null,"httpStatus":404,"providerCode":null,"providerType":"error","providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Unknown path.","providerDetail":null,"remedyHint":null,"category":"invalid_model","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:49.528Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/wrong/api/v1/cloud/agents","model":null,"httpStatus":404,"providerCode":null,"providerType":"error","providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Unknown path.","providerDetail":null,"remedyHint":null,"category":"invalid_model","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:49.535Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/api/v1/cloud/models","model":null,"httpStatus":null,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":null,"providerDetail":null,"remedyHint":null,"category":"network_error","classification":"transient","retryable":true,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+✔ a wrong path returns HTTP 404 instead of a false 'reachable' result (42.3081ms)
+✔ documented regional hosts resolve to matching exchange and business URLs (1.8138ms)
+✔ base URL normalization removes duplicate /api/v1 and stray slashes (0.8683ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:49.589Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/api/v1/cloud/models","model":null,"httpStatus":null,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":null,"providerDetail":null,"remedyHint":null,"category":"timeout","classification":"transient","retryable":true,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+✔ network failures and timeouts are distinguishable (104.119ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:49.667Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/api/v1/cloud/models","model":null,"httpStatus":429,"providerCode":null,"providerType":"error","providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Injected models 429.","providerDetail":null,"remedyHint":null,"category":"ambiguous_rate_limit","classification":"ambiguous","retryable":true,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:49.674Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/api/v1/cloud/models","model":null,"httpStatus":503,"providerCode":null,"providerType":"error","providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Injected models 503.","providerDetail":null,"remedyHint":null,"category":"upstream_unavailable","classification":"transient","retryable":true,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+✔ HTTP 429 and 5xx map to rate limiting and upstream unavailability (26.4689ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:49.699Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/api/v1/cloud/models","model":null,"httpStatus":401,"providerCode":null,"providerType":"error","providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Access token expired.","providerDetail":null,"remedyHint":null,"category":"invalid_credentials","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+✔ an expired SAT is discarded and exchanged again once (44.1297ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:49.732Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/api/v1/cloud/models","model":null,"httpStatus":200,"providerCode":null,"providerType":null,"providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":null,"providerDetail":null,"remedyHint":null,"category":"invalid_response","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:49.737Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/api/v1/cloud/models","model":null,"httpStatus":404,"providerCode":null,"providerType":"error","providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Injected models 404.","providerDetail":null,"remedyHint":null,"category":"invalid_model","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+✔ a malformed model list is invalid_response, never 'connected' (32.5008ms)
+✔ connection testing never creates environments, agents, or sessions (46.4088ms)
+✔ credentials never appear in diagnostics or error messages (29.5248ms)
+✔ saved settings default to PAT and behavior changes invalidate old results (1.0542ms)
+✔ a saved Qoder service account configuration round-trips through the settings API (864.2436ms)
+✔ testing a saved service account exchanges the key and never sends it to the business API (530.6118ms)
+✔ changing the Qoder auth mode clears a saved connection result (544.3829ms)
+✔ mismatched regions are rejected on save and the previous configuration survives (500.2731ms)
+✔ a service account save without an OpenAPI URL is rejected with a clear message (503.5241ms)
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:56.083Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/api/v1/cloud/models","model":null,"httpStatus":401,"providerCode":null,"providerType":"error","providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Invalid access token.","providerDetail":null,"remedyHint":null,"category":"invalid_credentials","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+{"event":"provider_upstream_failure","timestamp":"2026-10-30T02:27:56.155Z","requestId":null,"attempt":null,"providerHost":"127.0.0.1","endpoint":"/api/v1/cloud/models","model":null,"httpStatus":401,"providerCode":null,"providerType":"error","providerStatus":null,"providerName":null,"providerErrorCode":null,"limitSource":null,"providerReasons":[],"providerMessage":"Access token expired.","providerDetail":null,"remedyHint":null,"category":"invalid_credentials","classification":"permanent","retryable":false,"retryAfter":null,"retryAfterRaw":null,"responseHeaders":{}}
+✔ an expired service account token is refreshed on the next test (613.9777ms)
+✔ production session cookie is HTTP-only, Secure, SameSite=Lax and persistent (1.852ms)
+✔ development session cookie stays Lax without Secure (0.4978ms)
+✔ the JWT lifetime exactly matches the session cookie lifetime (5.6562ms)
+✔ production login sets only the first-party cookie, and logout clears both variants (1.3778ms)
+✔ concurrency slots are bounded per user and released independently (2.8136ms)
+✔ quota and concurrency configuration falls back to safe defaults (0.5994ms)
+✔ dedicated VUPS configuration takes precedence over OpenRouter (5.4913ms)
+✔ missing VUPS configuration falls back to the shared OpenRouter setup (1.4631ms)
+✔ shared OpenRouter fallback keeps text on the default model and routes images to the free vision model (1.2986ms)
+✔ VUPS_VISION_MODEL overrides the fallback image model and VUPS_VISION=false disables images (1.7523ms)
+✔ dedicated VUPS configuration uses VUPS_VISION_MODEL for image requests (1.5128ms)
+✔ dedicated VUPS image requests require an explicit vision setting (2.2388ms)
+✔ partial VUPS configuration fails instead of mixing it with OpenRouter (1.1653ms)
+✔ vision configuration reports the active model without exposing credentials (2.7552ms)
+✔ a VUPS_VISION_MODEL change takes effect without reloading the module (1.8373ms)
+✔ an invalid dedicated VUPS endpoint never falls back to OpenRouter (1.3359ms)
+✔ output and timeout settings are bounded and read without a reload (1.8307ms)
+✔ text model configuration reports the effective source without credentials (1.2446ms)
+✔ Vups v3 Galax rate limit is separate per authenticated user and preserves per-IP limits (104.7329ms)
+ℹ tests 436
+ℹ suites 0
+ℹ pass 436
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 55851.3152
