@@ -454,6 +454,11 @@ test("the desktop prompt bans invented Windows permission advice", async () => {
   assert.match(DESKTOP_TOOL_PROMPT, /Never tell the user to change NTFS permissions/);
   assert.match(DESKTOP_TOOL_PROMPT, /app-level consent and does not change Windows access control/);
   assert.match(DESKTOP_TOOL_PROMPT, /"access_denied" is the only code that means Windows itself refused/);
+  assert.match(
+    DESKTOP_TOOL_PROMPT,
+    /code "access_denied" may be described as a Windows access problem/,
+    "only a real access_denied result may be called a Windows access problem"
+  );
   assert.match(DESKTOP_TOOL_PROMPT, /call list_recent_files once/);
   assert.match(DESKTOP_TOOL_PROMPT, /say what it returned instead of calling the same tool again/);
 
