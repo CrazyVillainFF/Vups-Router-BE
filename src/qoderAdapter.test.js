@@ -10,7 +10,7 @@ import {
   testProviderConnection,
   usesResponsesApi
 } from "./providerClient.js";
-import { FAKE_QODER_API_KEY, FAKE_QODER_MODEL, startFakeQoder } from "./testUtils/fakeQoder.js";
+import { FAKE_QODER_API_KEY, FAKE_QODER_MODEL, FAKE_QODER_REPLY, startFakeQoder } from "./testUtils/fakeQoder.js";
 
 const MODEL = FAKE_QODER_MODEL;
 
@@ -199,6 +199,78 @@ test("an unknown model is rejected by Qoder before a session is created", async 
       return true;
     }
   );
+});
+
+test("a model saved under its display name is resolved to the id Qoder lists", async () => {
+  fake.state.agents.length = 0;
+  const result = await chatCompletion({
+    baseUrl,
+    apiKey: `${FAKE_QODER_API_KEY}-display-name`,
+    providerType: "qoder_cloud_agents",
+    model: "Ultimate",
+    messages: [{ role: "user", content: "Hello" }]
+  });
+  assert.equal(result.content, FAKE_QODER_REPLY);
+  const agent = requests.find(entry => entry.path === "/api/v1/cloud/agents" && entry.method === "POST");
+  assert.ok(agent, "an agent is created for the resolved model");
+  assert.equal(agent.body.model, "ultimate", "the account's real id is sent, not the display name");
+});
+
+test("an unlisted model name fails with the ids this account actually has", async () => {
+  await assert.rejects(
+    () =>
+      chatCompletion({
+        baseUrl,
+        apiKey: `${FAKE_QODER_API_KEY}-unlisted`,
+        providerType: "qoder_cloud_agents",
+        model: "deepseek-flash",
+        messages: [{ role: "user", content: "Hello" }]
+      }),
+    error => {
+      assert.ok(error instanceof ProviderError);
+      assert.equal(error.status, 400);
+      assert.equal(error.code, "invalid_model");
+      assert.match(error.message, /does not list a model called "deepseek-flash"/);
+      assert.match(error.message, /ultimate, giga/);
+      assert.equal(error.message.includes("deepseek-flash"), true);
+      assert.equal(requests.some(entry => entry.path === "/api/v1/cloud/agents" && entry.method === "POST"), false, "no agent is created for a model Qoder does not have");
+      return true;
+    }
+  );
+});
+
+test("a disabled model cannot be selected even by its exact id", async () => {
+  await assert.rejects(
+    () =>
+      chatCompletion({
+        baseUrl,
+        apiKey: `${FAKE_QODER_API_KEY}-disabled`,
+        providerType: "qoder_cloud_agents",
+        model: "retired",
+        messages: [{ role: "user", content: "Hello" }]
+      }),
+    error => {
+      assert.equal(error.code, "invalid_model");
+      assert.match(error.message, /retired/);
+      return true;
+    }
+  );
+});
+
+test("when the model list is unreachable the saved id is sent through unchanged", async () => {
+  fake.state.agents.length = 0;
+  fake.state.modelsStatus = 503;
+  const result = await chatCompletion({
+    baseUrl,
+    apiKey: `${FAKE_QODER_API_KEY}-list-down`,
+    providerType: "qoder_cloud_agents",
+    model: MODEL,
+    messages: [{ role: "user", content: "Hello" }]
+  });
+  assert.equal(result.content, FAKE_QODER_REPLY);
+  assert.ok(requests.some(entry => entry.path === "/api/v1/cloud/models" && entry.method === "GET"), "the list is attempted first");
+  const agent = requests.find(entry => entry.path === "/api/v1/cloud/agents" && entry.method === "POST");
+  assert.equal(agent.body.model, MODEL, "the outage never blocks a valid id");
 });
 
 test("history is flattened into labelled text blocks with Qoder image sources", () => {
