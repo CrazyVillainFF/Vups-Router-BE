@@ -8,9 +8,9 @@ import { Buffer } from "node:buffer";
 // URLs are passed to the upstream provider, never fetched by this server.
 //
 // Limits are configurable (see .env.example):
-//   CHAT_IMAGE_MAX_COUNT        default 4    (images per message)
+//   CHAT_IMAGE_MAX_COUNT        default 10   (images per message)
 //   CHAT_IMAGE_MAX_BYTES        default 4 MB (per image, decoded)
-//   CHAT_IMAGE_MAX_TOTAL_BYTES  default 8 MB (per message, decoded)
+//   CHAT_IMAGE_MAX_TOTAL_BYTES  default 24 MB (per message, decoded)
 //
 // The declared MIME type is never trusted: the first bytes of every decoded
 // buffer must match a known image signature. Image bytes are never logged.
@@ -20,16 +20,16 @@ const envInt = (name, fallback) => {
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
 };
 
-export const MAX_IMAGES_PER_MESSAGE = envInt("CHAT_IMAGE_MAX_COUNT", 4);
+export const MAX_IMAGES_PER_MESSAGE = envInt("CHAT_IMAGE_MAX_COUNT", 10);
 export const MAX_IMAGE_BYTES = envInt("CHAT_IMAGE_MAX_BYTES", 4 * 1024 * 1024);
-export const MAX_TOTAL_IMAGE_BYTES = envInt("CHAT_IMAGE_MAX_TOTAL_BYTES", 8 * 1024 * 1024);
+export const MAX_TOTAL_IMAGE_BYTES = envInt("CHAT_IMAGE_MAX_TOTAL_BYTES", 24 * 1024 * 1024);
 
 export const ALLOWED_IMAGE_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 const ALLOWED = new Set(ALLOWED_IMAGE_TYPES);
 const BASE64_PATTERN = /^[A-Za-z0-9+/]+={0,2}$/;
 const MAX_NAME_LENGTH = 120;
 const MAX_URL_LENGTH = 2048;
-const TEXT_OVERHEAD_BYTES = 2 * 1024 * 1024;
+const TEXT_OVERHEAD_BYTES = 8 * 1024 * 1024;
 const URL_IMAGE_MIME = "image/*";
 
 // JSON body limit that fits the largest allowed valid request (base64 inflates

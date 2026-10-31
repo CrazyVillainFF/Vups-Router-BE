@@ -31,7 +31,7 @@ delete process.env.VUPS_VISION_MODEL;
 
 const { default: app } = await import("./index.js");
 const { default: mongoose } = await import("mongoose");
-const { validateImages, MAX_IMAGES_PER_MESSAGE, MAX_IMAGE_BYTES } = await import("./chatImages.js");
+const { validateImages, MAX_IMAGES_PER_MESSAGE, MAX_IMAGE_BYTES, MAX_TOTAL_IMAGE_BYTES } = await import("./chatImages.js");
 
 const server = app.listen(0, "127.0.0.1");
 await new Promise(resolve => server.once("listening", resolve));
@@ -215,8 +215,15 @@ test("validateImages enforces count, per-image size, and total size limits", () 
   assert.match(oversize.error, /4 MB|MB or smaller/);
 
   const heavy = () => pngImage({ data: paddedPng(3 * 1024 * 1024) });
-  const tooHeavy = validateImages([heavy(), heavy(), heavy()]);
-  assert.match(tooHeavy.error, /total .*8 MB|per message/);
+  const heavyCount = Math.min(
+    MAX_IMAGES_PER_MESSAGE,
+    Math.floor(MAX_TOTAL_IMAGE_BYTES / (3 * 1024 * 1024)) + 1
+  );
+  const tooHeavy = validateImages(Array.from({ length: heavyCount }, heavy));
+  assert.match(
+    tooHeavy.error,
+    new RegExp(`total .*${Math.round(MAX_TOTAL_IMAGE_BYTES / 1024 / 1024)} MB|per message`)
+  );
 });
 
 // ─── Integration: personal provider ─────────────────────────────────────────

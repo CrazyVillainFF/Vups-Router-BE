@@ -77,7 +77,8 @@ const CHAT_MODES = new Map([
 ]);
 
 const MAX_MESSAGES = 60;
-const MAX_TOTAL_CHARS = 120000;
+const MAX_USER_MESSAGE_CHARS = 2_000_000;
+const MAX_TOTAL_CHARS = 4_000_000;
 const MAX_STORED_MESSAGES = 200;
 const MAX_ASSISTANT_MESSAGE_CHARS = 100000;
 const MAX_STORED_CHARS = 4_000_000;
@@ -97,7 +98,7 @@ function validateMessages(value, { allowAssistantLast = false } = {}) {
       ? entry.messageId.trim()
       : undefined;
     if (role !== "user" && role !== "assistant") return "Every message needs a role of user or assistant.";
-    if (role === "user" && content.length > 32000) return "A single message cannot exceed 32000 characters.";
+    if (role === "user" && content.length > MAX_USER_MESSAGE_CHARS) return `A single message cannot exceed ${MAX_USER_MESSAGE_CHARS.toLocaleString("en-US")} characters.`;
     if (role === "assistant" && content.length > MAX_ASSISTANT_MESSAGE_CHARS) return "A single assistant message is too large to replay. Start a new chat or continue from the saved code artifact.";
     const images = validateImages(entry?.images);
     if (images.error) return images.error;
@@ -169,7 +170,7 @@ function validateDesktopMessages(value) {
       });
       total += content.length;
     } else {
-      if (content.length > 32000) return "A single message cannot exceed 32000 characters.";
+      if (content.length > MAX_USER_MESSAGE_CHARS) return `A single message cannot exceed ${MAX_USER_MESSAGE_CHARS.toLocaleString("en-US")} characters.`;
       if (Array.isArray(entry?.images) && entry.images.length > 0) {
         return "Local filesystem tools are text-only. Remove image attachments or use a normal chat.";
       }
@@ -194,8 +195,8 @@ function cleanupDesktopRuns() {
 }
 
 // Limits enforced before any provider call are still context-limit failures.
-// The 32,000-character single-message cap stays an oversize error because it is
-// not evidence that the conversation window is exhausted.
+// The single-message and replay caps stay oversize errors because they are not
+// evidence that the conversation window is exhausted.
 const PRE_PROVIDER_CONTEXT_LIMIT =
   /at most \d+ messages|conversation is too large|too large to replay|too long for this (?:model|provider)/i;
 

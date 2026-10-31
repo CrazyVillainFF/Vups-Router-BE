@@ -208,13 +208,15 @@ test("an oversized conversation is rejected before the provider call as a contex
   fakeProvider.state.reset();
   const cookie = await signupUser();
   await configureProvider(cookie);
-  const large = "x".repeat(31000);
+  // Three 1.4M-character user turns exceed the 4M total while each stays under
+  // the 2M single-message cap, so the total-conversation guard is what rejects it.
+  const large = "x".repeat(1_400_000);
   const messages = [
     { role: "user", content: large },
-    { role: "assistant", content: large },
+    { role: "assistant", content: "ok" },
     { role: "user", content: large },
-    { role: "assistant", content: large },
-    { role: "user", content: "continue" }
+    { role: "assistant", content: "ok" },
+    { role: "user", content: large }
   ];
 
   const response = await api("/api/chat", {

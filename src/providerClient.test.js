@@ -365,6 +365,111 @@ test("AgentRouter GPT requests are POSTed to /v1/responses for both modes", asyn
   }
 });
 
+test("Kilo Gateway composes exactly one /v1/chat/completions path", () => {
+  const base = "https://ai-gateway.kilo.ai/api/v1";
+  const model = "anthropic/claude-sonnet-4.5";
+  assert.equal(normalizeBaseUrl(`${base}/`), base);
+  assert.equal(normalizeBaseUrl(`${base}/chat/completions`), base);
+  assert.equal(resolveChatEndpoint(base, model), `${base}/chat/completions`);
+  assert.equal(resolveChatEndpoint(`${base}/`, model), `${base}/chat/completions`);
+  assert.equal(resolveChatEndpoint(`${base}/chat/completions`, model), `${base}/chat/completions`);
+});
+
+test("Kilo Gateway sends the documented endpoint, bearer key, model, and stream flag", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    calls.push({ url: String(url), method: options.method, headers: options.headers, body });
+    if (body.stream) {
+      const sse = [
+        'data: {"id":"kilo-1","choices":[{"delta":{"content":"Hi from Kilo"}}]}',
+        'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":4}}',
+        "data: [DONE]",
+        ""
+      ].join("\n\n");
+      return new Response(sse, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    }
+    return new Response(JSON.stringify({
+      id: "kilo-1",
+      choices: [{ message: { role: "assistant", content: "Hi from Kilo" }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 5, completion_tokens: 4 }
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+  };
+  try {
+    const baseUrl = "https://ai-gateway.kilo.ai/api/v1";
+    const model = "anthropic/claude-sonnet-4.5";
+    const messages = [{ role: "user", content: "Say hi from Kilo Gateway" }];
+    const completion = await chatCompletion({
+      baseUrl,
+      apiKey: "sk-kilo-test-key",
+      model,
+      messages,
+      temperature: 0.2,
+      maxTokens: 64
+    });
+    const upstream = await startChatCompletionStream({
+      baseUrl: `${baseUrl}/`,
+      apiKey: "sk-kilo-test-key",
+      model,
+      messages
+    });
+    const streamed = await upstream.text();
+
+    assert.equal(completion.content, "Hi from Kilo");
+    assert.match(streamed, /Hi from Kilo/);
+    assert.deepEqual(
+      calls.map(call => call.url),
+      [
+        "https://ai-gateway.kilo.ai/api/v1/chat/completions",
+        "https://ai-gateway.kilo.ai/api/v1/chat/completions"
+      ],
+      "never /v1/v1 or /chat/completions/chat/completions"
+    );
+    assert.ok(calls.every(call => call.method === "POST"));
+    assert.equal(calls[0].headers.Authorization, "Bearer sk-kilo-test-key");
+    assert.equal(calls[0].headers["Content-Type"], "application/json");
+    assert.equal(calls[0].body.model, model);
+    assert.equal(calls[0].body.stream, false);
+    assert.equal(calls[0].body.temperature, 0.2);
+    assert.equal(calls[0].body.max_tokens, 64);
+    assert.equal(calls[1].body.model, model);
+    assert.equal(calls[1].body.stream, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("Kilo Gateway authentication failures surface and never fall back to another provider", async () => {
+  const originalFetch = globalThis.fetch;
+  const urls = [];
+  globalThis.fetch = async url => {
+    urls.push(String(url));
+    return new Response(JSON.stringify({ error: { message: "Invalid API key", type: "authentication_error" } }), {
+      status: 401,
+      headers: { "Content-Type": "application/json" }
+    });
+  };
+  try {
+    await assert.rejects(
+      () => chatCompletion({
+        baseUrl: "https://ai-gateway.kilo.ai/api/v1",
+        apiKey: "sk-kilo-invalid",
+        model: "anthropic/claude-sonnet-4.5",
+        messages: [{ role: "user", content: "Hello" }]
+      }),
+      error => error instanceof ProviderError && error.status === 401
+    );
+    assert.deepEqual(
+      urls,
+      ["https://ai-gateway.kilo.ai/api/v1/chat/completions"],
+      "one attempt against Kilo only"
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("OpenCode Zen resolves each documented model family to its endpoint", () => {
   const baseUrl = "https://opencode.ai/inference/openai/v1";
   assert.equal(resolveChatEndpoint(baseUrl, "deepseek-v4.1-flash"), "https://opencode.ai/inference/openai/v1/chat/completions");
