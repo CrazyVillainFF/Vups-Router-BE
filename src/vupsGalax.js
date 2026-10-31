@@ -6,8 +6,13 @@ export const VUPS_MODEL_NAME = "Vups v3 Galax";
 export const DEFAULT_VUPS_VISION_MODEL = "nvidia/nemotron-3.5-super-vl:free";
 export const DEFAULT_VUPS_MAX_OUTPUT_TOKENS = 24576;
 export const VUPS_MAX_OUTPUT_TOKENS_LIMIT = 32768;
-export const DEFAULT_VUPS_REQUEST_TIMEOUT_MS = 300000;
-export const DEFAULT_VUPS_STREAM_START_TIMEOUT_MS = 60000;
+// No total execution deadline by default: a free model may be queued, loading,
+// or reasoning for a long time and must not be killed for it. Providers and
+// infrastructure still enforce their own limits, and a caller-disconnect signal
+// still cancels the turn. Set the env vars to a positive number of milliseconds
+// to opt into a bounded deadline.
+export const DEFAULT_VUPS_REQUEST_TIMEOUT_MS = 0;
+export const DEFAULT_VUPS_STREAM_START_TIMEOUT_MS = 0;
 export const DEFAULT_VUPS_STREAM_IDLE_TIMEOUT_MS = 240000;
 export const DEFAULT_VUPS_SSE_HEARTBEAT_MS = 15000;
 
@@ -61,6 +66,15 @@ function boundedEnvNumber(name, fallback, { min, max }) {
   return Math.min(Math.max(Math.floor(value), min), max);
 }
 
+function optionalTimeoutEnv(name, fallback, { min, max }) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return fallback;
+  if (value <= 0) return 0;
+  return Math.min(Math.max(Math.floor(value), min), max);
+}
+
 export function vupsMaxOutputTokens() {
   return boundedEnvNumber("VUPS_MAX_OUTPUT_TOKENS", DEFAULT_VUPS_MAX_OUTPUT_TOKENS, {
     min: 256,
@@ -71,11 +85,11 @@ export function vupsMaxOutputTokens() {
 export function vupsExecutionConfiguration() {
   return {
     maxOutputTokens: vupsMaxOutputTokens(),
-    requestTimeoutMs: boundedEnvNumber("VUPS_REQUEST_TIMEOUT_MS", DEFAULT_VUPS_REQUEST_TIMEOUT_MS, {
+    requestTimeoutMs: optionalTimeoutEnv("VUPS_REQUEST_TIMEOUT_MS", DEFAULT_VUPS_REQUEST_TIMEOUT_MS, {
       min: 5000,
       max: 600000
     }),
-    streamStartTimeoutMs: boundedEnvNumber("VUPS_STREAM_START_TIMEOUT_MS", DEFAULT_VUPS_STREAM_START_TIMEOUT_MS, {
+    streamStartTimeoutMs: optionalTimeoutEnv("VUPS_STREAM_START_TIMEOUT_MS", DEFAULT_VUPS_STREAM_START_TIMEOUT_MS, {
       min: 5000,
       max: 180000
     }),

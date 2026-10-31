@@ -233,7 +233,9 @@ Environment variables (set in the Render dashboard):
 | `OPENROUTER_CATALOG_STALE_MS` | maximum age of a cached catalog served during transient failures; default `86400000` (24 hours). |
 | `OPENROUTER_MAX_OUTPUT_TOKENS` | `4096` (default) — maximum output tokens per shared reply. Clamped server-side to 8192. |
 | `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` (default; override only for testing). |
-| `PROVIDER_TIMEOUT_MS` / `PROVIDER_STREAM_TIMEOUT_MS` | `60000` / `300000` (defaults) — upstream timeouts, both personal and shared providers. |
+| `PROVIDER_TIMEOUT_MS` / `PROVIDER_STREAM_TIMEOUT_MS` | `60000` / `300000` (defaults) — fallback deadlines for provider calls that carry no caller signal. Chat routes pass a cancellation signal, so a slow or queued model is not cut off by these values. |
+| `CHAT_SSE_HEARTBEAT_MS` | `15000` — keepalive comment interval on a chat stream, so a thinking or queued model is not mistaken for a dead connection. |
+| `CHAT_TOTAL_TIMEOUT_MS` | unset (no total deadline) — optional total deadline for non-streaming chat replies. Streaming replies are bounded by the idle-stream watchdog and Stop, never by a default wall-clock cutoff. |
 
 Behavior and safety:
 
@@ -287,9 +289,9 @@ Environment variables (set in the Render dashboard, or omit the three upstream v
 | `VUPS_RETRY_MAX_MS` | optional maximum single backoff delay; default `8000`. |
 | `VUPS_RETRY_MAX_RETRY_AFTER_MS` | optional maximum accepted upstream `Retry-After`; longer values fail immediately; default `15000`. |
 | `VUPS_MAX_OUTPUT_TOKENS` | optional output budget sent to the upstream model; default `24576`, clamped to `256..32768`. |
-| `VUPS_REQUEST_TIMEOUT_MS` | optional per-attempt timeout for non-streaming Vups requests; default `300000`, clamped to `5000..600000`. |
-| `VUPS_STREAM_START_TIMEOUT_MS` | optional timeout for upstream response headers; default `60000`, clamped to `5000..180000`. |
-| `VUPS_STREAM_IDLE_TIMEOUT_MS` | optional maximum silence between upstream chunks; default `240000`, clamped to `15000..600000`. |
+| `VUPS_REQUEST_TIMEOUT_MS` | optional total deadline for non-streaming Vups requests; unset or `0` means no total deadline, positive values are clamped to `5000..600000`. |
+| `VUPS_STREAM_START_TIMEOUT_MS` | optional deadline for upstream response headers; unset or `0` means a queued model is waited for without a fixed start window, positive values are clamped to `5000..180000`. |
+| `VUPS_STREAM_IDLE_TIMEOUT_MS` | optional maximum silence between upstream chunks (idle guard, not a total deadline); default `240000`, clamped to `15000..600000`. |
 | `VUPS_SSE_HEARTBEAT_MS` | optional interval for SSE keepalive comments while waiting; default `15000`, clamped to `1000..60000`. |
 
 ### Production diagnosis checklist

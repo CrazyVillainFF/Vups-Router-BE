@@ -209,7 +209,7 @@ export function assertImageGenerationConfigured() {
   }
 }
 
-export async function generateImage(prompt) {
+export async function generateImage(prompt, signal = null) {
   assertImageGenerationConfigured();
   const accountId = envText("CLOUDFLARE_ACCOUNT_ID");
   const apiToken = envText("CLOUDFLARE_API_TOKEN");
@@ -225,6 +225,15 @@ export async function generateImage(prompt) {
     );
   }
 
+  const cancelled = () => new ImageGenerationError(
+    "Image generation was cancelled.",
+    499,
+    "cancelled"
+  );
+  if (signal?.aborted) throw cancelled();
+  const timeout = AbortSignal.timeout(timeoutMs());
+  const requestSignal = signal ? AbortSignal.any([timeout, signal]) : timeout;
+
   let response;
   try {
     response = await fetch(url, {
@@ -235,9 +244,10 @@ export async function generateImage(prompt) {
         Accept: "application/json, image/*"
       },
       body: JSON.stringify({ prompt }),
-      signal: AbortSignal.timeout(timeoutMs())
+      signal: requestSignal
     });
   } catch (error) {
+    if (signal?.aborted) throw cancelled();
     if (error?.name === "TimeoutError" || error?.name === "AbortError") {
       throw new ImageGenerationError("Image generation timed out. Try again.", 504, "image_generation_timeout");
     }
@@ -258,6 +268,7 @@ export async function generateImage(prompt) {
     return await parseSuccessfulResponse(response);
   } catch (error) {
     if (error instanceof ImageGenerationError) throw error;
+    if (signal?.aborted) throw cancelled();
     if (error?.name === "TimeoutError" || error?.name === "AbortError") {
       throw new ImageGenerationError("Image generation timed out. Try again.", 504, "image_generation_timeout");
     }

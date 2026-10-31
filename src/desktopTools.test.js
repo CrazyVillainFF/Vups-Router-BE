@@ -107,7 +107,7 @@ function lastProviderBody() {
   return fakeProvider.state.chatRequests.at(-1)?.body;
 }
 
-test("the desktop route offers only the native filesystem tools and returns the model's calls", async () => {
+test("the desktop route offers every native local tool and returns the model's calls", async () => {
   const cookie = await newUser();
   fakeProvider.state.set({
     toolCalls: [{ name: "get_windows_known_folder", args: { name: "downloads" } }]
@@ -127,17 +127,35 @@ test("the desktop route offers only the native filesystem tools and returns the 
 
   const body = lastProviderBody();
   assert.equal(body.tool_choice, "auto");
-  assert.deepEqual(
-    body.tools.map(tool => tool.function.name),
-    [
-      "get_windows_known_folder",
-      "list_directory",
-      "list_recent_files",
-      "read_file",
-      "search_files",
-      "read_file_metadata"
-    ]
-  );
+  const { DESKTOP_TOOL_NAMES } = await import("./desktopTools.js");
+  const offered = body.tools.map(tool => tool.function.name);
+  assert.deepEqual(offered, [...DESKTOP_TOOL_NAMES]);
+  assert.equal(offered.length, 27);
+  for (const name of [
+    "search_file_contents",
+    "create_directory",
+    "write_file",
+    "append_file",
+    "edit_file",
+    "rename_path",
+    "move_path",
+    "copy_path",
+    "delete_path",
+    "open_path",
+    "open_url",
+    "list_installed_apps",
+    "find_app",
+    "launch_app",
+    "open_with_app",
+    "list_processes",
+    "close_app",
+    "run_command",
+    "start_command",
+    "command_output",
+    "stop_command"
+  ]) {
+    assert.ok(offered.includes(name), `${name} must be offered to the model`);
+  }
   assert.match(body.messages[0].content, /Local Windows tools are available/);
   assert.match(
     body.messages[0].content,
@@ -306,7 +324,7 @@ test("the filesystem tool loop stops after the bounded number of rounds", async 
   });
 
   let lastStatus = null;
-  for (let step = 0; step < 7; step += 1) {
+  for (let step = 0; step < 13; step += 1) {
     const messages = [{ role: "user", content: "Find every report on this machine." }];
     for (let prior = 0; prior < step; prior += 1) {
       const callId = `call_${prior}`;
@@ -451,6 +469,7 @@ test("an exhausted retry budget says the model is unavailable and reports how ha
 test("the desktop prompt bans invented Windows permission advice", async () => {
   const { DESKTOP_TOOL_PROMPT, DESKTOP_TOOLS } = await import("./desktopTools.js");
 
+  assert.match(DESKTOP_TOOL_PROMPT, /complete each dependent step without pausing to ask whether to continue/);
   assert.match(DESKTOP_TOOL_PROMPT, /Never tell the user to change NTFS permissions/);
   assert.match(DESKTOP_TOOL_PROMPT, /app-level consent and does not change Windows access control/);
   assert.match(DESKTOP_TOOL_PROMPT, /"access_denied" is the only code that means Windows itself refused/);
@@ -466,3 +485,338 @@ test("the desktop prompt bans invented Windows permission advice", async () => {
   assert.ok(recent, "the deterministic newest-files tool is offered to the model");
   assert.match(recent.function.description, /sorted by last-modified time/);
 });
+
+test("a permission question is recognized only after real tool work", async () => {
+  const { asksPermissionToContinue } = await import("./desktopTools.js");
+
+  assert.equal(
+    asksPermissionToContinue({
+      text: "I created index.html and style.css. Would you like me to continue with script.js?",
+      hasToolResults: true
+    }),
+    true
+  );
+  assert.equal(
+    asksPermissionToContinue({
+      text: "Would you like me to continue with script.js?",
+      hasToolResults: false
+    }),
+    false,
+    "without completed tool work this is an ordinary reply"
+  );
+  assert.equal(
+    asksPermissionToContinue({
+      text: "I found two Qoder folders. Which one should I use: C:\\Users\\test\\Qoder or D:\\Qoder?",
+      hasToolResults: true
+    }),
+    false,
+    "a genuine clarification must stay a question"
+  );
+});
+
+test("a model that stops to ask before the last requested file gets one continuation round", async () => {
+  const cookie = await newUser();
+  fakeProvider.state.set({
+    chatResponseText: "I created index.html and style.css. Would you like me to continue with script.js?",
+    nudgeToolCalls: [
+      { name: "write_file", args: { path: "C:\\Users\\test\\site\\script.js", content: "console.log('ready');" } }
+    ]
+  });
+
+  const response = await api("/api/chat/desktop-tools", {
+    method: "POST",
+    cookie,
+    body: {
+      runId: runId("continue-files"),
+      messages: [
+        { role: "user", content: "Create index.html, style.css and script.js in C:\\Users\\test\\site." },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            {
+              id: "call_html",
+              type: "function",
+              function: { name: "write_file", arguments: JSON.stringify({ path: "C:\\Users\\test\\site\\index.html", content: "<h1>Hi</h1>" }) }
+            },
+            {
+              id: "call_css",
+              type: "function",
+              function: { name: "write_file", arguments: JSON.stringify({ path: "C:\\Users\\test\\site\\style.css", content: "body { margin: 0; }" }) }
+            }
+          ]
+        },
+        { role: "tool", tool_call_id: "call_html", content: JSON.stringify({ ok: true, data: { path: "C:\\Users\\test\\site\\index.html" } }) },
+        { role: "tool", tool_call_id: "call_css", content: JSON.stringify({ ok: true, data: { path: "C:\\Users\\test\\site\\style.css" } }) }
+      ]
+    }
+  });
+
+  assert.equal(response.status, 200, JSON.stringify(response.body));
+  assert.equal(response.body.type, "tool_calls", "the dependent step continues instead of stopping on a question");
+  assert.equal(response.body.toolCalls[0].function.name, "write_file");
+  assert.equal(fakeProvider.state.chatRequests.length, 2, "exactly one continuation round");
+  const followUp = fakeProvider.state.chatRequests[1].body.messages;
+  assert.equal(followUp.at(-2).role, "assistant");
+  assert.equal(followUp.at(-1).role, "system");
+  assert.match(followUp.at(-1).content, /finish every deliverable/);
+});
+
+test("a genuine clarification question is preserved, not converted into a tool call", async () => {
+  const cookie = await newUser();
+  const question = "I found two Qoder folders. Which one should I use: C:\\Users\\test\\Qoder or D:\\Qoder?";
+  fakeProvider.state.set({
+    chatResponseText: question,
+    nudgeToolCalls: [{ name: "search_files", args: { root: "C:\\Users\\test", query: "Qoder" } }]
+  });
+
+  const response = await api("/api/chat/desktop-tools", {
+    method: "POST",
+    cookie,
+    body: {
+      runId: runId("clarify"),
+      messages: [
+        { role: "user", content: "Find my Qoder folder." },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            { id: "call_find", type: "function", function: { name: "search_files", arguments: JSON.stringify({ root: "C:\\Users\\test", query: "Qoder" }) } }
+          ]
+        },
+        {
+          role: "tool",
+          tool_call_id: "call_find",
+          content: JSON.stringify({ ok: true, data: { entries: [{ name: "Qoder", path: "C:\\Users\\test\\Qoder" }] } })
+        }
+      ]
+    }
+  });
+
+  assert.equal(response.status, 200, JSON.stringify(response.body));
+  assert.equal(response.body.type, "final");
+  assert.equal(response.body.content, question);
+  assert.equal(fakeProvider.state.chatRequests.length, 1, "a real clarification spends no forced round");
+});
+
+test("an announced search is followed by a real tool call instead of ending on the promise", async () => {
+  const cookie = await newUser();
+  fakeProvider.state.set({
+    chatResponseText: "I'll search for the Qoder folder in the common directories.",
+    nudgeToolCalls: [{ name: "search_files", args: { root: "C:\\Users\\test", query: "Qoder" } }]
+  });
+
+  const response = await api("/api/chat/desktop-tools", {
+    method: "POST",
+    cookie,
+    body: {
+      runId: runId("announce"),
+      messages: [{ role: "user", content: "Can you find my Qoder folder and give that path?" }]
+    }
+  });
+
+  assert.equal(response.status, 200, JSON.stringify(response.body));
+  assert.equal(response.body.type, "tool_calls", "the promise must be turned into a real tool call");
+  assert.equal(response.body.toolCalls[0].function.name, "search_files");
+  assert.deepEqual(JSON.parse(response.body.toolCalls[0].function.arguments), { root: "C:\\Users\\test", query: "Qoder" });
+
+  assert.equal(fakeProvider.state.chatRequests.length, 2, "exactly one follow-up round is spent on the announcement");
+  const followUp = fakeProvider.state.chatRequests[1].body.messages;
+  assert.equal(followUp.at(-2).role, "assistant", "the announcement stays in context");
+  assert.equal(followUp.at(-1).role, "system");
+  assert.match(followUp.at(-1).content, /did not call any tool/);
+});
+
+test("a promise that stays a promise ends honestly and is never marked as executed", async () => {
+  const cookie = await newUser();
+  const promise = "I'll search for the Qoder folder in the common directories.";
+  fakeProvider.state.set({ chatResponseText: promise, nudgeResponseText: promise });
+
+  const response = await api("/api/chat/desktop-tools", {
+    method: "POST",
+    cookie,
+    body: {
+      runId: runId("still-promise"),
+      messages: [{ role: "user", content: "Can you find my Qoder folder and give that path?" }]
+    }
+  });
+
+  assert.equal(response.status, 200, JSON.stringify(response.body));
+  assert.equal(response.body.type, "final");
+  assert.equal(fakeProvider.state.chatRequests.length, 2, "one nudge, never an endless loop");
+  assert.equal(response.body.finishReason, "stop");
+  assert.doesNotMatch(response.body.content, /I found|here are the paths|C:\\/i);
+});
+
+test("consecutive tool rounds all reach the model before the final answer", async () => {
+  const cookie = await newUser();
+  const id = runId("two-rounds");
+  const userText = "Find my Qoder folder and confirm what is in it.";
+
+  fakeProvider.state.set({
+    toolCalls: [{ id: "call_a", name: "list_directory", args: { path: "C:\\Users\\test" } }]
+  });
+  const first = await api("/api/chat/desktop-tools", {
+    method: "POST",
+    cookie,
+    body: { runId: id, messages: [{ role: "user", content: userText }] }
+  });
+  assert.equal(first.body.type, "tool_calls");
+  assert.equal(first.body.toolCalls[0].id, "call_a");
+
+  fakeProvider.state.set({
+    toolCalls: [{ id: "call_b", name: "search_files", args: { root: "C:\\Users\\test\\Qoder", query: "config" } }]
+  });
+  const second = await api("/api/chat/desktop-tools", {
+    method: "POST",
+    cookie,
+    body: {
+      runId: id,
+      messages: [
+        { role: "user", content: userText },
+        first.body.assistantMessage,
+        { role: "tool", tool_call_id: "call_a", content: JSON.stringify({ ok: true, data: { entries: [{ name: "Qoder" }] } }) }
+      ]
+    }
+  });
+  assert.equal(second.body.type, "tool_calls");
+  assert.equal(second.body.toolCalls[0].id, "call_b");
+  const secondRequest = fakeProvider.state.chatRequests.at(-1).body.messages;
+  assert.ok(
+    secondRequest.some(message => message.role === "tool" && message.tool_call_id === "call_a"),
+    "the first result is sent back before the second action"
+  );
+
+  fakeProvider.state.set({
+    toolCalls: null,
+    chatResponseText: "The Qoder folder is C:\\Users\\test\\Qoder and it contains config.json."
+  });
+  const third = await api("/api/chat/desktop-tools", {
+    method: "POST",
+    cookie,
+    body: {
+      runId: id,
+      messages: [
+        { role: "user", content: userText },
+        first.body.assistantMessage,
+        { role: "tool", tool_call_id: "call_a", content: JSON.stringify({ ok: true, data: { entries: [{ name: "Qoder" }] } }) },
+        second.body.assistantMessage,
+        { role: "tool", tool_call_id: "call_b", content: JSON.stringify({ ok: true, data: { matches: [{ path: "C:\\Users\\test\\Qoder\\config.json" }] } }) }
+      ]
+    }
+  });
+  assert.equal(third.body.type, "final");
+  assert.match(third.body.content, /C:\\Users\\test\\Qoder/);
+});
+
+test("a clarifying question is delivered as the turn and the task resumes after the answer", async () => {
+  const cookie = await newUser();
+  const id = runId("clarify");
+  const question = "Which location should I search: the whole computer, common development folders, or a specific drive?";
+
+  fakeProvider.state.set({ toolCalls: null, chatResponseText: question });
+  const first = await api("/api/chat/desktop-tools", {
+    method: "POST",
+    cookie,
+    body: { runId: id, messages: [{ role: "user", content: "Find my Qoder folder." }] }
+  });
+  assert.equal(first.status, 200);
+  assert.equal(first.body.type, "final");
+  assert.equal(first.body.content, question);
+  assert.equal(fakeProvider.state.chatRequests.length, 1, "a question is not an unfulfilled action promise");
+
+  fakeProvider.state.set({
+    chatResponseText: null,
+    toolCalls: [{ id: "call_scope", name: "search_files", args: { root: "C:\\Users\\test\\Documents", query: "Qoder" } }]
+  });
+  const second = await api("/api/chat/desktop-tools", {
+    method: "POST",
+    cookie,
+    body: {
+      runId: id,
+      messages: [
+        { role: "user", content: "Find my Qoder folder." },
+        { role: "assistant", content: question },
+        { role: "user", content: "Search my development folders." }
+      ]
+    }
+  });
+  assert.equal(second.status, 200, JSON.stringify(second.body));
+  assert.equal(second.body.type, "tool_calls", "the same task continues after the answer");
+  assert.equal(second.body.toolCalls[0].function.name, "search_files");
+});
+
+test("the announcement follow-up is provider- and model-independent", async () => {
+  const cookie = await newUser();
+  const configId = "second-fake";
+  const saved = await api("/api/settings/providers/second-fake", {
+    method: "PUT",
+    cookie,
+    body: {
+      provider: "Second Fake",
+      providerId: "second-fake",
+      providerType: "openai_compatible",
+      baseUrl: fakeProvider.baseUrl,
+      apiKey: FAKE_API_KEY,
+      model: "fake-model-pro"
+    }
+  });
+  assert.equal(saved.status, 200, JSON.stringify(saved.body));
+  assert.equal(saved.body.config.configId, configId);
+
+  fakeProvider.state.set({
+    chatResponseText: "Let me check the Documents folder for a Qoder directory.",
+    nudgeToolCalls: [{ name: "search_files", args: { root: "C:\\Users\\test\\Documents", query: "Qoder" } }]
+  });
+  const response = await api("/api/chat/desktop-tools", {
+    method: "POST",
+    cookie,
+    body: {
+      runId: runId("second-provider"),
+      model: "fake-model-pro",
+      configId,
+      messages: [{ role: "user", content: "Find my Qoder folder under Documents." }]
+    }
+  });
+
+  assert.equal(response.status, 200, JSON.stringify(response.body));
+  assert.equal(response.body.type, "tool_calls");
+  const requests = fakeProvider.state.chatRequests;
+  assert.equal(requests.at(-1).body.model, "fake-model-pro");
+  assert.equal(requests.length, 2, "the nudge applies to a second configuration unchanged");
+});
+
+test("cancelling a tool turn stops the execution loop without a fabricated final answer", async () => {
+  const cookie = await newUser();
+  const id = runId("cancel");
+  fakeProvider.state.set({
+    chatResponseText: "I'll search for the Qoder folder in the common directories.",
+    nudgeToolCalls: [{ name: "search_files", args: { root: "C:\\Users\\test", query: "Qoder" } }],
+    chatDelayMs: 250
+  });
+
+  const controller = new AbortController();
+  const pending = fetch(`${baseURL}/api/chat/desktop-tools`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Cookie: cookie },
+    body: JSON.stringify({
+      runId: id,
+      messages: [{ role: "user", content: "Can you find my Qoder folder and give that path?" }]
+    }),
+    signal: controller.signal
+  }).catch(error => error);
+
+  setTimeout(() => controller.abort(), 80);
+  const outcome = await pending;
+  assert.equal(outcome.name, "AbortError");
+
+  fakeProvider.state.set({ chatDelayMs: 0, chatResponseText: null, nudgeToolCalls: null });
+  const next = await api("/api/chat/desktop-tools", {
+    method: "POST",
+    cookie,
+    body: { runId: id, messages: [{ role: "user", content: "Never mind." }] }
+  });
+  assert.notEqual(next.status, 409, "a cancelled run releases its busy slot");
+  assert.equal(next.body.type, "final");
+});
+

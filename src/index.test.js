@@ -21,6 +21,7 @@ const { default: mongoose } = await import("mongoose");
 const { startFakeProvider, FAKE_API_KEY, FAKE_MODELS } = await import("./testUtils/fakeProvider.js");
 const fakeProvider = await startFakeProvider();
 const { startFakeOllama, FAKE_OLLAMA_MODEL } = await import("./testUtils/fakeOllama.js");
+const { DESKTOP_TOOL_NAMES } = await import("./desktopTools.js");
 const fakeOllama = await startFakeOllama();
 process.env.OLLAMA_BASE_URL = fakeOllama.baseUrl;
 process.env.OLLAMA_MODEL = FAKE_OLLAMA_MODEL;
@@ -154,7 +155,7 @@ test("GET /api/health reports MongoDB, release metadata, features, and a request
   assert.equal(response.body.features.vupsTextModel, "fake-model-mini");
   assert.equal(response.body.features.vupsTextModelSource, "VUPS_UNDERLYING_MODEL");
   assert.equal(response.body.features.vupsMaxOutputTokens, 24576);
-  assert.equal(response.body.features.vupsStreamStartTimeoutMs, 60000);
+  assert.equal(response.body.features.vupsStreamStartTimeoutMs, 0);
   assert.equal(response.body.features.vupsStreamIdleTimeoutMs, 240000);
   assert.equal(response.body.features.vupsSseHeartbeatMs, 15000);
   assert.match(response.headers.get("x-request-id"), /^[0-9a-f-]{36}$/);
@@ -1174,6 +1175,37 @@ test("chat surfaces provider errors clearly (invalid key, rate limit, unavailabl
   fakeProvider.state.reset();
 });
 
+test("stopping a non-streaming chat aborts upstream work and persists nothing", async () => {
+  const { cookie } = await signupUser();
+  await configureProvider(cookie);
+  fakeProvider.state.reset();
+  fakeProvider.state.set({ chatDelayMs: 300 });
+
+  const controller = new AbortController();
+  const request = fetch(`${baseURL}/api/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Cookie: cookie },
+    body: JSON.stringify({
+      stream: false,
+      model: "fake-model-mini",
+      messages: [{ role: "user", content: "This turn will be stopped" }]
+    }),
+    signal: controller.signal
+  });
+  await new Promise(resolve => setTimeout(resolve, 80));
+  assert.equal(fakeProvider.state.chatRequests.length, 1, "the upstream request must be in flight");
+  controller.abort();
+  await assert.rejects(request, error => error.name === "AbortError");
+
+  // Give the route enough time that a late provider answer would have been
+  // saved if Stop did not cancel the turn.
+  await new Promise(resolve => setTimeout(resolve, 500));
+  const conversations = await api("/api/conversations", { cookie });
+  assert.equal(conversations.status, 200);
+  assert.equal(conversations.body.conversations.length, 0, "a stopped turn must not be saved");
+  fakeProvider.state.reset();
+});
+
 test("chat streams SSE deltas from the provider and persists the final text", async () => {
   const { cookie } = await signupUser();
   await configureProvider(cookie);
@@ -2158,7 +2190,10 @@ test("a shared desktop tool turn sends the real model upstream and the alias bac
 
       const upstream = fakeProvider.state.chatRequests.at(-1)?.body;
       assert.equal(upstream.model, "fake-model-pro", "the public alias must never reach the provider");
-      assert.ok(Array.isArray(upstream.tools) && upstream.tools.length === 6, "the filesystem tools are offered");
+      assert.ok(
+        Array.isArray(upstream.tools) && upstream.tools.length === DESKTOP_TOOL_NAMES.length,
+        "every registered local Windows tool is offered"
+      );
       assert.equal(response.body.model, "vups-v3-galax", "the client only ever sees the alias");
     });
   });

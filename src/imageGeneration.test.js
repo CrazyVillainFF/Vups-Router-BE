@@ -217,3 +217,74 @@ test("rejects malformed base64 images instead of returning a broken data URL", a
     await close(server);
   }
 });
+
+test("a caller stop aborts the upstream image request instead of waiting it out", async () => {
+  let connected = false;
+  let upstreamClosed = false;
+  const { server, port } = await listen((req, res) => {
+    connected = true;
+    req.on("close", () => {
+      upstreamClosed = true;
+      res.destroy();
+    });
+  });
+
+  try {
+    await withEnv(
+      {
+        CLOUDFLARE_ACCOUNT_ID: "account-123",
+        CLOUDFLARE_API_TOKEN: "cf-secret-token",
+        CLOUDFLARE_AI_BASE_URL: `http://127.0.0.1:${port}`
+      },
+      async () => {
+        const controller = new AbortController();
+        const run = generateImage("a slow image", controller.signal);
+        const timer = setTimeout(() => controller.abort(), 25);
+        try {
+          await assert.rejects(
+            run,
+            error => error instanceof ImageGenerationError &&
+              error.code === "cancelled" &&
+              error.status === 499
+          );
+        } finally {
+          clearTimeout(timer);
+        }
+        assert.equal(connected, true, "the upstream request must have started");
+        await new Promise(resolve => setTimeout(resolve, 50));
+        assert.equal(upstreamClosed, true, "the upstream connection must be closed by the abort");
+      }
+    );
+  } finally {
+    await close(server);
+  }
+});
+
+test("a pre-aborted signal never starts an image request", async () => {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    throw new Error("fetch must not run");
+  };
+  try {
+    await withEnv(
+      {
+        CLOUDFLARE_ACCOUNT_ID: "account-123",
+        CLOUDFLARE_API_TOKEN: "cf-secret-token",
+        CLOUDFLARE_AI_BASE_URL: "https://api.cloudflare.test/client/v4"
+      },
+      async () => {
+        const controller = new AbortController();
+        controller.abort();
+        await assert.rejects(
+          generateImage("stop", controller.signal),
+          error => error.code === "cancelled" && error.status === 499
+        );
+      }
+    );
+    assert.equal(calls, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

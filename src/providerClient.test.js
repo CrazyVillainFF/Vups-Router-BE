@@ -61,6 +61,15 @@ test("normalizes AgentRouter base URLs without duplicating /v1", () => {
   assert.equal(normalizeBaseUrl("https://agentrouter.org/v1/v1"), "https://agentrouter.org/v1");
 });
 
+test("normalizes the documented AgentRouter agent host to /v1", () => {
+  assert.equal(normalizeBaseUrl("https://co.agentrouter.org"), "https://co.agentrouter.org/v1");
+  assert.equal(normalizeBaseUrl("https://co.agentrouter.org/"), "https://co.agentrouter.org/v1");
+  assert.equal(normalizeBaseUrl("https://co.agentrouter.org/v1/"), "https://co.agentrouter.org/v1");
+  assert.equal(normalizeBaseUrl("https://co.agentrouter.org/v1/chat/completions"), "https://co.agentrouter.org/v1");
+  assert.equal(normalizeBaseUrl("https://co.agentrouter.org/v1/responses/"), "https://co.agentrouter.org/v1");
+  assert.equal(normalizeBaseUrl("https://co.agentrouter.org/v1/v1"), "https://co.agentrouter.org/v1");
+});
+
 test("keeps other provider base URLs unchanged", () => {
   assert.equal(normalizeBaseUrl("https://api.deepseek.com/"), "https://api.deepseek.com");
   assert.equal(normalizeBaseUrl("https://api.openai.com/v1/chat/completions/"), "https://api.openai.com/v1");
@@ -189,6 +198,18 @@ test("AgentRouter GPT models resolve to /responses and other models keep /chat/c
   assert.equal(resolveChatEndpoint("https://agentrouter.org/v1/responses", "gpt-5.6-sol"), "https://agentrouter.org/v1/responses");
   assert.equal(resolveChatEndpoint("https://agentrouter.org/v1", "deepseek-v4-flash"), "https://agentrouter.org/v1/chat/completions");
   assert.equal(resolveChatEndpoint("https://api.openai.com/v1", "gpt-5.6-sol"), "https://api.openai.com/v1/chat/completions");
+});
+
+test("the documented AgentRouter host follows the selected protocol and never doubles /v1", () => {
+  // AgentRouter documents OpenAI-compatible chat completions for this host;
+  // Responses stays opt-in per configuration instead of being inferred.
+  assert.equal(resolveChatEndpoint("https://co.agentrouter.org", "gpt-5.6-sol"), "https://co.agentrouter.org/v1/chat/completions");
+  assert.equal(resolveChatEndpoint("https://co.agentrouter.org/v1", "deepseek-v4-flash"), "https://co.agentrouter.org/v1/chat/completions");
+  assert.equal(resolveChatEndpoint("https://co.agentrouter.org/v1/v1", "glm-5.3"), "https://co.agentrouter.org/v1/chat/completions");
+  assert.equal(
+    resolveChatEndpoint("https://co.agentrouter.org", "gpt-5.6-sol", "openai_responses"),
+    "https://co.agentrouter.org/v1/responses"
+  );
 });
 
 test("builds a Responses payload with the exact model ID and stream flag", () => {
@@ -1066,4 +1087,112 @@ test("a non-stream answer spent entirely on reasoning reports the output limit",
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("AgentRouter's client gate maps to the documented host, not to the API key", async () => {
+  const { server, port } = await listen(async (req, res) => {
+    await readBody(req);
+    res.writeHead(401, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      error: { message: "unauthorized client detected, contact support for assistance" },
+      message: "UNAUTHENTICATED",
+      success: false,
+      type: "unauthorized_client_error"
+    }));
+  });
+  try {
+    await assert.rejects(
+      () => chatCompletion({
+        baseUrl: `http://127.0.0.1:${port}`,
+        apiKey: "sk-ar-secret-123456",
+        model: "gpt-5.6-sol",
+        messages: [{ role: "user", content: "Hello" }]
+      }),
+      error => {
+        assert.equal(error.code, "unauthorized_client");
+        assert.match(error.message, /https:\/\/co\.agentrouter\.org\/v1/);
+        assert.match(error.message, /coding CLIs/);
+        assert.ok(!error.message.includes("sk-ar-secret-123456"), "the key must never be echoed back");
+        return true;
+      }
+    );
+  } finally {
+    await close(server);
+  }
+});
+
+test("Responses history types assistant content parts as output_text", () => {
+  const body = buildChatRequestBody({
+    model: "gpt-5.6-sol",
+    responses: true,
+    messages: [
+      { role: "user", content: "What is in this image?", images: [{ url: "https://example.com/user.png" }] },
+      { role: "assistant", content: "A chart.", images: [{ url: "https://example.com/assistant.png" }] }
+    ]
+  });
+  assert.deepEqual(body.input[0].content, [
+    { type: "input_text", text: "What is in this image?" },
+    { type: "input_image", image_url: "https://example.com/user.png" }
+  ]);
+  assert.deepEqual(body.input[1].content, [
+    { type: "output_text", text: "A chart." },
+    { type: "input_image", image_url: "https://example.com/assistant.png" }
+  ]);
+});
+
+test("a caller stop is reported as cancelled, never as a retryable timeout", async () => {
+  const { server, port } = await listen((_req, _res) => {
+    /* hold the request open until the caller aborts */
+  });
+  try {
+    const controller = new AbortController();
+    const run = chatCompletion(
+      {
+        baseUrl: `http://127.0.0.1:${port}/v1`,
+        apiKey: "sk-test",
+        model: "test-model",
+        messages: [{ role: "user", content: "hello" }]
+      },
+      controller.signal
+    );
+    const timer = setTimeout(() => controller.abort(), 25);
+    try {
+      await assert.rejects(
+        run,
+        error => error instanceof ProviderError &&
+          error.code === "cancelled" &&
+          isRetryableProviderError(error) === false
+      );
+    } finally {
+      clearTimeout(timer);
+    }
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
+test("a retry loop stops immediately when the caller aborts", async () => {
+  const controller = new AbortController();
+  let operationCalls = 0;
+  await assert.rejects(
+    withProviderRetry(
+      async () => {
+        operationCalls += 1;
+        throw new ProviderError("Provider overloaded.", 503, "provider_unavailable");
+      },
+      {
+        maxRetries: 3,
+        baseDelayMs: 1,
+        maxDelayMs: 2,
+        random: () => 0,
+        signal: controller.signal,
+        sleep: async (_delay, signal) => {
+          controller.abort();
+          if (signal?.aborted) throw new ProviderError("Request cancelled.", null, "cancelled");
+        }
+      }
+    ),
+    error => error.code === "cancelled"
+  );
+  assert.equal(operationCalls, 1, "an aborted retry loop must not call the provider again");
 });

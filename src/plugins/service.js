@@ -15,8 +15,12 @@ function connectionSignal() {
   return AbortSignal.timeout(CONNECTION_TIMEOUT_MS);
 }
 
-function executionSignal() {
-  return AbortSignal.timeout(EXECUTION_TIMEOUT_MS);
+function executionSignal(caller = null) {
+  const timeout = AbortSignal.timeout(EXECUTION_TIMEOUT_MS);
+  if (!caller) return timeout;
+  // A caller stop has to reach the plugin request itself, not just be noticed
+  // between rounds once the upstream call has already finished.
+  return AbortSignal.any([timeout, caller]);
 }
 
 // Exported so the redaction path can be tested without a live provider: an
@@ -299,7 +303,8 @@ export async function uninstallPlugin(userId, pluginId, { requestId = "" } = {})
 export async function executePluginTool(userId, pluginId, toolName, args = {}, {
   confirm = false,
   source = "ui",
-  requestId = ""
+  requestId = "",
+  signal = null
 } = {}) {
   const plugin = getPlugin(pluginId);
   if (!plugin) throw new PluginError("That plugin does not exist in the catalog.", 404, "plugin_not_found");
@@ -328,7 +333,7 @@ export async function executePluginTool(userId, pluginId, toolName, args = {}, {
     const result = await adapter.execute(tool.name, args, {
       config: installation.config || {},
       credentials,
-      signal: executionSignal(),
+      signal: executionSignal(signal),
       requestId
     });
     await audit(userId, plugin.id, "execute", "success", {

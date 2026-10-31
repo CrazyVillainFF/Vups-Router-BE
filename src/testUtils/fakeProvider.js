@@ -54,6 +54,9 @@ export async function startFakeProvider() {
       emptyStream: false,
       chatResponseText: null,
       toolCalls: null,
+      nudgeToolCalls: null,
+      nudgeResponseText: null,
+      chatDelayMs: 0,
       extraModels: [],
       acceptedKeys: null
     },
@@ -89,6 +92,9 @@ export async function startFakeProvider() {
       state.behavior.emptyStream = false;
       state.behavior.chatResponseText = null;
       state.behavior.toolCalls = null;
+      state.behavior.nudgeToolCalls = null;
+      state.behavior.nudgeResponseText = null;
+      state.behavior.chatDelayMs = 0;
       state.behavior.extraModels = [];
       state.behavior.acceptedKeys = null;
     }
@@ -194,8 +200,43 @@ export async function startFakeProvider() {
         return json(res, 404, { error: { message: `The model \`${body.model}\` does not exist.` } });
       }
       const model = body.model;
+      // The desktop execution layer re-prompts a model that only announced an
+      // action or stalled on "shall I continue?"; tests drive that second round
+      // through these fields.
+      const nudged = Array.isArray(body.messages) && body.messages.some(message =>
+        message?.role === "system" &&
+        typeof message.content === "string" &&
+        (message.content.includes("did not call any tool") ||
+          message.content.includes("should continue with the next dependent step"))
+      );
+      if (state.behavior.chatDelayMs > 0) {
+        await new Promise(resolve => setTimeout(resolve, state.behavior.chatDelayMs));
+      }
 
       if (!body.stream) {
+        if (nudged && Array.isArray(state.behavior.nudgeToolCalls) && state.behavior.nudgeToolCalls.length > 0) {
+          const calls = state.behavior.nudgeToolCalls.map((call, index) => ({
+            id: call.id || `fake_nudge_call_${index}`,
+            type: "function",
+            function: { name: call.name, arguments: JSON.stringify(call.args ?? {}) }
+          }));
+          return json(res, 200, {
+            id: "chatcmpl-fake",
+            model,
+            choices: [{
+              index: 0,
+              message: { role: "assistant", content: null, tool_calls: calls },
+              finish_reason: "tool_calls"
+            }]
+          });
+        }
+        if (nudged && typeof state.behavior.nudgeResponseText === "string") {
+          return json(res, 200, {
+            id: "chatcmpl-fake",
+            model,
+            choices: [{ index: 0, message: { role: "assistant", content: state.behavior.nudgeResponseText }, finish_reason: "stop" }]
+          });
+        }
         if (Array.isArray(state.behavior.toolCalls) && state.behavior.toolCalls.length > 0) {
           const calls = state.behavior.toolCalls.map((call, index) => ({
             id: call.id || `fake_call_${index}`,

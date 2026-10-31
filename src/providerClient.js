@@ -8,6 +8,9 @@ function envMillis(name, fallback) {
   return Number.isFinite(value) && value >= 1000 ? Math.floor(value) : fallback;
 }
 
+// Fallback deadline for provider calls that arrive without a caller signal.
+// Chat routes always pass their own signal, so model generation is not capped
+// by these values; they only bound helper calls that have no caller of their own.
 const REQUEST_TIMEOUT_MS = envMillis("PROVIDER_TIMEOUT_MS", 60000);
 const STREAM_TIMEOUT_MS = envMillis("PROVIDER_STREAM_TIMEOUT_MS", 300000);
 const MAX_ERROR_LENGTH = 400;
@@ -28,6 +31,11 @@ export class ProviderError extends Error {
 
 const ENDPOINT_SUFFIX = /\/(chat\/completions|text\/chat|text\/chat_stream|responses|messages|completions|models|embeddings)$/i;
 const AGENTROUTER_HOSTS = new Set(["agentrouter.org", "www.agentrouter.org"]);
+// agentrouter.org answers an official-CLI fingerprint check before it checks the
+// key, so a server-side client gets 401 unauthorized_client_error no matter how
+// correct the request is. co.agentrouter.org is the documented host for
+// third-party agents: OpenAI-compatible under /v1, Anthropic at the origin.
+const AGENTROUTER_API_HOSTS = new Set(["co.agentrouter.org"]);
 const ANTHROPIC_HOSTS = new Set(["api.anthropic.com", "www.api.anthropic.com"]);
 const GOOGLE_GEMINI_HOSTS = new Set(["generativelanguage.googleapis.com"]);
 const OPENCODE_ZEN_HOSTS = new Set(["opencode.ai", "www.opencode.ai"]);
@@ -47,6 +55,10 @@ export function isBedrockHost(hostname) {
 
 function isAgentRouterHost(hostname) {
   return AGENTROUTER_HOSTS.has(String(hostname || "").toLowerCase());
+}
+
+function isAgentRouterApiHost(hostname) {
+  return AGENTROUTER_API_HOSTS.has(String(hostname || "").toLowerCase());
 }
 
 function isAnthropicHost(hostname) {
@@ -180,7 +192,7 @@ export function normalizeBaseUrl(value) {
   while (ENDPOINT_SUFFIX.test(cleanedPath)) {
     cleanedPath = cleanedPath.replace(ENDPOINT_SUFFIX, "");
   }
-  if ((isAgentRouterHost(parsed.hostname) || isAnthropicHost(parsed.hostname)) && (cleanedPath === "" || /^(\/v\d+)+$/i.test(cleanedPath))) {
+  if ((isAgentRouterHost(parsed.hostname) || isAgentRouterApiHost(parsed.hostname) || isAnthropicHost(parsed.hostname)) && (cleanedPath === "" || /^(\/v\d+)+$/i.test(cleanedPath))) {
     cleanedPath = "/v1";
   }
   if (isGoogleGeminiHost(parsed.hostname) && (cleanedPath === "" || /^\/v1(?:beta)?$/i.test(cleanedPath) || /^\/openai$/i.test(cleanedPath))) {
@@ -1799,7 +1811,20 @@ export function describeProviderError(status, payload) {
     // credential failure and used to be mislabeled as one in the client.
     return new ProviderError(`The provider rejected the request (HTTP 400)${detail ? "." : " and did not include details. Check the model ID and API base URL, then try again."}${suffix}`, status, "bad_request");
   }
-  if (status === 401) return new ProviderError(`The provider rejected your API key (HTTP 401). Check the key in Settings.${suffix}`, status, "invalid_api_key");
+  if (status === 401) {
+    // AgentRouter's agentrouter.org host rejects anything that is not one of its
+    // own coding CLIs before it looks at the key, so "check the key" would send
+    // the user after a problem that does not exist. Its documented host for
+    // third-party agents is co.agentrouter.org.
+    if (payload?.type === "unauthorized_client_error" || payload?.error?.type === "unauthorized_client_error") {
+      return new ProviderError(
+        "AgentRouter rejected this client (HTTP 401) before checking the API key: agentrouter.org only accepts requests from its own coding CLIs. Reconfigure the provider with the documented API host — https://co.agentrouter.org/v1 for OpenAI-compatible models, or https://co.agentrouter.org for Anthropic models — then test again.",
+        status,
+        "unauthorized_client"
+      );
+    }
+    return new ProviderError(`The provider rejected your API key (HTTP 401). Check the key in Settings.${suffix}`, status, "invalid_api_key");
+  }
   if (status === 402) return new ProviderError(`Your provider account has insufficient credits (HTTP 402).${suffix}`, status, "insufficient_credits");
   if (status === 403) return new ProviderError(`The provider denied access (HTTP 403). Your key may lack permission for this model.${suffix}`, status, "forbidden");
   if (status === 404) return new ProviderError(`The provider returned HTTP 404. The API base URL or model ID is likely wrong.${suffix}`, status, "not_found");
@@ -2260,12 +2285,15 @@ export function serializeMessages(messages) {
 function serializeResponsesMessages(messages) {
   return serializeMessages(messages).map(message => {
     if (typeof message.content === "string") return message;
+    // The Responses API only accepts output_text parts on assistant turns;
+    // input_text is a request-side type and is rejected in history.
+    const textType = message.role === "assistant" ? "output_text" : "input_text";
     return {
       role: message.role,
       content: message.content.map(part => (
         part.type === "image_url"
           ? { type: "input_image", image_url: part.image_url?.url ?? "" }
-          : { type: "input_text", text: part.text ?? "" }
+          : { type: textType, text: part.text ?? "" }
       ))
     };
   });
@@ -2402,6 +2430,13 @@ export async function chatCompletion({ baseUrl, apiKey, model, messages, tempera
     });
   } catch (error) {
     if (error?.name === "TimeoutError" || error?.name === "AbortError") {
+      // A caller stop is an outcome, not a slow provider: classifying it as a
+      // retryable timeout makes every retry loop try again after Stop. A
+      // composed deadline signal still aborts with the TimeoutError reason, so
+      // it keeps its retryable timeout meaning.
+      if (signal?.aborted && error?.name !== "TimeoutError") {
+        throw new ProviderError("Request cancelled.", null, "cancelled");
+      }
       throw attachProviderDiagnostic(
         new ProviderError("Timed out while waiting for the provider.", null, "timeout"),
         { url, context, classification: { category: "timeout", classification: "transient", retryable: true } }
@@ -2535,7 +2570,9 @@ export async function startChatCompletionStream({ baseUrl, apiKey, model, messag
       );
     }
     if (error?.name === "TimeoutError" || error?.name === "AbortError") {
-      if (signal?.aborted) throw new ProviderError("Request cancelled.", null, "cancelled");
+      if (signal?.aborted && error?.name !== "TimeoutError") {
+        throw new ProviderError("Request cancelled.", null, "cancelled");
+      }
       throw attachProviderDiagnostic(
         new ProviderError("Timed out while waiting for the provider's stream.", null, "timeout"),
         { url, context, classification: { category: "timeout", classification: "transient", retryable: true } }

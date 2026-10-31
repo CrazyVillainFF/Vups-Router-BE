@@ -38,6 +38,11 @@ router.post("/generate", requireAuth, imageGenerationRateLimiter, async (req, re
   };
   res.on("close", release);
 
+  const halted = new AbortController();
+  res.on("close", () => {
+    if (!res.writableEnded) halted.abort();
+  });
+
   try {
     await consumeDailyQuota(req.userId);
   } catch (error) {
@@ -49,7 +54,10 @@ router.post("/generate", requireAuth, imageGenerationRateLimiter, async (req, re
   }
 
   try {
-    const result = await generateImage(promptCheck.prompt);
+    const result = await generateImage(promptCheck.prompt, halted.signal);
+    // The caller stopped waiting; a late image must not be written to a closed
+    // response, and the turn that asked for it is already cancelled.
+    if (halted.signal.aborted) return;
     return res.json({
       success: true,
       image: result.image,
@@ -57,6 +65,7 @@ router.post("/generate", requireAuth, imageGenerationRateLimiter, async (req, re
       model: result.model
     });
   } catch (error) {
+    if (halted.signal.aborted) return;
     const status = Number.isInteger(error?.status) ? error.status : 502;
     const code = typeof error?.code === "string" ? error.code : "image_generation_failed";
     if (status >= 500) console.error("Image generation failed:", code);

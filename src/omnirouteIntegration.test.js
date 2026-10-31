@@ -383,9 +383,11 @@ test("an unreachable gateway is reported without breaking the rest of the app", 
   resetOmniRouteCache();
 });
 
-test("a slow gateway surfaces a timeout without hanging the request", async () => {
+test("a slow gateway is waited for instead of being cut off by a short deadline", async () => {
   const { cookie } = await signupUser();
   fakeOmniRoute.reset();
+  // Longer than the old one-second fallback deadline: the answer must still
+  // arrive, and one turn must never fan out into duplicate gateway calls.
   fakeOmniRoute.state.behavior.delayMs = 1500;
   resetOmniRouteCache();
 
@@ -394,8 +396,9 @@ test("a slow gateway surfaces a timeout without hanging the request", async () =
     cookie,
     body: { messages: [{ role: "user", content: "slow" }], model: "openai/gpt-5.2", source: "omniroute", stream: false }
   });
-  assert.equal(response.status, 504);
-  assert.equal(response.body.code, "omniroute_timeout");
+  assert.equal(response.status, 200);
+  assert.match(response.body.message.content, /OmniRoute echo from openai\/gpt-5\.2/);
+  assert.equal(fakeOmniRoute.state.chatRequests.length, 1);
   assert.ok(!response.text.includes(FAKE_OMNIROUTE_KEY));
 
   fakeOmniRoute.reset();

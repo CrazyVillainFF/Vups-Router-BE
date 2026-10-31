@@ -35,9 +35,14 @@ import { attachmentMetadata, validateImages } from "../chatImages.js";
 import { resolveTerminalEvent, writeSseEvent } from "../chatTerminal.js";
 import { runPluginToolLoop } from "../plugins/toolChat.js";
 import {
+  CONTINUE_TASK_NUDGE,
   DESKTOP_TOOLS,
   DESKTOP_TOOL_PROMPT,
+  LOCAL_ACTION_NUDGE,
+  announcesUnfulfilledLocalAction,
+  asksPermissionToContinue,
   isDesktopToolName,
+  lastUserMessageText,
   normalizeDesktopToolCalls
 } from "../desktopTools.js";
 import {
@@ -113,7 +118,9 @@ function validateMessages(value, { allowAssistantLast = false } = {}) {
   return { messages };
 }
 
-const MAX_DESKTOP_STEPS = 6;
+// Development work needs more rounds than a folder question: inspect, read,
+// edit, run tests, read the failure, fix it, rerun. Each round is still bounded.
+const MAX_DESKTOP_STEPS = 12;
 const DESKTOP_RUN_TTL_MS = 10 * 60 * 1000;
 const desktopRuns = new Map();
 
@@ -857,6 +864,22 @@ function sendSseHeartbeat(res) {
   res.write(": keepalive\n\n");
 }
 
+// A comment line keeps reverse proxies and idle-stream guards from treating a
+// model that is thinking, loading, or running tools as a dead connection. It
+// carries no content and is ignored by every client parser.
+const CHAT_SSE_HEARTBEAT_MS = (() => {
+  const value = Number(process.env.CHAT_SSE_HEARTBEAT_MS);
+  return Number.isFinite(value) && value >= 1000 ? Math.floor(value) : 15000;
+})();
+
+// There is no total execution deadline by default. A positive
+// CHAT_TOTAL_TIMEOUT_MS opts into one for non-streaming replies; streaming
+// replies stay bounded by the idle-stream watchdog and the caller's Stop.
+const CHAT_TOTAL_TIMEOUT_MS = (() => {
+  const value = Number(process.env.CHAT_TOTAL_TIMEOUT_MS);
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+})();
+
 function readStreamChunk(reader, timeoutMs, onTimeout) {
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -1513,6 +1536,11 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
           providerHost
         })
       };
+      // Only an explicitly configured deadline bounds the whole reply; by
+      // default the turn waits as long as the model genuinely needs.
+      const turnSignal = execution.requestTimeoutMs > 0
+        ? AbortSignal.any([requestController.signal, AbortSignal.timeout(execution.requestTimeoutMs)])
+        : requestController.signal;
       try {
         result = await withProviderRetry(
           (attempt) => {
@@ -1531,7 +1559,7 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
               conversationId,
               requestId,
               attempt: attempt + 1
-            }, AbortSignal.any([requestController.signal, AbortSignal.timeout(execution.requestTimeoutMs)]));
+            }, turnSignal);
           },
           retryOptions
         );
@@ -1561,6 +1589,8 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
           totalDurationMs: Date.now() - startedAt
         });
       }
+      // A stop during the final provider call must not persist the reply.
+      if (requestController.signal.aborted) return;
       if (continuationState) {
         try {
           const continued = await persistContinuation({
@@ -1660,7 +1690,9 @@ router.post("/vups-v3-galax", requireAuth, vupsGalaxRateLimiter, async (req, res
               conversationId: conversationId ?? prospectiveId,
               requestId,
               attempt: attempt + 1,
-              responseTimeoutMs: execution.streamStartTimeoutMs
+              // A queued model may take longer than any fixed start window;
+              // only an explicit positive setting applies one.
+              responseTimeoutMs: execution.streamStartTimeoutMs > 0 ? execution.streamStartTimeoutMs : null
             },
             controller.signal
           );
@@ -2143,42 +2175,43 @@ router.post("/desktop-tools", requireAuth, chatRateLimiter, async (req, res, nex
       // because the model blinked.
       let attempts = 1;
       let result;
-      try {
-        result = await withProviderRetry(
-          (attempt) => {
-            attempts = attempt + 1;
-            return chatCompletion(
-              {
-                baseUrl: provider.baseUrl,
-                authMode: provider.authMode,
-                openapiBaseUrl: provider.openapiBaseUrl,
-                apiKey: provider.apiKey,
-                providerType: provider.providerType,
-                model,
-                messages: upstreamMessages,
-                temperature,
-                maxTokens: provider.maxTokens,
-                reasoning: provider.reasoning,
-                tools: DESKTOP_TOOLS,
-                toolChoice: "auto",
-                conversationId: requestedConversationId,
-                requestId: req.requestId,
-                attempt: attempt + 1
-              },
-              controller.signal
-            );
-          },
-          {
-            ...vupsRetryOptions(),
-            signal: controller.signal,
-            onRetry: event => logVupsRetry({
-              ...event,
-              requestId: req.requestId,
+      const askModel = messages => withProviderRetry(
+        attempt => {
+          attempts = attempt + 1;
+          return chatCompletion(
+            {
+              baseUrl: provider.baseUrl,
+              authMode: provider.authMode,
+              openapiBaseUrl: provider.openapiBaseUrl,
+              apiKey: provider.apiKey,
+              providerType: provider.providerType,
               model,
-              providerHost: providerHostFromUrl(provider.baseUrl)
-            })
-          }
-        );
+              messages,
+              temperature,
+              maxTokens: provider.maxTokens,
+              reasoning: provider.reasoning,
+              tools: DESKTOP_TOOLS,
+              toolChoice: "auto",
+              conversationId: requestedConversationId,
+              requestId: req.requestId,
+              attempt: attempt + 1
+            },
+            controller.signal
+          );
+        },
+        {
+          ...vupsRetryOptions(),
+          signal: controller.signal,
+          onRetry: event => logVupsRetry({
+            ...event,
+            requestId: req.requestId,
+            model,
+            providerHost: providerHostFromUrl(provider.baseUrl)
+          })
+        }
+      );
+      try {
+        result = await askModel(upstreamMessages);
       } catch (error) {
         if (controller.signal.aborted) return;
         if (error instanceof ProviderError) {
@@ -2204,6 +2237,70 @@ router.post("/desktop-tools", requireAuth, chatRateLimiter, async (req, res, nex
         throw error;
       }
 
+      // A model can narrate the action it is about to take and return no tool
+      // call at all. Ending the run there leaves the user with a promise and no
+      // work done, so an unanswered "I'll search…" gets exactly one round with
+      // an explicit instruction to call a tool or stop pretending.
+      if (
+        normalizeDesktopToolCalls(result.toolCalls).length === 0 &&
+        !run.nudged &&
+        announcesUnfulfilledLocalAction({
+          text: result.content,
+          userText: lastUserMessageText(validated.messages)
+        })
+      ) {
+        run.nudged = true;
+        try {
+          const followUp = await askModel([
+            ...upstreamMessages,
+            { role: "assistant", content: String(result.content || "").trim() },
+            { role: "system", content: LOCAL_ACTION_NUDGE }
+          ]);
+          const followUpCalls = normalizeDesktopToolCalls(followUp.toolCalls);
+          if (followUpCalls.length > 0 || String(followUp.content || "").trim()) result = followUp;
+        } catch (error) {
+          if (controller.signal.aborted) return;
+          // The first answer is still real; keep it rather than failing a turn
+          // the user already paid a round for.
+        }
+      }
+
+      // A model can finish two of three requested files and then ask "shall I
+      // continue?". The user already asked for the whole task, so an ordinary
+      // dependent step must not stall on a question. One bounded follow-up
+      // turns the question into the next real tool call; a genuinely ambiguous
+      // or destructive step is still allowed to stay a question.
+      const sawSuccessfulToolResult = validated.messages.some(message =>
+        message.role === "tool" && /"ok"\s*:\s*true/.test(String(message.content || ""))
+      );
+      if (
+        normalizeDesktopToolCalls(result.toolCalls).length === 0 &&
+        !run.continued &&
+        asksPermissionToContinue({
+          text: result.content,
+          hasToolResults: sawSuccessfulToolResult
+        })
+      ) {
+        run.continued = true;
+        try {
+          const followUp = await askModel([
+            ...upstreamMessages,
+            { role: "assistant", content: String(result.content || "").trim() },
+            { role: "system", content: CONTINUE_TASK_NUDGE }
+          ]);
+          if (
+            normalizeDesktopToolCalls(followUp.toolCalls).length > 0 ||
+            String(followUp.content || "").trim()
+          ) {
+            result = followUp;
+          }
+        } catch (error) {
+          if (controller.signal.aborted) return;
+          // The first answer is still a real answer; never fail the turn for a
+          // follow-up that could not be sent.
+        }
+      }
+
       const toolCalls = normalizeDesktopToolCalls(result.toolCalls);
       if (toolCalls.length > 0) {
         run.steps += 1;
@@ -2225,6 +2322,9 @@ router.post("/desktop-tools", requireAuth, chatRateLimiter, async (req, res, nex
         });
       }
 
+      // A stop after the provider answered but before this turn was saved must
+      // not leave a reply in the conversation the user already cancelled.
+      if (controller.signal.aborted) return;
       const content = String(result.content || "").trim();
       if (!content) {
         return res.status(502).json({
@@ -2374,6 +2474,16 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
       let usedModel = model;
       let fallbackUsed = false;
       let pluginRun = null;
+      const halted = new AbortController();
+      res.on("close", () => {
+        if (!res.writableEnded) halted.abort();
+      });
+      // Stop and client disconnect are the only default bounds while this route
+      // holds the turn. A positive CHAT_TOTAL_TIMEOUT_MS adds an explicit
+      // deadline for deployments that want one.
+      const turnSignal = CHAT_TOTAL_TIMEOUT_MS > 0
+        ? AbortSignal.any([halted.signal, AbortSignal.timeout(CHAT_TOTAL_TIMEOUT_MS)])
+        : halted.signal;
       try {
         pluginRun = await runPluginToolLoop({
           userId: req.userId,
@@ -2383,23 +2493,30 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
           temperature,
           maxTokens: provider.maxTokens,
           reasoning: provider.reasoning,
+          signal: turnSignal,
           requestId: req.requestId
         });
       } catch (error) {
+        if (halted.signal.aborted) return;
         // A provider that fails mid tool loop must not lose the reply; fall back
         // to the plain completion below.
-        if (!(error instanceof ProviderError)) throw error;
-        logProviderFailure(provider, error);
-        pluginRun = null;
+        if (!(error instanceof ProviderError)) {
+          if (error?.code === "cancelled" && turnSignal.aborted) pluginRun = null;
+          else throw error;
+        } else {
+          logProviderFailure(provider, error);
+          pluginRun = null;
+        }
       }
       while (!pluginRun) {
         try {
           result = await chatCompletion(
             { baseUrl: provider.baseUrl, apiKey: provider.apiKey, providerType: provider.providerType, authMode: provider.authMode, openapiBaseUrl: provider.openapiBaseUrl, model: usedModel, messages: upstreamMessages, temperature, maxTokens: provider.maxTokens, reasoning: provider.reasoning, conversationId: prospectiveId },
-            undefined
+            turnSignal
           );
           break;
         } catch (error) {
+          if (halted.signal.aborted) return;
           if (!(error instanceof ProviderError)) throw error;
           logProviderFailure(provider, error);
           if (!fallbackUsed && canTrySharedFallback(provider, error)) {
@@ -2419,6 +2536,9 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
         }
       }
       if (pluginRun) result = pluginRun;
+      // The user may have stopped while the last provider call was finishing.
+      // Nothing this turn produced may land in the conversation after that.
+      if (halted.signal.aborted) return;
       const pluginToolsUsed = pluginRun?.toolsUsed || [];
       if (continuationState) {
         try {
@@ -2549,6 +2669,10 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
     res.setHeader("Connection", "keep-alive");
     res.setHeader("X-Accel-Buffering", "no");
     if (typeof res.flushHeaders === "function") res.flushHeaders();
+    const heartbeatTimer = setInterval(() => sendSseHeartbeat(res), CHAT_SSE_HEARTBEAT_MS);
+    heartbeatTimer.unref?.();
+    res.on("close", () => clearInterval(heartbeatTimer));
+    sendSseHeartbeat(res);
     sendEvent(res, {
       type: "meta",
       conversationId: prospectiveId,
@@ -2787,6 +2911,7 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
         ...(failure ? { diagnostic: vupsSafeDiagnostic(failure) } : {})
       });
     }
+    clearInterval(heartbeatTimer);
     if (!res.writableEnded) res.end();
   } catch (error) {
     if (res.headersSent) {

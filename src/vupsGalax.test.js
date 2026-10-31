@@ -300,6 +300,28 @@ test("output and timeout settings are bounded and read without a reload", () => 
   });
   withEnv(
     {
+      VUPS_REQUEST_TIMEOUT_MS: undefined,
+      VUPS_STREAM_START_TIMEOUT_MS: undefined
+    },
+    () => {
+      const configuration = vupsExecutionConfiguration();
+      assert.equal(configuration.requestTimeoutMs, 0, "no total deadline by default");
+      assert.equal(configuration.streamStartTimeoutMs, 0, "a queued model is waited for");
+    }
+  );
+  withEnv(
+    {
+      VUPS_REQUEST_TIMEOUT_MS: "0",
+      VUPS_STREAM_START_TIMEOUT_MS: "0"
+    },
+    () => {
+      const configuration = vupsExecutionConfiguration();
+      assert.equal(configuration.requestTimeoutMs, 0);
+      assert.equal(configuration.streamStartTimeoutMs, 0);
+    }
+  );
+  withEnv(
+    {
       VUPS_MAX_OUTPUT_TOKENS: "12",
       VUPS_REQUEST_TIMEOUT_MS: "1",
       VUPS_STREAM_START_TIMEOUT_MS: "9999999",

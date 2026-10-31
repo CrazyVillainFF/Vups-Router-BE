@@ -30,6 +30,14 @@ function toolMessageContent(value) {
   return text.length > MAX_TOOL_RESULT_CHARS ? `${text.slice(0, MAX_TOOL_RESULT_CHARS)}…` : text;
 }
 
+function cancelledError() {
+  return new PluginError("Request cancelled.", 499, "cancelled");
+}
+
+function throwIfAborted(signal) {
+  if (signal?.aborted) throw cancelledError();
+}
+
 export async function runPluginToolLoop({
   userId,
   provider,
@@ -41,6 +49,7 @@ export async function runPluginToolLoop({
   signal,
   requestId = ""
 }) {
+  throwIfAborted(signal);
   if (!providerSupportsPluginTools(provider, model)) return null;
   const tools = await toolDefinitionsForUser(userId);
   if (tools.length === 0) return null;
@@ -48,6 +57,7 @@ export async function runPluginToolLoop({
   let conversation = messages;
   const toolsUsed = [];
   for (let round = 0; round <= MAX_TOOL_ROUNDS; round += 1) {
+    throwIfAborted(signal);
     const result = await chatCompletion({
       baseUrl: provider.baseUrl,
       authMode: provider.authMode,
@@ -64,6 +74,7 @@ export async function runPluginToolLoop({
       requestId,
       attempt: round
     }, signal);
+    throwIfAborted(signal);
 
     if (!result.toolCalls?.length) {
       if (!result.content) {
@@ -84,6 +95,7 @@ export async function runPluginToolLoop({
       { role: "assistant", content: result.content || null, tool_calls: calls }
     ];
     for (const call of calls) {
+      throwIfAborted(signal);
       toolsUsed.push(call.function.name);
       let args;
       try {
@@ -101,11 +113,14 @@ export async function runPluginToolLoop({
         value = await executeToolByName(userId, call.function.name, args, {
           confirm: false,
           source: "ai",
-          requestId
+          requestId,
+          signal
         });
       } catch (error) {
+        if (signal?.aborted) throw cancelledError();
         value = toolError(error);
       }
+      throwIfAborted(signal);
       conversation.push({
         role: "tool",
         tool_call_id: call.id,

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 const { buildChatRequestBody, serializeMessages } = await import("../providerClient.js");
-const { providerSupportsPluginTools } = await import("./toolChat.js");
+const { providerSupportsPluginTools, runPluginToolLoop } = await import("./toolChat.js");
 
 test("chat request bodies include tool definitions only for chat-completions providers", () => {
   const tools = [{
@@ -48,4 +48,19 @@ test("plugin tools are disabled for providers with incompatible protocols", () =
   assert.equal(providerSupportsPluginTools({ providerType: "openai_compatible", baseUrl: "https://api.example.com/v1" }, "test-model"), true);
   assert.equal(providerSupportsPluginTools({ providerType: "anthropic_compatible", baseUrl: "https://api.example.com/v1" }, "test-model"), false);
   assert.equal(providerSupportsPluginTools({ providerType: "watsonx", baseUrl: "https://api.example.com/v1" }, "test-model"), false);
+});
+
+test("an aborted request stops the plugin loop before any provider or tool call", async () => {
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(
+    runPluginToolLoop({
+      userId: "user-1",
+      provider: { providerType: "openai_compatible", baseUrl: "https://api.example.com/v1" },
+      model: "test-model",
+      messages: [{ role: "user", content: "search" }],
+      signal: controller.signal
+    }),
+    error => error.code === "cancelled" && /cancelled/i.test(error.message)
+  );
 });
