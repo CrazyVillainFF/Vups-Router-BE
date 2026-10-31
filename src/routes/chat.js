@@ -22,7 +22,6 @@ import {
   extractStreamText,
   isQuotaExhaustedError,
   normalizeBaseUrl,
-  providerSupportsToolCalling,
   redactSecrets,
   startChatCompletionStream,
   withProviderRetry
@@ -123,7 +122,20 @@ function validateMessages(value, { allowAssistantLast = false } = {}) {
 // edit, run tests, read the failure, fix it, rerun. Each round is still bounded.
 const MAX_DESKTOP_STEPS = 12;
 const DESKTOP_RUN_TTL_MS = 10 * 60 * 1000;
+// The client replays the model's own previous tool calls on every round, and a
+// write_file call carries the whole file. A 14 KB script is ordinary work, not
+// a forged payload, so this bound matches the 200k the route already emits in
+// normalizeDesktopToolCalls. A smaller cap rejected the route's own history and
+// made every round after a large write fail with "not recognized".
+const MAX_DESKTOP_CALL_ARG_CHARS = 200000;
 const desktopRuns = new Map();
+
+// A run expires only after it has been idle, never mid-task. Steps that take
+// longer than the TTL (a long build, a slow approval) used to delete their own
+// run, which silently reset the round budget and the quota marker.
+export function desktopRunExpired(run, now = Date.now()) {
+  return now - (run?.lastUsedAt || run?.createdAt || 0) > DESKTOP_RUN_TTL_MS;
+}
 
 function validDesktopRunId(value) {
   return typeof value === "string" && /^[A-Za-z0-9_-]{8,80}$/.test(value.trim());
@@ -151,16 +163,27 @@ function validateDesktopMessages(value) {
       const toolCalls = Array.isArray(entry?.tool_calls) ? entry.tool_calls : [];
       if (toolCalls.length > 5) return "The assistant can request at most five local tools per step.";
       if (content.length > MAX_ASSISTANT_MESSAGE_CHARS) return "A single assistant message is too large.";
+      let unknownTool = false;
+      let oversizedCall = false;
       const normalizedCalls = toolCalls.map((call, index) => {
         const name = typeof call?.function?.name === "string" ? call.function.name : "";
-        if (!isDesktopToolName(name)) return null;
+        if (!isDesktopToolName(name)) {
+          unknownTool = true;
+          return null;
+        }
         const id = typeof call?.id === "string" && call.id.trim()
           ? call.id.trim().slice(0, 120)
           : `desktop_call_${index}`;
         const args = typeof call?.function?.arguments === "string" ? call.function.arguments : "{}";
-        if (args.length > 12000) return null;
+        if (args.length > MAX_DESKTOP_CALL_ARG_CHARS) {
+          oversizedCall = true;
+          return null;
+        }
+        total += args.length;
         return { id, type: "function", function: { name, arguments: args } };
       });
+      if (unknownTool) return "A previous tool call names a local tool this server does not offer.";
+      if (oversizedCall) return "A previous tool call is larger than the server can replay.";
       if (normalizedCalls.some(call => !call)) return "A previous tool call is not recognized.";
       if (!content.trim() && normalizedCalls.length === 0) return "An assistant message cannot be empty.";
       messages.push({
@@ -190,7 +213,7 @@ function validateDesktopMessages(value) {
 function cleanupDesktopRuns() {
   const now = Date.now();
   for (const [id, run] of desktopRuns) {
-    if (now - run.createdAt > DESKTOP_RUN_TTL_MS) desktopRuns.delete(id);
+    if (desktopRunExpired(run, now)) desktopRuns.delete(id);
   }
 }
 
@@ -2063,6 +2086,9 @@ router.post("/desktop-tools", requireAuth, chatRateLimiter, async (req, res, nex
     if (run?.busy) {
       return res.status(409).json({ message: "This desktop tool run is already waiting for a model response.", code: "run_busy" });
     }
+    // Every accepted round proves the run is alive, so idleness — not total age
+    // — is what expires it.
+    if (run) run.lastUsedAt = Date.now();
 
     const validated = validateDesktopMessages(body.messages);
     if (typeof validated === "string") return sendValidationFailure(res, validated);
@@ -2114,18 +2140,16 @@ router.post("/desktop-tools", requireAuth, chatRateLimiter, async (req, res, nex
     if (!model) {
       return res.status(400).json({ message: "Select a model before using local filesystem tools.", code: "no_model" });
     }
-    if (!providerSupportsToolCalling(provider, model)) {
-      return res.status(400).json({
-        message: "This model's provider does not support tool calling in VupsRouter. Choose an OpenAI-compatible chat model to use local Windows filesystem tools.",
-        code: "tool_calling_unsupported"
-      });
-    }
+    // Every provider reaches the same registry: Anthropic and Responses use
+    // native tool blocks, text-only providers use the validated protocol.
+    // The selected model never gates whether local tools exist.
 
     if (!run) {
       run = {
         userId: req.userId,
         conversationId: requestedConversationId,
         createdAt: Date.now(),
+        lastUsedAt: Date.now(),
         steps: 0,
         quotaConsumed: false,
         busy: false

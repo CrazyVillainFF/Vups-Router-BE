@@ -4,7 +4,7 @@ import { test } from "node:test";
 const { buildChatRequestBody, serializeMessages } = await import("../providerClient.js");
 const { providerSupportsPluginTools, runPluginToolLoop } = await import("./toolChat.js");
 
-test("chat request bodies include tool definitions only for chat-completions providers", () => {
+test("chat request bodies carry tool definitions in each provider's own shape", () => {
   const tools = [{
     type: "function",
     function: {
@@ -31,7 +31,14 @@ test("chat request bodies include tool definitions only for chat-completions pro
     tools,
     toolChoice: "auto"
   });
-  assert.equal(responses.tools, undefined);
+  assert.deepEqual(responses.tools, [{
+    type: "function",
+    name: "plugin__wikipedia__search",
+    description: "Search Wikipedia",
+    parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
+    strict: false
+  }]);
+  assert.equal(responses.tool_choice, "auto");
 });
 
 test("tool calls and tool results survive message serialization", () => {

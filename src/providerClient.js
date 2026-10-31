@@ -1237,23 +1237,52 @@ async function qoderCompletion(params, signal) {
       }
     }
   }
-  if (!content) {
+  // Qoder has no tool channel, so an ordinary answer and a tool request both
+  // arrive as text. The same validator and registry that guard every other
+  // transport decide whether a block is a real call.
+  const parsed = Array.isArray(params?.tools) && params.tools.length > 0
+    ? parseTextToolCalls(content, params.tools)
+    : { content, toolCalls: [] };
+  if (!parsed.content && parsed.toolCalls.length === 0) {
     throw new ProviderError("Qoder Cloud Agents returned an empty response.", null, "empty_response");
   }
-  return { content, finishReason: "stop" };
+  return {
+    content: parsed.content,
+    toolTransport: "text",
+    finishReason: parsed.toolCalls.length > 0 ? "tool_calls" : "stop",
+    ...(parsed.toolCalls.length > 0
+      ? {
+        toolCalls: parsed.toolCalls,
+        assistantMessage: {
+          role: "assistant",
+          content: parsed.content || null,
+          tool_calls: parsed.toolCalls
+        }
+      }
+      : {})
+  };
 }
 
 // ─── end Qoder helpers ──────────────────────────────────────────────────────
 
-// OpenAI Responses can be selected explicitly, or inferred for AgentRouter's
-// GPT models. Anthropic and every other provider use their own endpoint.
-export function providerSupportsToolCalling(provider, model) {
-  const type = normalizeProviderType(provider?.providerType);
-  if (type === "anthropic_compatible" || type === "watsonx" || type === "qoder_cloud_agents") return false;
+// Every provider reaches the same tool registry through one of four
+// transports. Native tool calling is used where the provider documents it;
+// providers without it get the validated text protocol below, so the selected
+// model never decides whether local tools exist.
+export function resolveToolTransport(baseUrl, model, providerType = "openai_compatible") {
+  const type = normalizeProviderType(providerType);
+  if (type === "qoder_cloud_agents") return "text";
+  if (type === "watsonx" && !isOpenCodeZenBase(baseUrl)) return "text";
+  if (usesAnthropicApi(baseUrl, model, type)) return "anthropic";
+  if (usesResponsesApi(baseUrl, model, type)) return "openai_responses";
+  return "openai_chat";
+}
+
+export function toolTransportFor(provider, model) {
   try {
-    return !usesResponsesApi(provider?.baseUrl, model, type);
+    return resolveToolTransport(provider?.baseUrl, model, provider?.providerType);
   } catch {
-    return false;
+    return "openai_chat";
   }
 }
 
@@ -2283,20 +2312,53 @@ export function serializeMessages(messages) {
 }
 
 function serializeResponsesMessages(messages) {
-  return serializeMessages(messages).map(message => {
-    if (typeof message.content === "string") return message;
+  const items = [];
+  for (const message of messages) {
+    if (message.role === "tool") {
+      items.push({
+        type: "function_call_output",
+        call_id: String(message.tool_call_id || ""),
+        output: typeof message.content === "string" ? message.content : ""
+      });
+      continue;
+    }
+    if (message.role === "assistant" && Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+      if (typeof message.content === "string" && message.content.trim()) {
+        items.push({ role: "assistant", content: [{ type: "output_text", text: message.content }] });
+      }
+      message.tool_calls.forEach((call, index) => {
+        const name = call?.function?.name;
+        if (typeof name !== "string" || !name) return;
+        items.push({
+          type: "function_call",
+          call_id: typeof call.id === "string" && call.id ? call.id : `call_${index}`,
+          name,
+          arguments: typeof call.function.arguments === "string" ? call.function.arguments : "{}"
+        });
+      });
+      continue;
+    }
+    const images = Array.isArray(message.images) ? message.images : [];
+    if (images.length === 0 && typeof message.content === "string") {
+      items.push({ role: message.role, content: message.content });
+      continue;
+    }
     // The Responses API only accepts output_text parts on assistant turns;
     // input_text is a request-side type and is rejected in history.
     const textType = message.role === "assistant" ? "output_text" : "input_text";
-    return {
-      role: message.role,
-      content: message.content.map(part => (
-        part.type === "image_url"
-          ? { type: "input_image", image_url: part.image_url?.url ?? "" }
-          : { type: textType, text: part.text ?? "" }
-      ))
-    };
-  });
+    const parts = [];
+    if (typeof message.content === "string" && message.content.length > 0) {
+      parts.push({ type: textType, text: message.content });
+    } else if (Array.isArray(message.content)) {
+      for (const part of message.content) {
+        if (part?.type === "image_url") parts.push({ type: "input_image", image_url: part.image_url?.url ?? "" });
+        else parts.push({ type: textType, text: part?.text ?? "" });
+      }
+    }
+    for (const image of images) parts.push({ type: "input_image", image_url: imageSourceUrl(image) });
+    items.push({ role: message.role, content: parts.length > 0 ? parts : "" });
+  }
+  return items;
 }
 
 function parseImageDataUrl(value) {
@@ -2305,28 +2367,84 @@ function parseImageDataUrl(value) {
   return { mediaType: match[1], data: match[2].replace(/\s+/g, "") };
 }
 
-function serializeAnthropicMessages(messages) {
-  return messages
-    .filter(message => message.role !== "system")
-    .map(message => {
-      const parts = [];
-      if (typeof message.content === "string" && message.content.length > 0) {
-        parts.push({ type: "text", text: message.content });
-      }
-      for (const image of Array.isArray(message.images) ? message.images : []) {
-        const sourceUrl = imageSourceUrl(image);
-        const parsed = parseImageDataUrl(sourceUrl);
-        if (parsed) parts.push({ type: "image", source: { type: "base64", media_type: parsed.mediaType, data: parsed.data } });
-        else if (/^https:\/\//i.test(sourceUrl)) parts.push({ type: "image", source: { type: "url", url: sourceUrl } });
+function anthropicText(message) {
+  if (typeof message.content === "string") return message.content;
+  if (Array.isArray(message.content)) {
+    return message.content
+      .filter(part => part?.type === "text")
+      .map(part => (typeof part.text === "string" ? part.text : ""))
+      .join("");
+  }
+  return "";
+}
+
+function anthropicToolUseBlocks(toolCalls) {
+  return (Array.isArray(toolCalls) ? toolCalls : [])
+    .filter(call => typeof call?.function?.name === "string" && call.function.name)
+    .map((call, index) => {
+      let input = {};
+      const raw = call.function.arguments;
+      if (raw && typeof raw === "object" && !Array.isArray(raw)) input = raw;
+      else if (typeof raw === "string") {
+        try {
+          const parsed = JSON.parse(raw);
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) input = parsed;
+        } catch {
+          input = {};
+        }
       }
       return {
-        role: message.role === "assistant" ? "assistant" : "user",
-        content: parts.length > 0 ? parts : [{ type: "text", text: "(empty message)" }]
+        type: "tool_use",
+        id: typeof call.id === "string" && call.id ? call.id : `call_${index}`,
+        name: call.function.name,
+        input
       };
     });
 }
 
-export function buildAnthropicRequestBody({ model, messages, temperature, maxTokens, stream }) {
+// Anthropic requires alternating turns and answers a tool_use block with a
+// tool_result block in the next user turn, so consecutive same-role messages
+// are merged instead of dropped. Images and text keep their documented blocks.
+function serializeAnthropicMessages(messages) {
+  const turns = [];
+  const push = (role, blocks) => {
+    if (blocks.length === 0) return;
+    const last = turns[turns.length - 1];
+    if (last && last.role === role) last.content.push(...blocks);
+    else turns.push({ role, content: blocks });
+  };
+  for (const message of messages) {
+    if (message.role === "system") continue;
+    if (message.role === "tool") {
+      push("user", [{
+        type: "tool_result",
+        tool_use_id: String(message.tool_call_id || ""),
+        content: typeof message.content === "string" ? message.content : ""
+      }]);
+      continue;
+    }
+    const blocks = [];
+    const text = anthropicText(message);
+    if (text.length > 0) blocks.push({ type: "text", text });
+    for (const image of Array.isArray(message.images) ? message.images : []) {
+      const sourceUrl = imageSourceUrl(image);
+      const parsed = parseImageDataUrl(sourceUrl);
+      if (parsed) blocks.push({ type: "image", source: { type: "base64", media_type: parsed.mediaType, data: parsed.data } });
+      else if (/^https:\/\//i.test(sourceUrl)) blocks.push({ type: "image", source: { type: "url", url: sourceUrl } });
+    }
+    if (message.role === "assistant") blocks.push(...anthropicToolUseBlocks(message.tool_calls));
+    if (blocks.length === 0) {
+      // An assistant turn that only carried a now-empty tool call is skipped;
+      // an empty user turn still has to exist for the alternation to hold.
+      if (message.role !== "assistant") push("user", [{ type: "text", text: "(empty message)" }]);
+      continue;
+    }
+    push(message.role === "assistant" ? "assistant" : "user", blocks);
+  }
+  return turns;
+}
+
+export function buildAnthropicRequestBody({ model, messages, temperature, maxTokens, stream, tools = null, toolChoice = null }) {
   const system = messages
     .filter(message => message.role === "system" && typeof message.content === "string")
     .map(message => message.content)
@@ -2340,6 +2458,22 @@ export function buildAnthropicRequestBody({ model, messages, temperature, maxTok
   };
   if (system) body.system = system;
   if (typeof temperature === "number" && Number.isFinite(temperature)) body.temperature = Math.min(1, Math.max(0, temperature));
+  if (Array.isArray(tools) && tools.length > 0) {
+    body.tools = tools
+      .map(tool => {
+        const fn = tool?.function || tool;
+        if (typeof fn?.name !== "string" || !fn.name) return null;
+        return {
+          name: fn.name,
+          description: typeof fn.description === "string" ? fn.description : "",
+          input_schema: fn.parameters && typeof fn.parameters === "object" ? fn.parameters : { type: "object", properties: {} }
+        };
+      })
+      .filter(Boolean);
+    if (body.tools.length > 0 && typeof toolChoice === "string") {
+      body.tool_choice = { type: toolChoice === "required" ? "any" : toolChoice === "none" ? "none" : "auto" };
+    }
+  }
   return body;
 }
 
@@ -2358,6 +2492,138 @@ function anthropicFinishReason(payload) {
   return typeof reason === "string" ? reason : null;
 }
 
+// ─── text tool protocol ─────────────────────────────────────────────────────
+// Providers without a documented tool-calling format still reach the same
+// tools through an explicit, validated text block. Only names from the
+// registry supplied with this request are accepted; everything else stays
+// plain text and is never executed.
+const TEXT_TOOL_OPEN = "<vups_tool_call>";
+const TEXT_TOOL_CLOSE = "</vups_tool_call>";
+const TEXT_TOOL_BLOCK = /<vups_tool_call>\s*([\s\S]*?)\s*<\/vups_tool_call>/g;
+const TEXT_TOOL_MAX_CALLS = 5;
+let textToolCallSeq = 0;
+
+function toolNameSet(tools) {
+  const names = new Set();
+  for (const tool of Array.isArray(tools) ? tools : []) {
+    const name = tool?.function?.name ?? tool?.name;
+    if (typeof name === "string" && name) names.add(name);
+  }
+  return names;
+}
+
+function toolProtocolPrompt(tools) {
+  const signatures = (Array.isArray(tools) ? tools : [])
+    .map(tool => {
+      const fn = tool?.function || tool;
+      if (typeof fn?.name !== "string" || !fn.name) return "";
+      const properties = fn?.parameters?.properties && typeof fn.parameters.properties === "object" ? fn.parameters.properties : {};
+      const required = new Set(Array.isArray(fn?.parameters?.required) ? fn.parameters.required : []);
+      const fields = Object.keys(properties)
+        .map(key => `${key}${required.has(key) ? "" : "?"}:${properties[key]?.type || "value"}`)
+        .join(", ");
+      return `- ${fn.name}(${fields})`;
+    })
+    .filter(Boolean)
+    .join("\n");
+  return [
+    "Tool calls",
+    "This model connection has no native function-calling channel, so request a local tool by writing one block, exactly:",
+    `${TEXT_TOOL_OPEN}{"name":"read_file","arguments":{"path":"C:/Users/you/file.txt"}}${TEXT_TOOL_CLOSE}`,
+    `Write at most ${TEXT_TOOL_MAX_CALLS} blocks per reply, each on its own line, with no prose inside a block. The host validates the name against its registry, asks for permission the same way for every model, executes the call, and sends the result back as a [Tool result] message. Never invent a tool result, and never write a block for a tool outside this list:`,
+    signatures || "(no local tools are available in this request)"
+  ].join("\n");
+}
+
+// Tool history arrives in OpenAI shape. A text-only provider cannot read
+// tool_calls or a tool role, so prior calls are replayed as protocol blocks
+// and prior results as user-visible [Tool result] turns.
+function flattenToolHistory(messages) {
+  const namesById = new Map();
+  return (Array.isArray(messages) ? messages : []).map(message => {
+    if (message?.role === "assistant" && Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+      const blocks = message.tool_calls
+        .filter(call => typeof call?.function?.name === "string" && call.function.name)
+        .map(call => {
+          if (typeof call.id === "string" && call.id) namesById.set(call.id, call.function.name);
+          let args = call.function.arguments;
+          if (typeof args === "string") {
+            try {
+              args = JSON.parse(args);
+            } catch {
+              args = {};
+            }
+          }
+          if (!args || typeof args !== "object" || Array.isArray(args)) args = {};
+          return `${TEXT_TOOL_OPEN}${JSON.stringify({ name: call.function.name, arguments: args })}${TEXT_TOOL_CLOSE}`;
+        });
+      const content = [
+        typeof message.content === "string" ? message.content.trim() : "",
+        ...blocks
+      ].filter(Boolean).join("\n");
+      return { role: "assistant", content };
+    }
+    if (message?.role === "tool") {
+      const name = namesById.get(message.tool_call_id) || "tool";
+      return {
+        role: "user",
+        content: `[Tool result: ${name}]\n${typeof message.content === "string" ? message.content : ""}`
+      };
+    }
+    const { tool_calls, ...rest } = message || {};
+    return rest;
+  });
+}
+
+function withTextToolProtocol(messages, tools) {
+  if (!Array.isArray(tools) || tools.length === 0) return messages;
+  const prompt = toolProtocolPrompt(tools);
+  let attached = false;
+  const next = messages.map(message => {
+    if (!attached && message?.role === "system" && typeof message.content === "string") {
+      attached = true;
+      return { ...message, content: `${message.content}\n\n${prompt}` };
+    }
+    return message;
+  });
+  if (!attached) next.unshift({ role: "system", content: prompt });
+  return next;
+}
+
+export function parseTextToolCalls(content, tools) {
+  const text = typeof content === "string" ? content : "";
+  const names = toolNameSet(tools);
+  if (!text || names.size === 0) return { content: text, toolCalls: [] };
+  const toolCalls = [];
+  let stripped = text.replace(TEXT_TOOL_BLOCK, (block, body) => {
+    if (toolCalls.length >= TEXT_TOOL_MAX_CALLS) return block;
+    let parsed;
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      return block;
+    }
+    const name = typeof parsed?.name === "string" ? parsed.name.trim() : "";
+    // A name outside the tools supplied with this request stays visible text
+    // and is never executed.
+    if (!names.has(name)) return block;
+    let args = parsed?.arguments ?? {};
+    const argsText = typeof args === "string" ? args : JSON.stringify(args);
+    if (typeof argsText !== "string" || argsText.length > 200000) return block;
+    textToolCallSeq += 1;
+    toolCalls.push({
+      id: `text_call_${textToolCallSeq}`,
+      type: "function",
+      function: { name, arguments: argsText }
+    });
+    return "";
+  });
+  return {
+    content: stripped.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim(),
+    toolCalls
+  };
+}
+
 export function buildChatRequestBody({ model, messages, temperature, maxTokens, stream, responses = false, reasoning, tools = null, toolChoice = null, streamUsage = false }) {
   if (responses) {
     const instructions = messages
@@ -2369,6 +2635,25 @@ export function buildChatRequestBody({ model, messages, temperature, maxTokens, 
     const body = { model, input, stream };
     if (instructions) body.instructions = instructions;
     if (typeof maxTokens === "number" && Number.isFinite(maxTokens)) body.max_output_tokens = maxTokens;
+    if (Array.isArray(tools) && tools.length > 0) {
+      const flattened = tools
+        .map(tool => {
+          const fn = tool?.function || tool;
+          if (typeof fn?.name !== "string" || !fn.name) return null;
+          return {
+            type: "function",
+            name: fn.name,
+            description: typeof fn.description === "string" ? fn.description : "",
+            parameters: fn.parameters && typeof fn.parameters === "object" ? fn.parameters : { type: "object", properties: {} },
+            strict: false
+          };
+        })
+        .filter(Boolean);
+      if (flattened.length > 0) {
+        body.tools = flattened;
+        if (typeof toolChoice === "string") body.tool_choice = toolChoice;
+      }
+    }
     return body;
   }
   const body = { model, messages: serializeMessages(messages), stream };
@@ -2404,64 +2689,42 @@ function responsesFinishReason(payload) {
   return payload?.status === "completed" ? "stop" : null;
 }
 
-export async function chatCompletion({ baseUrl, apiKey, model, messages, temperature, maxTokens, providerType = "openai_compatible", authMode = "pat", openapiBaseUrl = "", reasoning, requestId = null, attempt = null, tools = null, toolChoice = null, conversationId = null }, signal) {
-  const type = normalizeProviderType(providerType);
-  if (type === "qoder_cloud_agents") {
-    return qoderCompletion({ baseUrl, apiKey, authMode, openapiBaseUrl, model, messages, conversationId, requestId, attempt }, signal);
-  }
-  const anthropic = usesAnthropicApi(baseUrl, model, type);
-  const watsonx = !isOpenCodeZenBase(baseUrl) && type === "watsonx";
-  const responses = !anthropic && !watsonx && usesResponsesApi(baseUrl, model, type);
-  const url = resolveChatEndpoint(baseUrl, model, type);
-  const context = { requestId, attempt, model };
-  const body = anthropic
-    ? buildAnthropicRequestBody({ model, messages, temperature, maxTokens, stream: false })
-    : watsonx
-      ? buildWatsonxRequestBody({ model, messages, temperature, maxTokens, stream: false, projectId: requireWatsonxProjectId(baseUrl) })
-      : buildChatRequestBody({ model, messages, temperature, maxTokens, stream: false, responses, reasoning, tools, toolChoice });
-
-  let response;
-  try {
-    response = await guardedProviderFetch(url, {
-      method: "POST",
-      headers: await authHeaders(apiKey, type, baseUrl),
-      body: JSON.stringify(body),
-      signal: signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS)
-    });
-  } catch (error) {
-    if (error?.name === "TimeoutError" || error?.name === "AbortError") {
-      // A caller stop is an outcome, not a slow provider: classifying it as a
-      // retryable timeout makes every retry loop try again after Stop. A
-      // composed deadline signal still aborts with the TimeoutError reason, so
-      // it keeps its retryable timeout meaning.
-      if (signal?.aborted && error?.name !== "TimeoutError") {
-        throw new ProviderError("Request cancelled.", null, "cancelled");
+function anthropicToolCalls(payload) {
+  if (!Array.isArray(payload?.content)) return [];
+  return payload.content
+    .filter(part => part?.type === "tool_use" && typeof part.name === "string" && part.name)
+    .map((part, index) => ({
+      id: typeof part.id === "string" && part.id ? part.id : `anthropic_call_${index}`,
+      type: "function",
+      function: {
+        name: part.name,
+        arguments: JSON.stringify(part.input && typeof part.input === "object" ? part.input : {})
       }
-      throw attachProviderDiagnostic(
-        new ProviderError("Timed out while waiting for the provider.", null, "timeout"),
-        { url, context, classification: { category: "timeout", classification: "transient", retryable: true } }
-      );
-    }
-    if (error instanceof ProviderError) throw error;
-    throw networkError(error, url, context);
-  }
-  if (!response.ok) {
-    const failure = await readJsonSafely(response);
-    throw providerHttpError(
-      url,
-      response.status,
-      failure,
-      parseRetryAfter(response.headers.get("retry-after")),
-      response.headers,
-      context
-    );
-  }
-  const payload = await readJsonSafely(response);
-  const content = anthropic ? extractAnthropicText(payload) : extractResponseText(payload);
-  const rawToolCalls = !anthropic && !responses && Array.isArray(payload?.choices?.[0]?.message?.tool_calls)
-    ? payload.choices[0].message.tool_calls
-    : [];
-  const toolCalls = rawToolCalls
+    }));
+}
+
+function responsesToolCalls(payload) {
+  if (!Array.isArray(payload?.output)) return [];
+  return payload.output
+    .filter(item => item?.type === "function_call" && typeof item.name === "string" && item.name)
+    .map((item, index) => ({
+      id: typeof item.call_id === "string" && item.call_id
+        ? item.call_id
+        : typeof item.id === "string" && item.id ? item.id : `responses_call_${index}`,
+      type: "function",
+      function: {
+        name: item.name,
+        arguments: typeof item.arguments === "string"
+          ? item.arguments
+          : JSON.stringify(item.arguments ?? {})
+      }
+    }));
+}
+
+function openAiToolCalls(payload) {
+  const calls = payload?.choices?.[0]?.message?.tool_calls;
+  if (!Array.isArray(calls)) return [];
+  return calls
     .filter(call => call?.type === "function" && call?.function?.name)
     .map(call => ({
       id: typeof call.id === "string" ? call.id : "",
@@ -2471,6 +2734,132 @@ export async function chatCompletion({ baseUrl, apiKey, model, messages, tempera
         arguments: typeof call.function.arguments === "string" ? call.function.arguments : "{}"
       }
     }));
+}
+
+// A model documented as tool-capable can still reject the tool fields — an
+// older snapshot, a proxy that strips them, or a model retired upstream. Only
+// that exact rejection switches the same turn to the text protocol; any other
+// 400 keeps its own honest message and is never retried as a tool request.
+function toolsTransportRejected(status, payload) {
+  if (status !== 400 && status !== 404 && status !== 422) return false;
+  const parts = [
+    payload?.error?.message,
+    payload?.message,
+    typeof payload?.error === "string" ? payload.error : "",
+    typeof payload === "string" ? payload : ""
+  ].filter(part => typeof part === "string");
+  return /\btools?\b|tool_choice|function[_ ]?calling|tool_use|unsupported/i.test(parts.join(" "));
+}
+
+export async function chatCompletion({ baseUrl, apiKey, model, messages, temperature, maxTokens, providerType = "openai_compatible", authMode = "pat", openapiBaseUrl = "", reasoning, requestId = null, attempt = null, tools = null, toolChoice = null, conversationId = null }, signal) {
+  const type = normalizeProviderType(providerType);
+  const hasTools = Array.isArray(tools) && tools.length > 0;
+  if (type === "qoder_cloud_agents") {
+    const qoderMessages = hasTools ? withTextToolProtocol(flattenToolHistory(messages), tools) : messages;
+    return qoderCompletion(
+      { baseUrl, apiKey, authMode, openapiBaseUrl, model, messages: qoderMessages, conversationId, requestId, attempt, tools: hasTools ? tools : null },
+      signal
+    );
+  }
+  const anthropic = usesAnthropicApi(baseUrl, model, type);
+  const watsonx = !isOpenCodeZenBase(baseUrl) && type === "watsonx";
+  const responses = !anthropic && !watsonx && usesResponsesApi(baseUrl, model, type);
+  const url = resolveChatEndpoint(baseUrl, model, type);
+  const context = { requestId, attempt, model };
+  const transport = resolveToolTransport(baseUrl, model, type);
+  // Text-only transports get the protocol prompt plus a flattened history;
+  // every other transport receives the native tool contract.
+  const textMessages = withTextToolProtocol(flattenToolHistory(messages), hasTools ? tools : null);
+  const buildBody = mode => {
+    const nativeTools = mode === "text" ? null : hasTools ? tools : null;
+    const outgoing = mode === "text" ? textMessages : messages;
+    if (anthropic) {
+      return buildAnthropicRequestBody({ model, messages: outgoing, temperature, maxTokens, stream: false, tools: nativeTools, toolChoice });
+    }
+    if (watsonx) {
+      return buildWatsonxRequestBody({ model, messages: outgoing, temperature, maxTokens, stream: false, projectId: requireWatsonxProjectId(baseUrl) });
+    }
+    return buildChatRequestBody({
+      model,
+      messages: outgoing,
+      temperature,
+      maxTokens,
+      stream: false,
+      responses,
+      reasoning,
+      tools: nativeTools,
+      toolChoice
+    });
+  };
+  const send = async requestBody => {
+    try {
+      return await guardedProviderFetch(url, {
+        method: "POST",
+        headers: await authHeaders(apiKey, type, baseUrl),
+        body: JSON.stringify(requestBody),
+        signal: signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+      });
+    } catch (error) {
+      if (error?.name === "TimeoutError" || error?.name === "AbortError") {
+        // A caller stop is an outcome, not a slow provider: classifying it as a
+        // retryable timeout makes every retry loop try again after Stop. A
+        // composed deadline signal still aborts with the TimeoutError reason, so
+        // it keeps its retryable timeout meaning.
+        if (signal?.aborted && error?.name !== "TimeoutError") {
+          throw new ProviderError("Request cancelled.", null, "cancelled");
+        }
+        throw attachProviderDiagnostic(
+          new ProviderError("Timed out while waiting for the provider.", null, "timeout"),
+          { url, context, classification: { category: "timeout", classification: "transient", retryable: true } }
+        );
+      }
+      if (error instanceof ProviderError) throw error;
+      throw networkError(error, url, context);
+    }
+  };
+
+  let activeTransport = transport;
+  let response = await send(buildBody(activeTransport));
+  if (!response.ok) {
+    const failure = await readJsonSafely(response);
+    const error = providerHttpError(
+      url,
+      response.status,
+      failure,
+      parseRetryAfter(response.headers.get("retry-after")),
+      response.headers,
+      context
+    );
+    if (!hasTools || activeTransport === "text" || !toolsTransportRejected(error.status, failure)) {
+      throw error;
+    }
+    activeTransport = "text";
+    response = await send(buildBody("text"));
+    if (!response.ok) {
+      const retryFailure = await readJsonSafely(response);
+      throw providerHttpError(
+        url,
+        response.status,
+        retryFailure,
+        parseRetryAfter(response.headers.get("retry-after")),
+        response.headers,
+        context
+      );
+    }
+  }
+  const payload = await readJsonSafely(response);
+  const providerContent = anthropic ? extractAnthropicText(payload) : extractResponseText(payload);
+  let content = providerContent;
+  let nativeToolCalls = [];
+  if (activeTransport === "anthropic" && anthropic) nativeToolCalls = anthropicToolCalls(payload);
+  else if (activeTransport === "openai_responses" && responses) nativeToolCalls = responsesToolCalls(payload);
+  else if (activeTransport === "openai_chat" && !anthropic && !responses) nativeToolCalls = openAiToolCalls(payload);
+  let toolCalls = nativeToolCalls;
+  if (activeTransport === "text" && hasTools) {
+    const parsed = parseTextToolCalls(providerContent, tools);
+    content = parsed.content;
+    toolCalls = parsed.toolCalls;
+  }
   if (content.length === 0 && toolCalls.length === 0) {
     const message = payload?.choices?.[0]?.message;
     const reasoned =
@@ -2494,6 +2883,7 @@ export async function chatCompletion({ baseUrl, apiKey, model, messages, tempera
   }
   return {
     content,
+    toolTransport: activeTransport,
     finishReason: anthropic
       ? anthropicFinishReason(payload)
       : responses ? responsesFinishReason(payload) : (typeof payload?.choices?.[0]?.finish_reason === "string" ? payload.choices[0].finish_reason : null),
@@ -2502,7 +2892,7 @@ export async function chatCompletion({ baseUrl, apiKey, model, messages, tempera
       assistantMessage: {
         role: "assistant",
         content: content || null,
-        tool_calls: rawToolCalls
+        tool_calls: toolCalls
       }
     } : {})
   };

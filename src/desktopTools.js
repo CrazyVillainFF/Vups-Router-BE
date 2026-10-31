@@ -230,7 +230,7 @@ export const DESKTOP_TOOLS = Object.freeze([
   ),
   fn(
     "launch_app",
-    "Launch a real installed application by name or by an absolute executable path, with optional arguments and working directory. Use find_app first when the name is uncertain. The result reports the real PID and whether the process is running. This launches the app; it cannot click buttons, type into it, or read its screen.",
+    "Launch a real installed application by name or by an absolute executable path, with optional arguments and working directory. Use find_app first when the name is uncertain. The result reports the real PID and whether the process is running. An app that hands off to an already-running instance (Chrome, Edge) leaves that instance's window open; list_processes reports the window PID you can close. This launches the app; it cannot click buttons, type into it, or read its screen.",
     {
       name: { type: "string", description: "Installed app name, for example Blender." },
       path: { type: "string", description: "Absolute executable path, an alternative to name." },
@@ -257,7 +257,7 @@ export const DESKTOP_TOOLS = Object.freeze([
   ),
   fn(
     "list_processes",
-    "List running applications that have a visible window, with PID, process name, window title, and whether VupsRouter manages the process. Entries with managed=true carry the processId usable with close_app or stop_command. Use it to check whether an app is already running. It cannot list every system service, and it cannot close anything VupsRouter did not launch.",
+    "List running applications that have a visible window, with PID, process name, window title, and close capability. Every entry has managed=true; canClose=true means close_app accepts its processId or numeric PID, even when VupsRouter did not launch it. launchedByVupsRouter marks processes VupsRouter started. Protected Windows processes cannot be closed. Use it to check whether an app is already running.",
     {
       name: { type: "string", description: "Optional process-name or window-title filter." },
       limit: { type: "integer", minimum: 1, maximum: 100 }
@@ -266,7 +266,7 @@ export const DESKTOP_TOOLS = Object.freeze([
   ),
   fn(
     "close_app",
-    "Ask an app that VupsRouter launched to close, using its processId. Graceful first; set force=true only when the user explicitly authorized termination and a graceful close did not work. Unrelated Windows processes are never touched, and this cannot close an app launched outside VupsRouter.",
+    "Ask any running app with a visible window to close, using its processId or numeric PID from list_processes. Works for apps VupsRouter did not launch. Graceful first, so the app can save; set force=true only when the user explicitly authorized termination and a graceful close did not work. Protected Windows processes and VupsRouter itself are refused.",
     {
       processId,
       force: {
@@ -335,7 +335,7 @@ Files and folders
 Apps and processes
 - Discover apps with list_installed_apps or find_app. The list comes from Windows App Paths and the Start Menu, not a fixed list. Do not claim an app is unavailable before checking.
 - Launch with launch_app. Report the real PID and running state from the result. Launching is not interacting: VupsRouter cannot click buttons, type into an app, or read its window. Never claim an app action happened inside the app, and never invent menu steps.
-- list_processes shows applications with visible windows. close_app can only close a process VupsRouter itself launched, using the processId it returned. Never try to close unrelated system processes, and never force-terminate without explicit user authorization.
+- list_processes reports every app with a visible window and whether it can be closed. Use close_app with the processId when present, otherwise the numeric pid; apps VupsRouter did not launch can be closed too. Prefer a graceful close, and never force-terminate without explicit user authorization. Protected Windows processes and VupsRouter itself are refused.
 - open_path and open_with_app open a file or folder in Windows for the user. open_url only opens http/https links in the default browser; VupsRouter has no browser automation, so it cannot navigate, click, type, or scrape a page.
 
 Terminal and development work

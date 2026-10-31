@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import http from "node:http";
 import { after, test } from "node:test";
 
 process.env.NODE_ENV = "test";
@@ -29,8 +30,47 @@ const server = app.listen(0, "127.0.0.1");
 await new Promise(resolve => server.once("listening", resolve));
 const baseURL = `http://127.0.0.1:${server.address().port}`;
 
+// A second provider speaks the Anthropic Messages protocol. The route-level
+// test below proves the same desktop tool registry is reachable through it,
+// not only through the OpenAI-compatible fake.
+const anthropicRequests = [];
+const anthropicServer = http.createServer((req, res) => {
+  let raw = "";
+  req.on("data", chunk => {
+    raw += chunk;
+  });
+  req.on("end", () => {
+    let body = null;
+    try {
+      body = raw ? JSON.parse(raw) : null;
+    } catch {
+      body = raw;
+    }
+    anthropicRequests.push({ method: req.method, url: req.url, headers: req.headers, body });
+    if (req.url === "/v1/messages" && req.method === "POST") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        id: "msg_route",
+        type: "message",
+        role: "assistant",
+        content: [
+          { type: "text", text: "Checking." },
+          { type: "tool_use", id: "toolu_route", name: "list_directory", input: { path: "C:/Users/Test" } }
+        ],
+        stop_reason: "tool_use"
+      }));
+      return;
+    }
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: { message: "No route" } }));
+  });
+});
+await new Promise(resolve => anthropicServer.listen(0, "127.0.0.1", resolve));
+const anthropicBaseURL = `http://127.0.0.1:${anthropicServer.address().port}`;
+
 after(async () => {
   await new Promise((resolve, reject) => server.close(error => (error ? reject(error) : resolve())));
+  await new Promise((resolve, reject) => anthropicServer.close(error => (error ? reject(error) : resolve())));
   await fakeProvider.close();
   await mongoose.disconnect();
   await mongod.stop();
@@ -106,6 +146,17 @@ async function newUser() {
 function lastProviderBody() {
   return fakeProvider.state.chatRequests.at(-1)?.body;
 }
+
+test("close_app promises to close any visible app, not only ones VupsRouter launched", async () => {
+  const { DESKTOP_TOOL_PROMPT, DESKTOP_TOOLS } = await import("./desktopTools.js");
+  const list = DESKTOP_TOOLS.find(tool => tool.function.name === "list_processes");
+  const close = DESKTOP_TOOLS.find(tool => tool.function.name === "close_app");
+  assert.match(list.function.description, /canClose=true/);
+  assert.match(list.function.description, /even when VupsRouter did not launch it/);
+  assert.match(close.function.description, /Works for apps VupsRouter did not launch/);
+  assert.match(close.function.description, /Protected Windows processes/);
+  assert.match(DESKTOP_TOOL_PROMPT, /apps VupsRouter did not launch can be closed too/);
+});
 
 test("the desktop route offers every native local tool and returns the model's calls", async () => {
   const cookie = await newUser();
@@ -262,7 +313,7 @@ test("an invented tool name in the assistant transcript is rejected before any p
   });
 
   assert.equal(response.status, 400);
-  assert.match(response.body.message, /not recognized/);
+  assert.match(response.body.message, /does not offer|not recognized/);
   assert.equal(fakeProvider.state.chatRequests.length, before);
 });
 
@@ -424,7 +475,7 @@ test("a rejected provider key on a tool turn is not retried and is not called bu
   fakeProvider.state.set({ invalidKey: false });
 });
 
-test("a malformed request on a tool turn is reported as itself, not as a busy model", async () => {
+test("a provider that rejects the tool fields gets one text-protocol retry, then the real error", async () => {
   const cookie = await newUser();
   fakeProvider.state.set({
     toolCalls: null,
@@ -442,8 +493,72 @@ test("a malformed request on a tool turn is reported as itself, not as a busy mo
   assert.equal(response.status, 400);
   assert.equal(response.body.code, "bad_request");
   assert.match(response.body.message, /tools is not supported/);
+  const requests = fakeProvider.state.chatRequests;
+  assert.equal(requests.length, 2, "one native attempt, then one text-protocol attempt");
+  assert.ok(Array.isArray(requests[0].body.tools), "the first attempt uses native tools");
+  assert.equal(requests[1].body.tools, undefined, "the compatibility attempt sends no tool fields");
+  assert.match(
+    String(requests[1].body.messages[0].content),
+    /<vups_tool_call>/,
+    "the compatibility attempt carries the validated text protocol"
+  );
+  fakeProvider.state.set({ chatStatus: 200, chatErrorPayload: null });
+});
+
+test("a permanent 400 unrelated to tools is reported at once and never retried", async () => {
+  const cookie = await newUser();
+  fakeProvider.state.set({
+    toolCalls: null,
+    chatResponseText: "unused",
+    chatStatus: 400,
+    chatErrorPayload: { error: { message: "Invalid model: not a valid model ID." } }
+  });
+
+  const response = await api("/api/chat/desktop-tools", {
+    method: "POST",
+    cookie,
+    body: { runId: runId("modelbad"), messages: [{ role: "user", content: "List my Downloads folder." }] }
+  });
+
+  assert.equal(response.status, 400);
+  assert.equal(response.body.code, "invalid_model");
+  assert.match(response.body.message, /not a valid model ID/);
   assert.equal(fakeProvider.state.chatRequests.length, 1, "a permanent 400 must not be retried");
   fakeProvider.state.set({ chatStatus: 200, chatErrorPayload: null });
+});
+
+test("an Anthropic Messages provider reaches the same local tool registry", async () => {
+  const { DESKTOP_TOOLS } = await import("./desktopTools.js");
+  const cookie = await signupUser("Anthropic Desktop Tester");
+  const saved = await api("/api/settings/provider", {
+    method: "PUT",
+    cookie,
+    body: {
+      provider: "Fake Anthropic",
+      baseUrl: anthropicBaseURL,
+      apiKey: "sk-ant-route-test-123456",
+      model: "claude-route-test",
+      providerType: "anthropic_compatible"
+    }
+  });
+  assert.equal(saved.status, 200);
+  anthropicRequests.length = 0;
+
+  const response = await api("/api/chat/desktop-tools", {
+    method: "POST",
+    cookie,
+    body: { runId: runId("anthropic"), messages: [{ role: "user", content: "List C:/Users/Test." }] }
+  });
+
+  assert.equal(response.status, 200, "the former tool_calling_unsupported gate is gone");
+  assert.equal(response.body.type, "tool_calls");
+  assert.equal(response.body.toolCalls.length, 1);
+  assert.equal(response.body.toolCalls[0].function.name, "list_directory");
+  assert.equal(anthropicRequests.length, 1);
+  assert.equal(anthropicRequests[0].url, "/v1/messages");
+  assert.equal(anthropicRequests[0].headers["anthropic-version"], "2023-06-01");
+  assert.equal(Array.isArray(anthropicRequests[0].body.tools), true);
+  assert.equal(anthropicRequests[0].body.tools.length, DESKTOP_TOOLS.length);
 });
 
 test("an exhausted retry budget says the model is unavailable and reports how hard it tried", async () => {
@@ -818,5 +933,95 @@ test("cancelling a tool turn stops the execution loop without a fabricated final
   });
   assert.notEqual(next.status, 409, "a cancelled run releases its busy slot");
   assert.equal(next.body.type, "final");
+});
+
+test("a write_file call as large as the file it wrote is replayed on the next round", async () => {
+  // Reproduced from the Windows app: script.js was 14,861 bytes, and the next
+  // tool round replayed its write_file call. The old 12,000-character replay
+  // cap rejected the route's own history, so the turn after a successful large
+  // write failed and every remaining file was lost.
+  const cookie = await newUser();
+  const id = runId("large-replay");
+  const fileBody = `const boot = ${JSON.stringify("x".repeat(14861))};\n`;
+  assert.ok(fileBody.length > 12000, "the fixture must exceed the old 12,000 cap");
+
+  fakeProvider.state.set({
+    toolCalls: [{ id: "call_write", name: "write_file", args: { path: "C:\\project\\Tested Folder\\script.js", content: fileBody } }]
+  });
+  const first = await api("/api/chat/desktop-tools", {
+    method: "POST",
+    cookie,
+    body: { runId: id, messages: [{ role: "user", content: "Build the page files." }] }
+  });
+  assert.equal(first.status, 200, JSON.stringify(first.body));
+  assert.equal(first.body.type, "tool_calls");
+  assert.equal(first.body.toolCalls[0].function.name, "write_file");
+  assert.ok(first.body.toolCalls[0].function.arguments.length > 12000);
+
+  fakeProvider.state.set({ toolCalls: null, chatResponseText: "The files are written." });
+  const second = await api("/api/chat/desktop-tools", {
+    method: "POST",
+    cookie,
+    body: {
+      runId: id,
+      messages: [
+        { role: "user", content: "Build the page files." },
+        first.body.assistantMessage,
+        {
+          role: "tool",
+          tool_call_id: "call_write",
+          content: JSON.stringify({ ok: true, data: { path: "C:\\project\\Tested Folder\\script.js", bytesWritten: fileBody.length } })
+        }
+      ]
+    }
+  });
+
+  assert.equal(second.status, 200, JSON.stringify(second.body));
+  assert.equal(second.body.type, "final");
+  const replayed = lastProviderBody().messages.find(message => message.role === "assistant" && message.tool_calls);
+  assert.equal(replayed.tool_calls[0].function.name, "write_file");
+  assert.ok(replayed.tool_calls[0].function.arguments.length > 12000, "the real file text reaches the model");
+});
+
+test("a replayed tool call above the replay bound gets its own honest message", async () => {
+  const cookie = await newUser();
+  const before = fakeProvider.state.chatRequests.length;
+  const response = await api("/api/chat/desktop-tools", {
+    method: "POST",
+    cookie,
+    body: {
+      runId: runId("oversized"),
+      messages: [
+        { role: "user", content: "Write an enormous file." },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [{
+            id: "call_huge",
+            type: "function",
+            function: { name: "write_file", arguments: JSON.stringify({ path: "C:\\huge.txt", content: "x".repeat(200001) }) }
+          }]
+        },
+        { role: "tool", tool_call_id: "call_huge", content: "{\"ok\":true}" }
+      ]
+    }
+  });
+
+  assert.equal(response.status, 400);
+  assert.match(response.body.message, /larger than the server can replay/i);
+  assert.equal(fakeProvider.state.chatRequests.length, before);
+});
+
+test("a desktop run expires from idleness, not total age", async () => {
+  const { desktopRunExpired } = await import("./routes/chat.js");
+  const now = Date.now();
+  const hour = 60 * 60 * 1000;
+  assert.equal(desktopRunExpired({ createdAt: now - hour }, now), true, "an idle run expires");
+  assert.equal(
+    desktopRunExpired({ createdAt: now - hour, lastUsedAt: now - 1000 }, now),
+    false,
+    "a run still receiving rounds stays alive past the TTL"
+  );
+  assert.equal(desktopRunExpired({ lastUsedAt: now - hour }, now), true);
 });
 
