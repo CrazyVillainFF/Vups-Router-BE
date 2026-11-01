@@ -230,7 +230,7 @@ function sendValidationFailure(res, message) {
   });
 }
 
-function parseMessageId(value) {
+export function parseMessageId(value) {
   return typeof value === "string" && /^[A-Za-z0-9_-]{1,80}$/.test(value.trim()) ? value.trim() : "";
 }
 
@@ -357,7 +357,7 @@ function chooseSavedConfig(candidates) {
   return { config: candidates[0], reason: null };
 }
 
-async function resolveProvider(userId, requestedModel, requestedConfigId, requestedSource = "", requestedProviderId = "") {
+export async function resolveProvider(userId, requestedModel, requestedConfigId, requestedSource = "", requestedProviderId = "") {
   // A gateway source is an explicit, whitelisted selection from the model
   // picker. Client input can never choose an upstream URL.
   if (requestedSource) {
@@ -580,7 +580,7 @@ function trimStoredMessages(messages) {
   }
   return kept;
 }
-async function persistConversation(userId, conversationId, messages, assistantText, assistant = {}) {
+export async function persistConversation(userId, conversationId, messages, assistantText, assistant = {}) {
   let conversation = null;
   if (conversationId && mongoose.isValidObjectId(conversationId)) {
     conversation = await Conversation.findOne({ _id: conversationId, userId });

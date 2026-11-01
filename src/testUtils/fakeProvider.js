@@ -57,6 +57,7 @@ export async function startFakeProvider() {
       nudgeToolCalls: null,
       nudgeResponseText: null,
       chatDelayMs: 0,
+      chatResponder: null,
       extraModels: [],
       acceptedKeys: null
     },
@@ -95,6 +96,7 @@ export async function startFakeProvider() {
       state.behavior.nudgeToolCalls = null;
       state.behavior.nudgeResponseText = null;
       state.behavior.chatDelayMs = 0;
+      state.behavior.chatResponder = null;
       state.behavior.extraModels = [];
       state.behavior.acceptedKeys = null;
     }
@@ -253,7 +255,12 @@ export async function startFakeProvider() {
             }]
           });
         }
-        const content = state.behavior.chatResponseText ?? `Echo from ${model}: ${body.messages.at(-1)?.content ?? ""}`;
+        const custom = typeof state.behavior.chatResponder === "function"
+          ? state.behavior.chatResponder(body, model)
+          : null;
+        const content = typeof custom === "string"
+          ? custom
+          : state.behavior.chatResponseText ?? `Echo from ${model}: ${body.messages.at(-1)?.content ?? ""}`;
         return json(res, 200, {
           id: "chatcmpl-fake",
           model,

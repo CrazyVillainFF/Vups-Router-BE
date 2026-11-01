@@ -12,6 +12,7 @@ import passwordResetRoutes from "./routes/passwordReset.js";
 import settingsRoutes from "./routes/settings.js";
 import conversationsRoutes from "./routes/conversations.js";
 import chatRoutes from "./routes/chat.js";
+import comboRoutes from "./routes/combo.js";
 import imageRoutes from "./routes/images.js";
 import adminRoutes from "./routes/admin.js";
 import pluginRoutes from "./routes/plugins.js";
@@ -110,7 +111,11 @@ app.use("/api", (_req, res, next) => {
 const defaultJsonParser = express.json({ limit: "512kb" });
 const chatJsonParser = express.json({ limit: chatJsonBodyLimit() });
 app.use((req, res, next) => {
-  const isChatRoute = req.path === "/api/chat" || req.path.startsWith("/api/chat/");
+  const isChatRoute =
+    req.path === "/api/chat" ||
+    req.path.startsWith("/api/chat/") ||
+    req.path === "/api/combo/chat" ||
+    req.path.startsWith("/api/combo/chat/");
   return (isChatRoute ? chatJsonParser : defaultJsonParser)(req, res, next);
 });
 app.use(requireJsonBody);
@@ -179,6 +184,7 @@ app.use("/api", passwordResetRoutes);
 app.use("/api/settings", settingsRoutes);
 app.use("/api/conversations", conversationsRoutes);
 app.use("/api/chat", chatRoutes);
+app.use("/api/combo", comboRoutes);
 app.use("/api/images", imageRoutes);
 app.use("/api/plugins", pluginRoutes);
 app.use("/api/admin", adminRoutes);
