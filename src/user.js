@@ -5,6 +5,10 @@ const userSchema = new mongoose.Schema({
   email: { type: String, required: true, lowercase: true, trim: true, unique: true },
   passwordHash: { type: String, required: true, select: false },
   passwordChangedAt: { type: Date, default: null },
+  // Consent evidence: when the signup form's acceptance was received, and which
+  // version of the policies was on the legal pages at that moment.
+  termsAcceptedAt: { type: Date, default: null },
+  termsVersion: { type: String, default: null },
   resetCodeHash: { type: String, default: undefined, select: false },
   resetCodeExpires: { type: Date, default: undefined, select: false },
   resetAttempts: { type: Number, default: 0, select: false },

@@ -137,7 +137,9 @@ test("every provider type resolves to a supported tool transport", () => {
   assert.equal(resolveToolTransport("https://api.openai.com/v1", "gpt-5.6-sol", "openai_responses"), "openai_responses");
   assert.equal(resolveToolTransport("https://api.anthropic.com", "claude-sol", "anthropic_compatible"), "anthropic");
   assert.equal(resolveToolTransport("https://us-south.ml.cloud.ibm.com?project_id=p", "granite", "watsonx"), "text");
-  assert.equal(resolveToolTransport("https://api.example.com", "qoder-model", "qoder_cloud_agents"), "text");
+  // Qoder registers the registry as custom tools on its agent, so it has a
+  // native call channel of its own rather than the text protocol.
+  assert.equal(resolveToolTransport("https://api.example.com", "qoder-model", "qoder_cloud_agents"), "qoder_custom");
   assert.equal(resolveToolTransport("https://agentrouter.org", "gpt-5.6-sol", "openai_compatible"), "openai_responses");
   assert.equal(resolveToolTransport("https://co.agentrouter.org", "gpt-5.6-sol", "openai_compatible"), "openai_chat");
   assert.equal(resolveToolTransport("https://opencode.ai/inference", "claude-sonnet-4", "openai_compatible"), "anthropic");

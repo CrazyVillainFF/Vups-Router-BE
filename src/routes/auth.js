@@ -1,5 +1,5 @@
 ﻿import { Router } from "express";
-import { createToken, hashPassword, passwordMatches, validateSignin, validateSignup } from "../auth.js";
+import { consentPolicyVersion, createToken, hashPassword, passwordMatches, validateSignin, validateSignup } from "../auth.js";
 import connectToDatabase from "../db.js";
 import User from "../user.js";
 import { dailyQuota } from "../usage.js";
@@ -27,7 +27,13 @@ router.post("/signup", authRateLimiter, async (req, res, next) => {
     const email = input.email.trim().toLowerCase();
     const existing = await User.findOne({ email }).select("_id");
     if (existing) return res.status(409).json({ message: "An account with that email already exists." });
-    const user = new User({ name: input.name.trim(), email, passwordHash: await hashPassword(input.password) });
+    const user = new User({
+      name: input.name.trim(),
+      email,
+      passwordHash: await hashPassword(input.password),
+      termsAcceptedAt: new Date(),
+      termsVersion: consentPolicyVersion(input.termsVersion)
+    });
     await user.save();
     const secret = getJwtSecret();
     if (!secret) return res.status(500).json({ message: "Authentication is not configured on the server." });

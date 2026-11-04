@@ -70,7 +70,7 @@ async function signupUser() {
   const email = uniqueEmail();
   const response = await api("/api/auth/signup", {
     method: "POST",
-    body: { name: "Context Tester", email, password: "correct-horse-battery" }
+    body: { name: "Context Tester", email, password: "correct-horse-battery", acceptTerms: true }
   });
   assert.equal(response.status, 201);
   return sessionCookie(response);

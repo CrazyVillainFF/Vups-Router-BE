@@ -22,7 +22,7 @@ test("health reports a degraded service when MongoDB is not configured", async (
     const signup = await fetch(`${baseURL}/api/auth/signup`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: "Alex", email: "alex@example.com", password: "correct-horse-battery" })
+      body: JSON.stringify({ name: "Alex", email: "alex@example.com", password: "correct-horse-battery", acceptTerms: true })
     });
     assert.equal(signup.status, 503);
     const signupBody = await signup.json();

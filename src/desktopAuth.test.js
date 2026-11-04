@@ -63,7 +63,7 @@ async function api(path, { method = "GET", body, cookie } = {}) {
 async function signedInUser() {
   const response = await api("/api/auth/signup", {
     method: "POST",
-    body: { name: "Handoff Tester", email: uniqueEmail(), password: "handoff-pass-123" }
+    body: { name: "Handoff Tester", email: uniqueEmail(), password: "handoff-pass-123", acceptTerms: true }
   });
   assert.equal(response.status, 201);
   const cookie = response.cookie.split(";")[0];

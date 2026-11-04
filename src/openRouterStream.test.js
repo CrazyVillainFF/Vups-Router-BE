@@ -79,7 +79,7 @@ function sessionCookie(response) {
 async function signupUser(label = "stream") {
   const response = await api("/api/auth/signup", {
     method: "POST",
-    body: { name: `OpenRouter ${label}`, email: uniqueEmail(), password: "correct-horse-battery" }
+    body: { name: `OpenRouter ${label}`, email: uniqueEmail(), password: "correct-horse-battery", acceptTerms: true }
   });
   assert.equal(response.status, 201);
   return sessionCookie(response);

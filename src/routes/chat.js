@@ -2217,7 +2217,10 @@ router.post("/desktop-tools", requireAuth, chatRateLimiter, async (req, res, nex
               reasoning: provider.reasoning,
               tools: DESKTOP_TOOLS,
               toolChoice: "auto",
-              conversationId: requestedConversationId,
+              // A brand new chat has no conversation id yet, and Qoder resumes
+              // its paused session per conversation, so the run id stands in
+              // until the chat document exists.
+              conversationId: requestedConversationId || runId,
               requestId: req.requestId,
               attempt: attempt + 1
             },
@@ -2519,7 +2522,8 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
           maxTokens: provider.maxTokens,
           reasoning: provider.reasoning,
           signal: turnSignal,
-          requestId: req.requestId
+          requestId: req.requestId,
+          conversationId: prospectiveId
         });
       } catch (error) {
         if (halted.signal.aborted) return;
@@ -2639,7 +2643,8 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
         maxTokens: provider.maxTokens,
         reasoning: provider.reasoning,
         signal: controller.signal,
-        requestId: req.requestId
+        requestId: req.requestId,
+        conversationId: prospectiveId
       });
     } catch (error) {
       if (controller.signal.aborted) return;

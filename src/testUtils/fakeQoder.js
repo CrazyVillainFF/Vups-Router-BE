@@ -70,6 +70,14 @@ export async function startFakeQoder() {
     dropAfterFrames: 0,
     holdOpen: false,
     replayBuffered: false,
+    // Tool scripting: each step runs in order inside one turn. A tools step
+    // pauses the session until every call has a result; a text step ends it.
+    toolScript: [],
+    toolCalls: [],
+    toolResults: [],
+    unknownToolResults: [],
+    pausedMessages: [],
+    toolSeq: 0,
     clearRequests() {
       // Mutates in place so test files can keep a stable reference to the log.
       state.requests.length = 0;
@@ -95,6 +103,12 @@ export async function startFakeQoder() {
       state.dropAfterFrames = 0;
       state.holdOpen = false;
       state.replayBuffered = false;
+      state.toolScript = [];
+      state.toolCalls.length = 0;
+      state.toolResults.length = 0;
+      state.unknownToolResults.length = 0;
+      state.pausedMessages.length = 0;
+      state.toolSeq = 0;
       turnWaiters.clear();
       readyTurns.clear();
     },
@@ -160,6 +174,66 @@ export async function startFakeQoder() {
     await Promise.race([gate, new Promise(done => setTimeout(done, 3000))]);
     const stale = waiting.indexOf(release);
     if (stale !== -1) waiting.splice(stale, 1);
+  }
+
+  // Tool turns need a second channel: the write loop of an open stream has to
+  // learn about frames pushed while it is parked between events.
+  const frameWaiters = new Map();
+  function wakeFrames(sessionId) {
+    const waiting = frameWaiters.get(sessionId);
+    if (waiting?.length) waiting.shift()();
+  }
+  async function waitFrames(sessionId, ms = 1000) {
+    let release;
+    const gate = new Promise(done => {
+      release = done;
+    });
+    if (!frameWaiters.has(sessionId)) frameWaiters.set(sessionId, []);
+    const waiting = frameWaiters.get(sessionId);
+    waiting.push(release);
+    await Promise.race([gate, new Promise(done => setTimeout(done, ms))]);
+    const stale = waiting.indexOf(release);
+    if (stale !== -1) waiting.splice(stale, 1);
+  }
+  function pushFrame(session, event, data) {
+    session.frames.push({ event, data });
+    wakeFrames(session.id);
+  }
+  // Runs the next scripted step: tools pause the turn, text ends it.
+  function runToolStep(session) {
+    const step = session.script?.[session.step];
+    if (!step) {
+      session.done = true;
+      wakeFrames(session.id);
+      return;
+    }
+    const calls = Array.isArray(step.tools) ? step.tools : [];
+    if (calls.length === 0) {
+      pushFrame(session, "agent.message", {
+        id: `evt_msg_${session.step}`,
+        type: "agent.message",
+        content: [{ type: "text", text: typeof step.text === "string" ? step.text : FAKE_QODER_REPLY }],
+        processed_at: "2026-05-18T03:40:51Z"
+      });
+      session.done = true;
+      wakeFrames(session.id);
+      return;
+    }
+    for (const call of calls) {
+      state.toolSeq += 1;
+      const customToolUseId = call.customToolUseId || `ctu_${state.toolSeq}`;
+      const input = call.input && typeof call.input === "object" ? call.input : {};
+      session.pending.set(customToolUseId, { name: call.name, input, result: null });
+      state.toolCalls.push({ sessionId: session.id, customToolUseId, name: call.name, input });
+      pushFrame(session, "agent.custom_tool_use", {
+        id: `evt_ctu_${state.toolSeq}`,
+        type: "agent.custom_tool_use",
+        custom_tool_use_id: customToolUseId,
+        name: call.name,
+        input,
+        processed_at: "2026-05-18T03:40:51Z"
+      });
+    }
   }
 
   const server = http.createServer(async (req, res) => {
@@ -271,7 +345,9 @@ export async function startFakeQoder() {
         name: body?.name,
         model: body?.model,
         system: body?.system,
-        tools: [],
+        // Whatever the adapter registered is what this agent can call; omitting
+        // `tools` is what leaves Qoder's own sandbox tools enabled.
+        tools: Array.isArray(body?.tools) ? body.tools : [],
         version: 1,
         archived_at: null
       };
@@ -284,7 +360,18 @@ export async function startFakeQoder() {
       }
       state.sessionSeq += 1;
       const id = state.sessionSeq === 1 ? "sess_test" : `sess_test_${state.sessionSeq}`;
-      const session = { id, agent: body.agent, environmentId: body.environment_id, status: "idle", content: [] };
+      const session = {
+        id,
+        agent: body.agent,
+        environmentId: body.environment_id,
+        status: "idle",
+        content: [],
+        frames: [],
+        pending: new Map(),
+        script: null,
+        step: 0,
+        done: false
+      };
       state.sessions.push(session);
       return json(res, 200, { id, type: "session", status: "idle", agent: { id: body.agent, model: body.model }, environment_id: body.environment_id });
     }
@@ -296,14 +383,59 @@ export async function startFakeQoder() {
         return json(res, 404, { type: "error", error: { type: "not_found_error", message: "Session not found." } });
       }
       if (suffix === "/events" && req.method === "POST") {
-        const eventType = body?.events?.[0]?.type;
+        const events = Array.isArray(body?.events) ? body.events : [];
+        const eventType = events[0]?.type;
         if (eventType === "user.interrupt") {
           state.interrupts.push(session.id);
           session.status = "idle";
+          session.pending.clear();
+          session.script = null;
+          session.done = true;
           return json(res, 200, { data: [{ id: `evt_interrupt_${state.interrupts.length}`, type: "user.interrupt", processed_at: "2026-05-18T03:40:50Z" }] });
+        }
+        if (eventType === "user.custom_tool_result") {
+          for (const event of events) {
+            const pending = session.pending.get(event?.custom_tool_use_id);
+            if (!pending) {
+              state.unknownToolResults.push(event?.custom_tool_use_id);
+              return json(res, 400, {
+                type: "error",
+                error: { type: "invalid_request_error", message: `Unknown custom_tool_use_id "${event?.custom_tool_use_id}".` }
+              });
+            }
+            if (pending.result !== null) {
+              state.unknownToolResults.push(event?.custom_tool_use_id);
+              return json(res, 400, {
+                type: "error",
+                error: { type: "invalid_request_error", message: `custom_tool_use_id "${event?.custom_tool_use_id}" was already answered.` }
+              });
+            }
+            pending.result = event?.content;
+            state.toolResults.push({
+              sessionId: session.id,
+              customToolUseId: event.custom_tool_use_id,
+              content: event.content,
+              isError: event.is_error === true
+            });
+          }
+          if ([...session.pending.values()].every(entry => entry.result !== null)) {
+            session.pending.clear();
+            session.step += 1;
+            runToolStep(session);
+          }
+          signalTurn(session.id);
+          return json(res, 200, { data: events.map((event, index) => ({ id: `evt_ctr_${index}`, type: event.type })) });
         }
         if (eventType !== "user.message") {
           return json(res, 400, { type: "error", error: { type: "invalid_request_error", message: "Unsupported event type." } });
+        }
+        // A paused turn accepts no new message until its tool results arrive.
+        if (session.pending.size > 0) {
+          state.pausedMessages.push(session.id);
+          return json(res, 409, {
+            type: "error",
+            error: { type: "invalid_request_error", message: "Session is paused waiting for custom tool results." }
+          });
         }
         if (state.busyOnce > 0) {
           state.busyOnce -= 1;
@@ -315,14 +447,59 @@ export async function startFakeQoder() {
         if (state.eventsStatus) {
           return json(res, state.eventsStatus, { type: "error", error: { type: "api_error", message: `Injected events ${state.eventsStatus}.` } });
         }
-        session.content = body.events[0].content;
+        session.content = events[0].content;
         session.status = "running";
+        session.done = false;
+        session.frames = [];
+        session.script = state.toolScript.length > 0 ? state.toolScript.map(step => ({ ...step })) : null;
+        if (session.script) {
+          session.step = 0;
+          session.pending.clear();
+          runToolStep(session);
+        }
         signalTurn(session.id);
-        return json(res, 200, { data: [{ id: "evt_user", type: "user.message", content: body.events[0].content }] });
+        return json(res, 200, { data: [{ id: "evt_user", type: "user.message", content: events[0].content }] });
       }
       if (state.streamNotFoundOnce > 0 && req.method === "GET") {
         state.streamNotFoundOnce -= 1;
         return json(res, 404, { type: "error", error: { type: "not_found_error", message: "Session not found." } });
+      }
+      // A tool turn keeps its stream open while the agent is paused: the custom
+      // tool use frames arrive first, the result unblocks the next step, and
+      // session.status_idle only comes once the whole turn is finished.
+      if (suffix === "/events/stream" && req.method === "GET" && (session.script || state.toolScript.length > 0)) {
+        res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
+        res.on("error", () => {});
+        let closed = false;
+        res.on("close", () => {
+          closed = true;
+          wakeFrames(session.id);
+        });
+        res.write(": heartbeat\n\n");
+        // The adapter attaches the stream before posting, so a fresh connection
+        // waits for the message (or the tool result) that starts this turn.
+        if (session.frames.length === 0 && session.pending.size === 0 && !session.done) {
+          await awaitTurn(session.id);
+        }
+        while (!closed) {
+          while (session.frames.length > 0) {
+            const entry = session.frames.shift();
+            frame(res, entry.event, entry.data);
+          }
+          if (session.done) {
+            frame(res, "session.status_idle", {
+              id: "evt_idle",
+              type: "session.status_idle",
+              stop_reason: { type: "end_turn" },
+              processed_at: "2026-05-18T03:40:52Z"
+            });
+            session.status = "idle";
+            res.end();
+            return undefined;
+          }
+          await waitFrames(session.id);
+        }
+        return undefined;
       }
       if (suffix === "/events/stream" && req.method === "GET") {
         res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });

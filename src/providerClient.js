@@ -289,7 +289,7 @@ const QODER_CLOUD_SCOPE = "qca.access";
 const QODER_SAT_TTL_SECONDS = 3600;
 const QODER_SAT_REFRESH_MARGIN_MS = 60000;
 const QODER_AUTH_MODES = new Set(["pat", "service_account"]);
-const QODER_ROLE_LABELS = { user: "User", assistant: "Assistant", system: "System" };
+const QODER_ROLE_LABELS = { user: "User", assistant: "Assistant", system: "System", tool: "Tool result" };
 // Keyed on the credential fingerprint so two users of the same public host
 // never share an environment or an agent.
 const qoderEnvironmentCache = new Map();
@@ -306,9 +306,18 @@ const qoderSatPending = new Map();
 // one session instead of paying for a new sandbox on every message.
 const qoderSessionCache = new Map();
 const QODER_SESSION_TTL_MS = 30 * 60 * 1000;
+// A custom tool call pauses the session until its result is posted back to that
+// same session, so the call ids a session is waiting on are kept per session.
+const qoderPendingToolUses = new Map();
 // A dropped SSE connection is resumed from the last event id, which Qoder
 // documents as continuing delivery after that event.
 const QODER_STREAM_RECONNECTS = 2;
+// A turn paused on custom tools never reaches session.status_idle, so the
+// call batch is closed once Qoder has been quiet this long after the last call.
+const QODER_TOOL_WINDOW_MS = 250;
+// Same ceiling the text protocol and the desktop route apply. Every extra call
+// must still be answered, or the paused turn could never be resumed.
+const QODER_MAX_TOOL_CALLS = 5;
 
 export function qoderRegionForHost(hostname) {
   const host = String(hostname || "").toLowerCase();
@@ -822,12 +831,53 @@ async function qoderEnvironmentId(credentials, signal, context) {
   return qoderRemember(qoderEnvironmentCache, cacheKey, id);
 }
 
-// An agent fixes the model, so one agent per (credential, model) is reused.
-async function qoderAgentId(credentials, requestedModel, signal, context) {
+// Qoder Cloud Agents runs its own sandbox tools when an agent is created
+// without a `tools` list. VupsRouter never lets that sandbox act on the user's
+// machine; the central registry is registered as client-side custom tools
+// instead, so every call comes back here and passes through the same approval
+// policy as every other provider.
+function qoderCustomTools(tools) {
+  return (Array.isArray(tools) ? tools : [])
+    .map(tool => {
+      const fn = tool?.function || tool;
+      if (typeof fn?.name !== "string" || !fn.name) return null;
+      return {
+        type: "custom",
+        name: fn.name,
+        description: typeof fn.description === "string" ? fn.description : "",
+        input_schema: fn?.parameters && typeof fn.parameters === "object"
+          ? fn.parameters
+          : { type: "object", properties: {} }
+      };
+    })
+    .filter(Boolean);
+}
+
+// The agent stores its tools, so a different registry needs a different agent.
+// Sorting makes the signature independent of catalog order.
+function qoderToolSignature(customTools) {
+  if (!Array.isArray(customTools) || customTools.length === 0) return "none";
+  const normalized = customTools
+    .map(tool => ({ name: tool.name, description: tool.description, parameters: tool.input_schema }))
+    .sort((left, right) => left.name.localeCompare(right.name));
+  return createHash("sha256").update(JSON.stringify(normalized)).digest("hex").slice(0, 12);
+}
+
+function qoderAgentName(model, signature) {
+  const base = `VupsRouter ${model}`;
+  return signature === "none" ? base : `${base.slice(0, 220)} ${signature}`;
+}
+
+// An agent fixes the model and its tool list, so one agent per (credential,
+// model, registry signature) is reused.
+async function qoderAgentId(credentials, requestedModel, tools, signal, context) {
   const base = credentials.businessBase;
   const model = await qoderResolveModelId(credentials, requestedModel, signal, context);
-  const cacheKey = `${qoderCacheKey(credentials)}|${model}`;
+  const customTools = qoderCustomTools(tools);
+  const signature = qoderToolSignature(customTools);
+  const cacheKey = `${qoderCacheKey(credentials)}|${model}|${signature}`;
   if (qoderAgentCache.has(cacheKey)) return qoderAgentCache.get(cacheKey);
+  const wantedName = qoderAgentName(model, signature);
   let page = "";
   for (let attempt = 0; attempt < 5; attempt += 1) {
     const listUrl = new URL(qoderJoin(base, "agents"));
@@ -836,7 +886,9 @@ async function qoderAgentId(credentials, requestedModel, signal, context) {
     const listed = await qoderRequest(listUrl.toString(), { credentials }, signal, context);
     const payload = await readJsonSafely(listed);
     const match = (Array.isArray(payload?.data) ? payload.data : [])
-      .find(agent => agent?.archived_at === null && (agent?.model === model || agent?.model?.id === model));
+      .find(agent => agent?.archived_at === null
+        && (agent?.model === model || agent?.model?.id === model)
+        && agent?.name === wantedName);
     if (match?.id) return qoderRemember(qoderAgentCache, cacheKey, match.id);
     if (!payload?.has_more || !payload?.next_page) break;
     page = payload.next_page;
@@ -849,7 +901,14 @@ async function qoderAgentId(credentials, requestedModel, signal, context) {
     // this product never asks for, and inventing one would change how a reply is
     // produced on the user's credit. The matcher above already reads both shapes
     // back, so an agent tuned in the Qoder console is still reused.
-    body: { name: `VupsRouter ${model}`, model, system: "You are a helpful assistant." }
+    body: {
+      name: wantedName,
+      model,
+      system: "You are a helpful assistant.",
+      // Omitting the built-in toolset is what keeps Qoder's sandbox from acting
+      // on its own; only custom tools route back to VupsRouter.
+      ...(customTools.length > 0 ? { tools: customTools } : {})
+    }
   }, signal, context);
   const id = (await readJsonSafely(created))?.id;
   if (typeof id !== "string" || !id) {
@@ -871,7 +930,16 @@ export function qoderEventContent(messages = []) {
       : Array.isArray(message?.content)
         ? message.content.filter(part => part?.type === "text").map(part => part?.text || "").join("\n")
         : "";
-    if (text.trim()) blocks.push({ type: "text", text: `[${label}]\n${text.trim()}` });
+    // A session created after a tool round has no tool history of its own, so
+    // prior calls and their results are replayed as readable turns.
+    const calls = message?.role === "assistant" && Array.isArray(message?.tool_calls)
+      ? message.tool_calls
+        .filter(call => typeof call?.function?.name === "string" && call.function.name)
+        .map(call => `[Tool call: ${call.function.name}] ${typeof call.function.arguments === "string" ? call.function.arguments : JSON.stringify(call.function.arguments ?? {})}`)
+        .join("\n")
+      : "";
+    const body = [text.trim(), calls].filter(Boolean).join("\n");
+    if (body) blocks.push({ type: "text", text: `[${label}]\n${body}` });
     for (const image of Array.isArray(message?.images) ? message.images : []) {
       if (typeof image?.url === "string" && image.url) {
         blocks.push({ type: "image", source: { type: "url", url: image.url } });
@@ -907,6 +975,66 @@ function qoderRememberSession(key, sessionId, posted) {
   qoderSessionCache.set(key, { sessionId, posted, expiresAt: Date.now() + QODER_SESSION_TTL_MS });
 }
 
+function qoderPendingFor(sessionId, create = false) {
+  let pending = qoderPendingToolUses.get(sessionId);
+  if (!pending && !create) return null;
+  if (!pending) {
+    if (qoderPendingToolUses.size > 500) {
+      for (const [id, entries] of qoderPendingToolUses) {
+        if (!entries.size || [...entries.values()].every(entry => entry.expiresAt <= Date.now())) qoderPendingToolUses.delete(id);
+      }
+      while (qoderPendingToolUses.size > 500) qoderPendingToolUses.delete(qoderPendingToolUses.keys().next().value);
+    }
+    pending = new Map();
+    qoderPendingToolUses.set(sessionId, pending);
+  }
+  for (const [callId, entry] of pending) {
+    if (entry.expiresAt <= Date.now()) pending.delete(callId);
+  }
+  return pending;
+}
+
+function qoderRememberToolUse(sessionId, { callId, customToolUseId, name }) {
+  const pending = qoderPendingFor(sessionId, true);
+  pending.set(callId, {
+    customToolUseId,
+    name,
+    delivered: false,
+    expiresAt: Date.now() + QODER_SESSION_TTL_MS
+  });
+}
+
+function qoderToolResultIsError(content) {
+  try {
+    const parsed = JSON.parse(content);
+    return Boolean(parsed && typeof parsed === "object" && (parsed.ok === false || parsed.error));
+  } catch {
+    return false;
+  }
+}
+
+// Only undelivered results for calls this session is waiting on may be posted
+// back: Qoder resumes the paused turn, so anything else would answer the wrong
+// request or duplicate a completed one.
+function qoderToolResultsFor(messages, pending, includeDelivered = false) {
+  if (!pending?.size) return [];
+  const results = [];
+  for (const message of Array.isArray(messages) ? messages : []) {
+    if (message?.role !== "tool") continue;
+    const callId = typeof message.tool_call_id === "string" ? message.tool_call_id : "";
+    const entry = callId ? pending.get(callId) : null;
+    if (!entry || (entry.delivered && !includeDelivered)) continue;
+    const content = typeof message.content === "string" ? message.content : JSON.stringify(message.content ?? "");
+    results.push({
+      callId,
+      customToolUseId: entry.customToolUseId,
+      content,
+      isError: qoderToolResultIsError(content)
+    });
+  }
+  return results;
+}
+
 async function qoderCreateSession(credentials, { agentId, environmentId }, signal, context) {
   const response = await qoderRequest(qoderJoin(credentials.businessBase, "sessions"), {
     method: "POST",
@@ -935,24 +1063,64 @@ async function qoderInterruptTurn(credentials, sessionId) {
   }
 }
 
+async function qoderSendCustomToolResult(credentials, sessionId, customToolUseId, text, isError = false) {
+  try {
+    await qoderRequest(qoderJoin(credentials.businessBase, `sessions/${sessionId}/events`), {
+      method: "POST",
+      credentials,
+      body: {
+        events: [{
+          type: "user.custom_tool_result",
+          custom_tool_use_id: customToolUseId,
+          content: [{ type: "text", text }],
+          ...(isError ? { is_error: true } : {})
+        }]
+      }
+    }, AbortSignal.timeout(REQUEST_TIMEOUT_MS), { stage: "business_api", operation: "custom_tool_result" });
+  } catch {
+    // The stream is already gone, so there is no paused turn left to unblock.
+  }
+}
+
+async function qoderDenyToolConfirmation(credentials, sessionId, toolUseId) {
+  try {
+    await qoderRequest(qoderJoin(credentials.businessBase, `sessions/${sessionId}/events`), {
+      method: "POST",
+      credentials,
+      body: {
+        events: [{
+          type: "user.tool_confirmation",
+          tool_use_id: toolUseId,
+          result: "deny",
+          deny_message: "VupsRouter runs its own approved tools; built-in Qoder sandbox tools are disabled."
+        }]
+      }
+    }, AbortSignal.timeout(REQUEST_TIMEOUT_MS), { stage: "business_api", operation: "tool_confirmation" });
+  } catch {
+    // Nothing executed, so a failed denial cannot cause a sandbox action.
+  }
+}
+
 // Only the newest user turn goes to a session that already holds the
 // conversation: re-sending the flattened history would run the same turn twice.
+// A tool result is a turn too, because it is what resumes a paused session.
 function qoderLatestTurnContent(messages = []) {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
-    if (messages[index]?.role !== "user") continue;
+    const role = messages[index]?.role;
+    if (role !== "user" && role !== "tool") continue;
     const blocks = qoderEventContent([messages[index]]);
     if (blocks.length) return blocks;
   }
   return [];
 }
 
-async function qoderStartStream({ baseUrl, apiKey, authMode, openapiBaseUrl, model, messages, conversationId = null, clientSignal = null, requestId = null, attempt = null }, signal) {
+async function qoderStartStream({ baseUrl, apiKey, authMode, openapiBaseUrl, model, messages, conversationId = null, clientSignal = null, requestId = null, attempt = null, tools = null }, signal) {
   const credentials = qoderCredentials({ baseUrl, apiKey, authMode, openapiBaseUrl });
   const base = credentials.businessBase;
   const context = { requestId, attempt, model, authMode: credentials.authMode, region: credentials.region };
   const [environmentId, agentId] = await Promise.all([
     qoderEnvironmentId(credentials, signal, context),
-    qoderAgentId(credentials, model, signal, context)
+    qoderAgentId(credentials, model, tools, signal, context)
   ]);
   const streamUrl = sessionId => {
     const url = new URL(qoderJoin(base, `sessions/${sessionId}/events/stream`));
@@ -965,17 +1133,66 @@ async function qoderStartStream({ baseUrl, apiKey, authMode, openapiBaseUrl, mod
     signal ?? AbortSignal.timeout(STREAM_TIMEOUT_MS),
     context
   );
+  const postEvents = (sessionId, events) => qoderRequest(
+    qoderJoin(base, `sessions/${sessionId}/events`),
+    { method: "POST", credentials, body: { events } },
+    signal,
+    context
+  );
   const key = conversationId ? qoderSessionCacheKey(credentials, conversationId, agentId) : "";
   let sessionId = key ? qoderLiveSession(key) : "";
+  let pending = sessionId ? qoderPendingFor(sessionId) : null;
+  let transcriptResults = qoderToolResultsFor(messages, pending, true);
+  let results = transcriptResults.filter(result => !pending?.get(result.callId)?.delivered);
+  let resultsSignature = transcriptResults.length
+    ? JSON.stringify({ toolResults: transcriptResults.map(result => [result.customToolUseId, result.content]) })
+    : "";
+  const lastRole = messages[messages.length - 1]?.role;
+  const restart = async () => {
+    await qoderInterruptTurn(credentials, sessionId);
+    if (key) qoderSessionCache.delete(key);
+    qoderPendingToolUses.delete(sessionId);
+    sessionId = "";
+    pending = null;
+    results = [];
+    transcriptResults = [];
+    resultsSignature = "";
+  };
+  if (sessionId && lastRole === "tool" && transcriptResults.length === 0) {
+    // The transcript answers calls this session never made (a restart, or a run
+    // that lost its state). They cannot be posted to it, so a fresh session
+    // takes the whole transcript, tool results included.
+    await restart();
+  } else if (sessionId && lastRole !== "tool" && pending && [...pending.values()].some(entry => !entry.delivered)) {
+    // A previous turn was abandoned before its tool results came back. The
+    // paused session would reject a new user message, so it is interrupted and
+    // the conversation continues in a new session with the real transcript.
+    await restart();
+  } else if (
+    sessionId
+    && lastRole === "tool"
+    && results.length === 0
+    && (!key || qoderSessionCache.get(key)?.posted !== resultsSignature)
+  ) {
+    // Every result in this transcript was already delivered and no recorded
+    // batch matches it. Re-posting would run the turn twice, so the conversation
+    // is replayed into a fresh session instead.
+    await restart();
+  }
   // A brand new session starts with no history of its own, so its first batch
   // carries the whole conversation; a reused session already has it, so only the
-  // newest user message is sent.
-  let content = sessionId ? qoderLatestTurnContent(messages) : [];
-  if (!sessionId || !content.length) content = qoderEventContent(messages);
-  if (!content.length) {
+  // newest turn is sent.
+  let content = sessionId ? qoderLatestTurnContent(messages) : qoderEventContent(messages);
+  if (!content.length && results.length === 0) {
     throw new ProviderError("There was no message to send to Qoder.", 400, "empty_request");
   }
-  let signature = JSON.stringify(content);
+  // A tool-result turn and a user turn post different things, so only a tool
+  // turn is fingerprinted by its results; otherwise the newest message is.
+  let signature = lastRole === "tool" && transcriptResults.length
+    ? (results.length
+      ? JSON.stringify({ toolResults: results.map(result => [result.customToolUseId, result.content]) })
+      : resultsSignature)
+    : JSON.stringify(content);
   // The chat route retries a dropped turn with the same parameters. Re-sending
   // that same batch would run the turn twice, so an already-posted batch is
   // resumed by reading the stream instead.
@@ -988,13 +1205,15 @@ async function qoderStartStream({ baseUrl, apiKey, authMode, openapiBaseUrl, mod
       // A session archived or deleted since the last turn is recoverable: a new
       // one takes the whole transcript so the conversation still continues.
       if (error?.status !== 404) throw error;
-      qoderSessionCache.delete(key);
+      if (key) qoderSessionCache.delete(key);
       sessionId = "";
     }
   }
   if (!sessionId) {
     sessionId = await qoderCreateSession(credentials, { agentId, environmentId }, signal, context);
     content = qoderEventContent(messages);
+    results = [];
+    pending = null;
     signature = JSON.stringify(content);
     alreadyPosted = false;
     stream = await openStream(sessionId, "");
@@ -1008,16 +1227,29 @@ async function qoderStartStream({ baseUrl, apiKey, authMode, openapiBaseUrl, mod
   // Executing only after the stream is attached is what makes the first deltas
   // of this turn observable; since 2026-08-24 Qoder does not replay history.
   if (!alreadyPosted) {
+    const events = results.length > 0
+      ? results.map(result => ({
+        type: "user.custom_tool_result",
+        custom_tool_use_id: result.customToolUseId,
+        content: [{ type: "text", text: result.content }],
+        ...(result.isError ? { is_error: true } : {})
+      }))
+      : [{ type: "user.message", content }];
     try {
-      await qoderRequest(qoderJoin(base, `sessions/${sessionId}/events`), {
-        method: "POST",
-        credentials,
-        body: { events: [{ type: "user.message", content }] }
-      }, signal, context);
+      await postEvents(sessionId, events);
     } catch (error) {
       stream.body.cancel().catch(() => {});
       if (key && error?.status === 404) qoderSessionCache.delete(key);
       throw error;
+    }
+    if (results.length > 0) {
+      for (const result of results) {
+        const entry = pending?.get(result.callId);
+        if (entry) entry.delivered = true;
+      }
+    } else if (pending) {
+      // A new user turn abandons any older call this session never answered.
+      qoderPendingToolUses.delete(sessionId);
     }
   }
   if (key) qoderRememberSession(key, sessionId, signature);
@@ -1031,12 +1263,46 @@ async function qoderStartStream({ baseUrl, apiKey, authMode, openapiBaseUrl, mod
       if (!turn.finished) qoderInterruptTurn(credentials, activeSession);
     }, { once: true });
   }
+  const allowedToolNames = toolNameSet(tools);
+  let acceptedToolUses = 0;
   const body = qoderSSEToChatStream(stream.body, {
     turn,
     reopen: lastEventId => openStream(sessionId, lastEventId),
     aborted: () => Boolean(cancelSignal?.aborted),
     onTerminal: () => {
       if (key) qoderSessionCache.delete(key);
+    },
+    // The agent can only call tools this request registered. Anything else is
+    // answered with an error result instead of leaving the turn paused.
+    onCustomToolUse: use => {
+      if (!allowedToolNames.has(use.name)) {
+        qoderSendCustomToolResult(
+          credentials,
+          sessionId,
+          use.customToolUseId,
+          JSON.stringify({ ok: false, error: { code: "tool_not_available", message: `The tool "${use.name}" is not registered for this request.` } }),
+          true
+        );
+        return false;
+      }
+      if (acceptedToolUses >= QODER_MAX_TOOL_CALLS) {
+        qoderSendCustomToolResult(
+          credentials,
+          sessionId,
+          use.customToolUseId,
+          JSON.stringify({ ok: false, error: { code: "too_many_tool_calls", message: `At most ${QODER_MAX_TOOL_CALLS} tool calls can run in one step.` } }),
+          true
+        );
+        return false;
+      }
+      acceptedToolUses += 1;
+      qoderRememberToolUse(sessionId, use);
+      return true;
+    },
+    // Built-in sandbox tools are disabled on the agent; a confirmation request
+    // can only be a stale agent, and VupsRouter never lets the sandbox act.
+    onBuiltinToolUse: toolUseId => {
+      qoderDenyToolConfirmation(credentials, sessionId, toolUseId);
     }
   });
   const response = new Response(body, {
@@ -1085,13 +1351,16 @@ async function qoderReadFrames(body, state, onFrame) {
   }
 }
 
-function qoderSSEToChatStream(sourceBody, { turn = null, reopen = null, aborted = null, onTerminal = null } = {}) {
+function qoderSSEToChatStream(sourceBody, { turn = null, reopen = null, aborted = null, onTerminal = null, onCustomToolUse = null, onBuiltinToolUse = null } = {}) {
   const encoder = new TextEncoder();
   const streamedByEvent = new Map();
   const deltaOnlyEvents = new Set();
   const foldedEvents = new Set();
+  const seenToolUses = new Set();
   const state = { closed: false, reader: null, lastEventId: "" };
   const finished = turn || { finished: false };
+  let toolCallCount = 0;
+  let toolWindow = null;
 
   return new ReadableStream({
     async start(controller) {
@@ -1102,12 +1371,19 @@ function qoderSSEToChatStream(sourceBody, { turn = null, reopen = null, aborted 
       const sendText = text => push(JSON.stringify({ choices: [{ delta: { content: text } }] }));
       const finish = () => {
         if (state.closed) return;
+        if (toolWindow) {
+          clearTimeout(toolWindow);
+          toolWindow = null;
+        }
         state.closed = true;
         finished.finished = true;
+        // A paused turn has no further event to wake the read loop with, so the
+        // upstream connection is released here instead of after the next beat.
+        state.reader?.cancel().catch(() => {});
         // The terminal frames go out after the guard flips, so they are written
         // exactly once even when a reconnect races with the end of the turn.
         try {
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] })}\n\n`));
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: toolCallCount > 0 ? "tool_calls" : "stop" }] })}\n\n`));
           controller.enqueue(encoder.encode("data: [DONE]\n\n"));
           controller.close();
         } catch {
@@ -1167,6 +1443,48 @@ function qoderSSEToChatStream(sourceBody, { turn = null, reopen = null, aborted 
           if (id) foldedEvents.add(id);
           return;
         }
+        // A custom tool use pauses the session until its result is posted back,
+        // so the call has to reach the chat loop in the same shape every other
+        // provider's stream uses or the turn would dead-end here.
+        if (type === "agent.custom_tool_use") {
+          const customToolUseId = String(payload?.custom_tool_use_id || "");
+          const name = typeof payload?.name === "string" ? payload.name : "";
+          if (!customToolUseId || !name || seenToolUses.has(customToolUseId)) return;
+          seenToolUses.add(customToolUseId);
+          const input = payload?.input && typeof payload.input === "object" ? payload.input : {};
+          const accepted = onCustomToolUse
+            ? onCustomToolUse({ callId: customToolUseId, customToolUseId, name, input }) !== false
+            : false;
+          if (!accepted) return;
+          const index = toolCallCount;
+          toolCallCount += 1;
+          push(JSON.stringify({
+            choices: [{
+              delta: {
+                tool_calls: [{
+                  index,
+                  id: customToolUseId,
+                  type: "function",
+                  function: { name, arguments: JSON.stringify(input) }
+                }]
+              }
+            }]
+          }));
+          // Qoder keeps a paused turn open and never sends status_idle, so the
+          // batch is closed once the last call has been quiet for a moment.
+          if (toolWindow) clearTimeout(toolWindow);
+          toolWindow = setTimeout(() => {
+            toolWindow = null;
+            finish();
+          }, QODER_TOOL_WINDOW_MS);
+          toolWindow.unref?.();
+          return;
+        }
+        if (type === "agent.tool_use") {
+          const toolUseId = String(payload?.tool_use_id || payload?.id || "");
+          if (toolUseId && onBuiltinToolUse) onBuiltinToolUse(toolUseId);
+          return;
+        }
         if (type === "session.status_idle") {
           finish();
         } else if (type === "session.status_terminated" || type === "session.deleted") {
@@ -1219,6 +1537,7 @@ async function qoderCompletion(params, signal) {
   const decoder = new TextDecoder();
   let pending = "";
   let content = "";
+  const calls = new Map();
   while (true) {
     const { value, done } = await reader.read();
     if (done) break;
@@ -1230,33 +1549,47 @@ async function qoderCompletion(params, signal) {
       if (!trimmed.startsWith("data:")) continue;
       const raw = trimmed.slice(5).trim();
       if (!raw || raw === "[DONE]") continue;
+      let payload;
       try {
-        content += extractStreamText(JSON.parse(raw));
+        payload = JSON.parse(raw);
       } catch {
         continue;
       }
+      content += extractStreamText(payload);
+      const deltas = payload?.choices?.[0]?.delta?.tool_calls;
+      if (!Array.isArray(deltas)) continue;
+      for (const delta of deltas) {
+        const index = Number.isInteger(delta?.index) ? delta.index : calls.size;
+        const existing = calls.get(index) || { id: "", name: "", arguments: "" };
+        if (typeof delta?.id === "string" && delta.id) existing.id = delta.id;
+        if (typeof delta?.function?.name === "string" && delta.function.name) existing.name = delta.function.name;
+        if (typeof delta?.function?.arguments === "string") existing.arguments += delta.function.arguments;
+        calls.set(index, existing);
+      }
     }
   }
-  // Qoder has no tool channel, so an ordinary answer and a tool request both
-  // arrive as text. The same validator and registry that guard every other
-  // transport decide whether a block is a real call.
-  const parsed = Array.isArray(params?.tools) && params.tools.length > 0
-    ? parseTextToolCalls(content, params.tools)
-    : { content, toolCalls: [] };
-  if (!parsed.content && parsed.toolCalls.length === 0) {
+  const toolCalls = [...calls.entries()]
+    .sort(([left], [right]) => left - right)
+    .map(([index, call]) => ({
+      id: call.id || `call_${index}`,
+      type: "function",
+      function: { name: call.name, arguments: call.arguments || "{}" }
+    }))
+    .filter(call => call.function.name);
+  if (!content && toolCalls.length === 0) {
     throw new ProviderError("Qoder Cloud Agents returned an empty response.", null, "empty_response");
   }
   return {
-    content: parsed.content,
-    toolTransport: "text",
-    finishReason: parsed.toolCalls.length > 0 ? "tool_calls" : "stop",
-    ...(parsed.toolCalls.length > 0
+    content,
+    toolTransport: "qoder_custom",
+    finishReason: toolCalls.length > 0 ? "tool_calls" : "stop",
+    ...(toolCalls.length > 0
       ? {
-        toolCalls: parsed.toolCalls,
+        toolCalls,
         assistantMessage: {
           role: "assistant",
-          content: parsed.content || null,
-          tool_calls: parsed.toolCalls
+          content: content || null,
+          tool_calls: toolCalls
         }
       }
       : {})
@@ -1271,7 +1604,7 @@ async function qoderCompletion(params, signal) {
 // model never decides whether local tools exist.
 export function resolveToolTransport(baseUrl, model, providerType = "openai_compatible") {
   const type = normalizeProviderType(providerType);
-  if (type === "qoder_cloud_agents") return "text";
+  if (type === "qoder_cloud_agents") return "qoder_custom";
   if (type === "watsonx" && !isOpenCodeZenBase(baseUrl)) return "text";
   if (usesAnthropicApi(baseUrl, model, type)) return "anthropic";
   if (usesResponsesApi(baseUrl, model, type)) return "openai_responses";
@@ -2755,9 +3088,10 @@ export async function chatCompletion({ baseUrl, apiKey, model, messages, tempera
   const type = normalizeProviderType(providerType);
   const hasTools = Array.isArray(tools) && tools.length > 0;
   if (type === "qoder_cloud_agents") {
-    const qoderMessages = hasTools ? withTextToolProtocol(flattenToolHistory(messages), tools) : messages;
+    // Tools are registered on the Qoder agent itself as custom tools, so the
+    // conversation stays in its native shape and calls come back on the stream.
     return qoderCompletion(
-      { baseUrl, apiKey, authMode, openapiBaseUrl, model, messages: qoderMessages, conversationId, requestId, attempt, tools: hasTools ? tools : null },
+      { baseUrl, apiKey, authMode, openapiBaseUrl, model, messages, conversationId, requestId, attempt, tools: hasTools ? tools : null },
       signal
     );
   }
@@ -2898,7 +3232,7 @@ export async function chatCompletion({ baseUrl, apiKey, model, messages, tempera
   };
 }
 
-export async function startChatCompletionStream({ baseUrl, apiKey, model, messages, temperature, maxTokens, providerType = "openai_compatible", authMode = "pat", openapiBaseUrl = "", reasoning, requestId = null, attempt = null, responseTimeoutMs = null, conversationId = null }, signal) {
+export async function startChatCompletionStream({ baseUrl, apiKey, model, messages, temperature, maxTokens, providerType = "openai_compatible", authMode = "pat", openapiBaseUrl = "", reasoning, requestId = null, attempt = null, responseTimeoutMs = null, conversationId = null, tools = null }, signal) {
   const type = normalizeProviderType(providerType);
   const anthropic = usesAnthropicApi(baseUrl, model, type);
   const watsonx = !isOpenCodeZenBase(baseUrl) && type === "watsonx";
@@ -2922,7 +3256,7 @@ export async function startChatCompletionStream({ baseUrl, apiKey, model, messag
   if (type === "qoder_cloud_agents") {
     try {
       return await qoderStartStream(
-        { baseUrl, apiKey, authMode, openapiBaseUrl, model, messages, conversationId, clientSignal: signal ?? null, requestId, attempt },
+        { baseUrl, apiKey, authMode, openapiBaseUrl, model, messages, conversationId, clientSignal: signal ?? null, requestId, attempt, tools },
         requestSignal ?? AbortSignal.timeout(STREAM_TIMEOUT_MS)
       );
     } catch (error) {

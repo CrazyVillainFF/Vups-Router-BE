@@ -68,7 +68,7 @@ function sessionCookie(response) {
 async function signupUser() {
   const response = await api("/api/auth/signup", {
     method: "POST",
-    body: { name: "Qoder Chat Tester", email: uniqueEmail(), password: "correct-horse-battery" }
+    body: { name: "Qoder Chat Tester", email: uniqueEmail(), password: "correct-horse-battery", acceptTerms: true }
   });
   assert.equal(response.status, 201);
   return sessionCookie(response);
@@ -237,6 +237,67 @@ test("a streamed Qoder turn reaches the chat client as deltas and one terminal e
   assert.match(done[0].message.content, /Hello world/);
   assert.equal(events.some(event => event.type === "error"), false);
   fake.state.mode = "buffered";
+});
+
+test("desktop tools are registered with Qoder and their results resume the same session", async () => {
+  const cookie = await signupUser();
+  await saveQoder(cookie);
+  fake.state.clearRequests();
+  fake.state.toolScript = [
+    { tools: [{ name: "read_file", input: { path: "C:/workspace/a.txt" } }] },
+    { text: "The file contains hello." }
+  ];
+
+  const first = await api("/api/chat/desktop-tools", {
+    method: "POST",
+    cookie,
+    body: { runId: "run_qoder_tools_1", messages: [{ role: "user", content: "Read C:/workspace/a.txt" }] }
+  });
+  assert.equal(first.status, 200);
+  assert.equal(first.body.type, "tool_calls");
+  assert.equal(first.body.toolCalls.length, 1);
+  assert.equal(first.body.toolCalls[0].function.name, "read_file");
+  assert.deepEqual(JSON.parse(first.body.toolCalls[0].function.arguments), { path: "C:/workspace/a.txt" });
+
+  // The registry reached Qoder itself, as custom tools with their real schemas.
+  const agent = fake.state.requests.find(entry => entry.path === "/api/v1/cloud/agents" && entry.method === "POST");
+  assert.ok(agent, "the Qoder agent was provisioned for this tool set");
+  const registered = agent.body.tools.map(tool => tool.name);
+  assert.ok(registered.includes("read_file"), `read_file must be registered, got ${registered.join(", ")}`);
+  assert.ok(registered.includes("list_directory"));
+  const readFile = agent.body.tools.find(tool => tool.name === "read_file");
+  assert.equal(readFile.type, "custom");
+  assert.equal(readFile.input_schema.required[0], "path");
+  assert.equal(agent.body.tools.some(tool => tool.name === "agent_toolset_20260401"), false);
+
+  const runId = first.body.runId;
+  const sessionId = fake.state.sessions.at(-1).id;
+  const second = await api("/api/chat/desktop-tools", {
+    method: "POST",
+    cookie,
+    body: {
+      runId,
+      messages: [
+        { role: "user", content: "Read C:/workspace/a.txt" },
+        first.body.assistantMessage,
+        { role: "tool", tool_call_id: first.body.toolCalls[0].id, content: JSON.stringify({ ok: true, content: "hello" }) }
+      ]
+    }
+  });
+
+  assert.equal(second.status, 200);
+  assert.equal(second.body.type, "final");
+  assert.notEqual(second.body.finishReason, "tool_calls");
+  assert.equal(createdSessions().length, 1, "the tool result resumes the same Qoder session");
+  assert.equal(fake.state.toolResults.length, 1);
+  const resultPost = fake.state.requests.find(entry =>
+    entry.method === "POST"
+    && entry.path === `/api/v1/cloud/sessions/${sessionId}/events`
+    && entry.body?.events?.[0]?.type === "user.custom_tool_result"
+  );
+  assert.ok(resultPost, "the executed result is posted back as user.custom_tool_result");
+  assert.equal(resultPost.body.events[0].custom_tool_use_id, first.body.toolCalls[0].id);
+  fake.state.toolScript = [];
 });
 
 test("a Qoder auth failure is actionable and never repeats the credential", async () => {

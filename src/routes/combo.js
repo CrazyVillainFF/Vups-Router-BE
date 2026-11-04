@@ -14,8 +14,8 @@ import ComboConfig, {
   publicComboConfig,
   sanitizeSelectedModel
 } from "../comboConfig.js";
-import { comboCatalogForUser } from "../comboCatalog.js";
-import { ComboCancelledError, runAvailabilityChecks } from "../comboAvailability.js";
+import { comboCatalogForUser, descriptorFromCatalog } from "../comboCatalog.js";
+import { ComboCancelledError, runAvailabilityChecks, runModelTest } from "../comboAvailability.js";
 import { ComboError, runComboChat } from "../comboOrchestrator.js";
 
 const router = Router();
@@ -120,8 +120,13 @@ router.put("/", settingsRateLimiter, async (req, res, next) => {
     if (selection.error) return res.status(400).json({ message: selection.error, code: "invalid_selection" });
 
     const previousAvailability = Array.isArray(existing?.availability) ? existing.availability : [];
-    const selectedKeys = new Set(selection.selected.map(model => model.key));
-    const availability = previousAvailability.filter(entry => selectedKeys.has(entry.key));
+    const keepKeys = new Set([
+      ...selection.selected.map(model => model.key),
+      // A model the user tested but never selected still has a real, current
+      // result, so saving the selection must not throw that status away.
+      ...catalog.models.map(model => model.key)
+    ]);
+    const availability = previousAvailability.filter(entry => keepKeys.has(entry.key));
     const update = {
       enabled: typeof body.enabled === "boolean" ? body.enabled : existing?.enabled !== false,
       selected: selection.selected,
@@ -165,6 +170,71 @@ router.post("/availability", chatRateLimiter, async (req, res, next) => {
       models: availability.models,
       checkedAt: new Date().toISOString()
     });
+  } catch (error) {
+    if (error instanceof ComboCancelledError) return;
+    return next(error);
+  }
+});
+
+// One in-flight test per account and model: a double click, or two tabs, must not
+// put two live requests on the same provider or race two availability writes.
+const modelTests = new Map();
+
+router.post("/test", chatRateLimiter, async (req, res, next) => {
+  try {
+    await connectToDatabase();
+    const key = typeof req.body?.key === "string" ? req.body.key.trim() : "";
+    if (!key) return res.status(400).json({ message: "Choose a model to test.", code: "missing_model_key" });
+
+    const [config, catalog] = await Promise.all([
+      comboConfigForUser(req.userId),
+      comboCatalogForUser(req.userId)
+    ]);
+    const model = descriptorFromCatalog(catalog, key);
+    if (!model) {
+      return res.status(404).json({
+        message: "That model is no longer in your catalog. Reload the model list, or reconnect the provider in API settings.",
+        code: "model_not_found"
+      });
+    }
+    // The descriptor comes out of the server-built catalog, never out of the
+    // request body, so a test can only ever reach a model this account already
+    // has - with its own stored key and base URL.
+    const descriptor = sanitizeSelectedModel(model);
+    if (!descriptor) {
+      return res.status(400).json({ message: "That catalog entry is incomplete. Reload the model list.", code: "invalid_model_key" });
+    }
+
+    const requestId = `${req.userId}|${descriptor.key}`;
+    const pending = modelTests.get(requestId);
+    if (pending) {
+      try {
+        return res.json({ model: await pending, reused: true });
+      } catch (error) {
+        // The tab that started the probe may have closed it. The waiting tab gets
+        // an honest answer instead of a response that never arrives.
+        if (error instanceof ComboCancelledError) {
+          return res.status(499).json({
+            message: "That test was stopped by the tab that started it. Run Test again.",
+            code: "test_cancelled"
+          });
+        }
+        throw error;
+      }
+    }
+
+    const controller = new AbortController();
+    res.on("close", () => {
+      if (!res.writableEnded) controller.abort();
+    });
+    const task = runModelTest({ userId: req.userId, descriptor, config, signal: controller.signal })
+      .finally(() => {
+        if (modelTests.get(requestId) === task) modelTests.delete(requestId);
+      });
+    modelTests.set(requestId, task);
+    const result = await task;
+    if (controller.signal.aborted) return;
+    return res.json({ model: result, checkedAt: result.checkedAt });
   } catch (error) {
     if (error instanceof ComboCancelledError) return;
     return next(error);

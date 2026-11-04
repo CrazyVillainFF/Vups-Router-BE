@@ -55,6 +55,9 @@ test("plugin tools are disabled for providers with incompatible protocols", () =
   assert.equal(providerSupportsPluginTools({ providerType: "openai_compatible", baseUrl: "https://api.example.com/v1" }, "test-model"), true);
   assert.equal(providerSupportsPluginTools({ providerType: "anthropic_compatible", baseUrl: "https://api.example.com/v1" }, "test-model"), false);
   assert.equal(providerSupportsPluginTools({ providerType: "watsonx", baseUrl: "https://api.example.com/v1" }, "test-model"), false);
+  // Qoder speaks the tool_calls contract through its custom-tool channel, so
+  // plugin tools use the same loop as every other native provider.
+  assert.equal(providerSupportsPluginTools({ providerType: "qoder_cloud_agents", baseUrl: "https://api.qoder.com" }, "test-model"), true);
 });
 
 test("an aborted request stops the plugin loop before any provider or tool call", async () => {

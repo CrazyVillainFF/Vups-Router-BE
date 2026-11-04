@@ -70,7 +70,7 @@ function sessionCookie(response) {
 async function signupUser() {
   const response = await api("/api/auth/signup", {
     method: "POST",
-    body: { name: "Qoder Settings Tester", email: uniqueEmail(), password: "correct-horse-battery" }
+    body: { name: "Qoder Settings Tester", email: uniqueEmail(), password: "correct-horse-battery", acceptTerms: true }
   });
   assert.equal(response.status, 201);
   return sessionCookie(response);

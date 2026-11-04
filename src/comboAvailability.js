@@ -1,7 +1,9 @@
 import ProviderConfig from "./providerConfig.js";
+import ComboConfig, { normalizeAvailability } from "./comboConfig.js";
 import { chatCompletion, ProviderError } from "./providerClient.js";
 import { resolveProvider } from "./routes/chat.js";
 import { vupsProviderForChat } from "./vupsGalax.js";
+import { redactSecrets } from "./plugins/redact.js";
 
 const PERMANENT_CODES = new Set([
   "invalid_credentials",
@@ -48,7 +50,11 @@ export class ComboCancelledError extends Error {
 }
 
 export function isTransientAvailabilityError(error) {
-  if (error?.classification?.retryable === true) return true;
+  // providerClient attaches its own retry verdict to the error it throws, and it
+  // spells the rate-limit codes as categories rather than codes, so a rate limited
+  // model used to fall through and be cached as if it were permanently broken. The
+  // code sets stay as the fallback for errors that carry no verdict at all.
+  if (error?.retryable === true || error?.classification?.retryable === true) return true;
   const code = String(error?.code || "");
   if (PERMANENT_CODES.has(code)) return false;
   return TRANSIENT_CODES.has(code);
@@ -62,6 +68,35 @@ export function availabilityReason(error) {
 
 function cancelled(signal) {
   return signal?.aborted === true;
+}
+
+const MAX_PROBE_DETAIL_CHARS = 240;
+
+// The HTTP status the provider actually answered with, when the failure carried
+// one. A transport error has no status, and inventing 500 would misreport it.
+function probeHttpStatus(error) {
+  const status = Number(error?.status);
+  return Number.isInteger(status) && status >= 100 && status <= 599 ? status : null;
+}
+
+// The sentence a single-model test shows the user. Provider messages are already
+// sanitised by describeProviderError, but a probe knows the exact credential it
+// was carrying, so it redacts that too before anything leaves the module.
+function probeDetail(error, secrets = []) {
+  const message = typeof error?.message === "string" ? error.message.trim() : "";
+  if (!message) return "";
+  return redactSecrets(message.slice(0, MAX_PROBE_DETAIL_CHARS), secrets);
+}
+
+function probeFailure(error, startedAt, secrets = []) {
+  return {
+    status: "not_working",
+    reason: availabilityReason(error),
+    retryable: isTransientAvailabilityError(error),
+    latencyMs: Date.now() - startedAt,
+    httpStatus: probeHttpStatus(error),
+    detail: probeDetail(error, secrets)
+  };
 }
 
 export async function resolveComboProvider(userId, descriptor) {
@@ -89,7 +124,14 @@ export async function resolveComboProvider(userId, descriptor) {
 export async function probeDescriptor(userId, descriptor, { signal, timeoutMs = 20000 } = {}) {
   const startedAt = Date.now();
   if (!descriptor || !descriptor.model) {
-    return { status: "not_working", reason: "invalid_model", retryable: false, latencyMs: 0 };
+    return {
+      status: "not_working",
+      reason: "invalid_model",
+      retryable: false,
+      latencyMs: 0,
+      httpStatus: null,
+      detail: ""
+    };
   }
   let provider;
   try {
@@ -99,12 +141,7 @@ export async function probeDescriptor(userId, descriptor, { signal, timeoutMs = 
     }
   } catch (error) {
     if (cancelled(signal)) throw new ComboCancelledError();
-    return {
-      status: "not_working",
-      reason: availabilityReason(error),
-      retryable: isTransientAvailabilityError(error),
-      latencyMs: Date.now() - startedAt
-    };
+    return probeFailure(error, startedAt);
   }
 
   const timeout = AbortSignal.timeout(Math.max(5000, Math.min(60000, Number(timeoutMs) || 20000)));
@@ -123,15 +160,20 @@ export async function probeDescriptor(userId, descriptor, { signal, timeoutMs = 
       },
       combined
     );
-    return { status: "working", reason: "", retryable: false, latencyMs: Date.now() - startedAt };
+    // chatCompletion throws on an empty or unusable body, so reaching this line
+    // means the model itself returned an answer rather than the endpoint accepting
+    // the request.
+    return {
+      status: "working",
+      reason: "",
+      retryable: false,
+      latencyMs: Date.now() - startedAt,
+      httpStatus: null,
+      detail: ""
+    };
   } catch (error) {
     if (cancelled(signal)) throw new ComboCancelledError();
-    return {
-      status: "not_working",
-      reason: availabilityReason(error),
-      retryable: isTransientAvailabilityError(error),
-      latencyMs: Date.now() - startedAt
-    };
+    return probeFailure(error, startedAt, [provider.apiKey]);
   }
 }
 
@@ -263,7 +305,12 @@ export async function runAvailabilityChecks({
   ));
 
   if (config && !config.isNew) {
-    config.availability = ordered;
+    // A check is only ever run over a subset of the selected models - a keyed
+    // recheck, or a single-model test - so the entries this run did not touch
+    // carry over instead of being silently dropped from the cache.
+    const probedKeys = new Set(descriptors.map(descriptor => descriptor.key));
+    const carried = [...cached.values()].filter(entry => entry.key && !probedKeys.has(entry.key));
+    config.availability = normalizeAvailability([...ordered, ...carried]);
     config.markModified?.("availability");
     try {
       await config.save();
@@ -284,5 +331,66 @@ export async function runAvailabilityChecks({
     entries: ordered,
     activeKeys,
     excludedKeys
+  };
+}
+
+// Availability rows are read-modify-written, so two concurrent single-model tests
+// for the same account could each start from the pre-write state and one result
+// would vanish. Every write for a user runs after the previous one has landed.
+const availabilityWrites = new Map();
+
+function queueAvailabilityWrite(userId, task) {
+  const previous = availabilityWrites.get(userId) || Promise.resolve();
+  const run = previous.then(task);
+  const tracked = run.catch(() => {});
+  availabilityWrites.set(userId, tracked);
+  tracked.then(() => {
+    if (availabilityWrites.get(userId) === tracked) availabilityWrites.delete(userId);
+  });
+  return run;
+}
+
+export function storeAvailabilityEntry(userId, entry) {
+  return queueAvailabilityWrite(userId, async () => {
+    const stored = await ComboConfig.findOne({ userId });
+    const carried = (Array.isArray(stored?.availability) ? stored.availability : [])
+      .filter(row => String(row?.key || "") !== entry.key);
+    await ComboConfig.findOneAndUpdate(
+      { userId },
+      { $set: { availability: normalizeAvailability([entry, ...carried]) } },
+      { upsert: true, setDefaultsOnInsert: true }
+    );
+  });
+}
+
+// One model, one real request, no orchestration and no selection change. The
+// result lands in the same availability cache the batch check writes, so a model
+// proved by a manual test is reported identically to one proved by a recheck.
+export async function runModelTest({ userId, descriptor, config, signal = null }) {
+  const settings = config?.settings || {};
+  const probe = await probeDescriptor(userId, descriptor, {
+    signal,
+    timeoutMs: settings.probeTimeoutMs
+  });
+  const fingerprints = await providerFingerprints(userId, [descriptor]);
+  const entry = {
+    key: descriptor.key,
+    status: probe.status,
+    checkedAt: new Date(),
+    reason: probe.reason,
+    retryable: probe.retryable,
+    providerUpdatedAt: descriptor.kind === "saved" ? fingerprints.get(descriptor.configId) || "" : ""
+  };
+  await storeAvailabilityEntry(userId, entry);
+  return {
+    ...publicEntry(entry),
+    // The batch endpoint only ever publishes key/status/checkedAt. A test is a
+    // deliberate action on one model, so it also hands back why it failed and
+    // what the provider answered - reason is a code, detail is already redacted.
+    reason: probe.reason,
+    retryable: probe.retryable,
+    latencyMs: probe.latencyMs,
+    httpStatus: probe.httpStatus,
+    detail: probe.detail
   };
 }

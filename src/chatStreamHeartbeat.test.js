@@ -52,7 +52,8 @@ async function newUser() {
     body: JSON.stringify({
       name: "Heartbeat Tester",
       email: `heartbeat-${Date.now()}@example.com`,
-      password: "correct-horse-battery"
+      password: "correct-horse-battery",
+      acceptTerms: true
     })
   });
   assert.equal(signup.status, 201);

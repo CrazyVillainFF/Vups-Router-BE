@@ -85,7 +85,7 @@ async function signupUser(password = "correct-horse-battery") {
   const email = uniqueEmail();
   const response = await api("/api/auth/signup", {
     method: "POST",
-    body: { name: "Reset Tester", email, password }
+    body: { name: "Reset Tester", email, password, acceptTerms: true }
   });
   assert.equal(response.status, 201);
   return { email, cookie: sessionCookie(response), password };

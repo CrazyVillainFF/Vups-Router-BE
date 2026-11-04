@@ -8,7 +8,10 @@ const MAX_TOOL_RESULT_CHARS = 12000;
 
 export function providerSupportsPluginTools(provider, model) {
   const type = provider?.providerType || "openai_compatible";
-  if (type === "anthropic_compatible" || type === "watsonx" || type === "qoder_cloud_agents") return false;
+  // Qoder calls tools through native custom-tool events on its agent session,
+  // which the adapter translates into the same tool_calls contract as the rest.
+  if (type === "qoder_cloud_agents") return true;
+  if (type === "anthropic_compatible" || type === "watsonx") return false;
   try {
     return !usesResponsesApi(provider.baseUrl, model, type);
   } catch {
@@ -47,7 +50,8 @@ export async function runPluginToolLoop({
   maxTokens,
   reasoning,
   signal,
-  requestId = ""
+  requestId = "",
+  conversationId = null
 }) {
   throwIfAborted(signal);
   if (!providerSupportsPluginTools(provider, model)) return null;
@@ -72,7 +76,8 @@ export async function runPluginToolLoop({
       tools,
       toolChoice: "auto",
       requestId,
-      attempt: round
+      attempt: round,
+      conversationId
     }, signal);
     throwIfAborted(signal);
 

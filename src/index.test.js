@@ -84,7 +84,7 @@ async function signupUser() {
   const email = uniqueEmail();
   const response = await api("/api/auth/signup", {
     method: "POST",
-    body: { name: "Test User", email, password: "correct-horse-battery" }
+    body: { name: "Test User", email, password: "correct-horse-battery", acceptTerms: true }
   });
   assert.equal(response.status, 201);
   return { email, cookie: sessionCookie(response), body: response.body };
@@ -210,7 +210,7 @@ test("registration succeeds, hashes the password, and sets an HTTP-only session 
   const email = uniqueEmail();
   const response = await api("/api/auth/signup", {
     method: "POST",
-    body: { name: "Alex Router", email, password: "correct-horse-battery" }
+    body: { name: "Alex Router", email, password: "correct-horse-battery", acceptTerms: true }
   });
   assert.equal(response.status, 201);
   assert.equal(response.body.user.email, email);
@@ -236,17 +236,67 @@ test("registration succeeds, hashes the password, and sets an HTTP-only session 
 test("registration rejects invalid input with clear messages", async () => {
   const response = await api("/api/auth/signup", {
     method: "POST",
-    body: { name: "A", email: "not-an-email", password: "short" }
+    body: { name: "A", email: "not-an-email", password: "short", acceptTerms: true }
   });
   assert.equal(response.status, 400);
   assert.match(response.body.message, /Name/);
+});
+
+test("registration is rejected, and no account is created, when acceptance is missing or false", async () => {
+  const email = uniqueEmail();
+  for (const acceptTerms of [undefined, false, "true", 1]) {
+    const body = { name: "No Consent", email, password: "correct-horse-battery" };
+    if (acceptTerms !== undefined) body.acceptTerms = acceptTerms;
+    const response = await api("/api/auth/signup", { method: "POST", body });
+    assert.equal(response.status, 400);
+    assert.match(response.body.message, /Terms of Service and Privacy Policy/);
+    assert.equal(response.body.token, undefined, "a rejected signup must not hand out a session");
+  }
+  assert.equal(await mongoose.connection.db.collection("users").findOne({ email }), null);
+});
+
+test("registration records the acceptance time and the policy version that was shown", async () => {
+  const email = uniqueEmail();
+  const startedAt = Date.now();
+  const response = await api("/api/auth/signup", {
+    method: "POST",
+    body: {
+      name: "Consent Given",
+      email,
+      password: "correct-horse-battery",
+      acceptTerms: true,
+      termsVersion: "2026-10-19"
+    }
+  });
+  assert.equal(response.status, 201);
+  const stored = await mongoose.connection.db.collection("users").findOne({ email });
+  assert.ok(stored.termsAcceptedAt instanceof Date);
+  assert.ok(stored.termsAcceptedAt.getTime() >= startedAt - 5000);
+  assert.equal(stored.termsVersion, "2026-10-19");
+});
+
+test("a policy version that is not an ISO date is not recorded", async () => {
+  const email = uniqueEmail();
+  const response = await api("/api/auth/signup", {
+    method: "POST",
+    body: {
+      name: "Odd Version",
+      email,
+      password: "correct-horse-battery",
+      acceptTerms: true,
+      termsVersion: "latest terms!!"
+    }
+  });
+  assert.equal(response.status, 201);
+  const stored = await mongoose.connection.db.collection("users").findOne({ email });
+  assert.equal(stored.termsVersion, null);
 });
 
 test("duplicate registration is rejected", async () => {
   const { email } = await signupUser();
   const response = await api("/api/auth/signup", {
     method: "POST",
-    body: { name: "Second User", email, password: "correct-horse-battery" }
+    body: { name: "Second User", email, password: "correct-horse-battery", acceptTerms: true }
   });
   assert.equal(response.status, 409);
   assert.match(response.body.message, /already exists/i);
