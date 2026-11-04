@@ -13,6 +13,7 @@ const OPTIONAL_TOKEN = Object.freeze({
 
 const AUTH_OVERRIDES = {
   github: OPTIONAL_TOKEN,
+  "github-oauth": { type: "oauth", label: "GitHub sign-in (OAuth)", fields: [] },
   unsplash: {
     type: "api_key",
     label: "Unsplash access key",
@@ -40,6 +41,7 @@ const AUTH_OVERRIDES = {
 
 const SITES = {
   github: "https://github.com",
+  "github-oauth": "https://github.com",
   "docker-hub": "https://hub.docker.com",
   npm: "https://www.npmjs.com",
   pypi: "https://pypi.org",
@@ -75,7 +77,16 @@ const SITES = {
 };
 
 const TOOL_PERMISSIONS = {
-  github: ["Read public repositories and issues", "Create issues only when you explicitly confirm"],
+  github: [
+    "Read public repositories and issues",
+    "Read your own repositories when a token is saved",
+    "Write, only to a branch you name and after you confirm the exact change"
+  ],
+  "github-oauth": [
+    "Read the repositories your GitHub account can see",
+    "Browse files, branches, commits, issues, and pull requests",
+    "Write, only to a branch you name and after you confirm the exact change"
+  ],
   unsplash: ["Search public photos"],
   deepl: ["Translate text you submit"],
   "url-reader": ["Read public web pages"],
@@ -116,7 +127,8 @@ const ROWS = [
   ["microsoft-calendar", "Microsoft Calendar", "communication", "Read events and availability from Microsoft 365.", "oauth"],
   ["twilio", "Twilio", "communication", "Send SMS messages through a Twilio account.", "api"],
 
-  ["github", "GitHub", "developer", "Search repositories, inspect issues, and create issues with an optional token.", "optional", "github"],
+  ["github", "GitHub", "developer", "Search repositories, read files, branches, commits and pull requests, and open issues with an optional token.", "optional", "github"],
+  ["github-oauth", "GitHub (sign in)", "developer", "Sign in with GitHub to browse your repositories, files, branches, commits, issues, and pull requests.", "oauth", "github"],
   ["gitlab", "GitLab", "developer", "Search projects and inspect merge requests in GitLab.", "oauth"],
   ["bitbucket", "Bitbucket", "developer", "Search repositories and pull requests in Bitbucket.", "oauth"],
   ["jira", "Jira", "developer", "Search issues and projects in Atlassian Jira.", "oauth"],
@@ -201,6 +213,13 @@ const ROWS = [
   ["coinbase-spot", "Coinbase Spot Prices", "utilities", "Read the current Coinbase spot price for any currency pair.", "none", "coinbase-spot"]
 ];
 
+// A plugin can be reached through two connection methods. The access-token row
+// stays the entry the marketplace lists; the sign-in row is the same adapter
+// under a different credential, so it is offered from that card instead of as a
+// second card with a duplicated name.
+const OAUTH_COMPANION = { github: "github-oauth" };
+const SIGN_IN_ONLY = new Set(Object.values(OAUTH_COMPANION));
+
 function authFor(code) {
   if (code === "none") return NONE;
   if (code === "optional") return OPTIONAL_TOKEN;
@@ -235,7 +254,9 @@ export const PLUGIN_CATALOG = Object.freeze(ROWS.map(([id, name, category, descr
     website: SITES[id] || "",
     implemented: Boolean(adapter),
     availability: availabilityFor(auth, adapter),
-    permissions: permissionsFor(id, auth)
+    permissions: permissionsFor(id, auth),
+    marketplaceEntry: !SIGN_IN_ONLY.has(id),
+    oauthPluginId: OAUTH_COMPANION[id] || ""
   });
 }));
 
@@ -243,6 +264,29 @@ const BY_ID = new Map(PLUGIN_CATALOG.map(plugin => [plugin.id, plugin]));
 
 export function getPlugin(id) {
   return BY_ID.get(String(id || "")) || null;
+}
+
+const PRIMARY_BY_OAUTH = new Map(
+  PLUGIN_CATALOG.filter(plugin => plugin.oauthPluginId).map(plugin => [plugin.oauthPluginId, plugin.id])
+);
+
+// A provider records one exact callback URL, and the user-facing plugin is the
+// card in the marketplace. So the sign-in row's callback travels on the primary
+// row's path: /api/plugins/github/oauth/callback serves the github-oauth
+// connection rather than inventing a second URL that no OAuth app knows about.
+export function oauthCallbackPathId(pluginId) {
+  return PRIMARY_BY_OAUTH.get(String(pluginId || "")) || String(pluginId || "");
+}
+
+// Resolves whichever row a callback path names back to the OAuth row that owns it,
+// so both the primary and the sign-in path land on the same connection.
+export function oauthPluginForCallback(pathPluginId) {
+  const plugin = getPlugin(pathPluginId);
+  if (!plugin) return null;
+  if (plugin.auth.type === "oauth") return plugin;
+  if (!plugin.oauthPluginId) return null;
+  const companion = getPlugin(plugin.oauthPluginId);
+  return companion?.auth.type === "oauth" ? companion : null;
 }
 
 export function catalogSummary() {

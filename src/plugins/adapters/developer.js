@@ -1,128 +1,6 @@
 import { boundedText, queryString, requestJson } from "../http.js";
+import { githubAdapter } from "./github.js";
 import { integer, object, text } from "./schema.js";
-
-function githubHeaders(credentials = {}) {
-  return {
-    Accept: "application/vnd.github+json",
-    "X-GitHub-Api-Version": "2022-11-28",
-    ...(credentials.token ? { Authorization: `Bearer ${credentials.token}` } : {})
-  };
-}
-
-function githubRepository(item) {
-  return {
-    fullName: item.full_name,
-    description: boundedText(item.description, 500),
-    url: item.html_url,
-    stars: item.stargazers_count ?? null,
-    forks: item.forks_count ?? null,
-    language: item.language || "",
-    updatedAt: item.updated_at || "",
-    archived: Boolean(item.archived)
-  };
-}
-
-const github = {
-  id: "github",
-  tools: [
-    {
-      name: "search_repositories",
-      description: "Search GitHub repositories.",
-      inputSchema: object({
-        query: text("Repository search query.", { minLength: 1, maxLength: 300 }),
-        limit: integer("Number of results (1-10).", { minimum: 1, maximum: 10 })
-      }, ["query"])
-    },
-    {
-      name: "repository",
-      description: "Read metadata for one GitHub repository.",
-      inputSchema: object({
-        owner: text("Repository owner.", { minLength: 1, maxLength: 100 }),
-        repo: text("Repository name.", { minLength: 1, maxLength: 100 })
-      }, ["owner", "repo"])
-    },
-    {
-      name: "list_issues",
-      description: "List issues in a GitHub repository. Pull requests are excluded.",
-      inputSchema: object({
-        owner: text("Repository owner.", { minLength: 1, maxLength: 100 }),
-        repo: text("Repository name.", { minLength: 1, maxLength: 100 }),
-        state: text("Issue state: open, closed, or all.", { enum: ["open", "closed", "all"] }),
-        limit: integer("Number of issues (1-20).", { minimum: 1, maximum: 20 })
-      }, ["owner", "repo"])
-    },
-    {
-      name: "create_issue",
-      description: "Create an issue in a GitHub repository. Requires an access token and explicit confirmation.",
-      sensitive: true,
-      inputSchema: object({
-        owner: text("Repository owner.", { minLength: 1, maxLength: 100 }),
-        repo: text("Repository name.", { minLength: 1, maxLength: 100 }),
-        title: text("Issue title.", { minLength: 1, maxLength: 256 }),
-        body: text("Issue body.", { maxLength: 10000 })
-      }, ["owner", "repo", "title"])
-    }
-  ],
-  async testConnection({ credentials, signal }) {
-    await requestJson("https://api.github.com/rate_limit", { headers: githubHeaders(credentials), signal });
-    return { message: credentials?.token ? "GitHub token accepted." : "GitHub public API is responding." };
-  },
-  async execute(tool, args, { credentials, signal }) {
-    const headers = githubHeaders(credentials);
-    if (tool === "search_repositories") {
-      const payload = await requestJson(
-        `https://api.github.com/search/repositories?${queryString({ q: args.query, per_page: args.limit ?? 5 })}`,
-        { headers, signal }
-      );
-      return { query: args.query, results: (payload?.items || []).map(githubRepository) };
-    }
-    if (tool === "repository") {
-      const payload = await requestJson(
-        `https://api.github.com/repos/${encodeURIComponent(args.owner)}/${encodeURIComponent(args.repo)}`,
-        { headers, signal }
-      );
-      return githubRepository(payload);
-    }
-    if (tool === "list_issues") {
-      const payload = await requestJson(
-        `https://api.github.com/repos/${encodeURIComponent(args.owner)}/${encodeURIComponent(args.repo)}/issues?${queryString({
-          state: args.state || "open",
-          per_page: args.limit ?? 10
-        })}`,
-        { headers, signal }
-      );
-      return {
-        issues: (Array.isArray(payload) ? payload : [])
-          .filter(item => !item.pull_request)
-          .map(item => ({
-            number: item.number,
-            title: boundedText(item.title, 300),
-            state: item.state,
-            author: item.user?.login || "",
-            labels: (item.labels || []).map(label => label.name),
-            url: item.html_url,
-            updatedAt: item.updated_at || ""
-          }))
-      };
-    }
-    if (tool === "create_issue") {
-      if (!credentials?.token) {
-        throw new Error("A GitHub access token is required to create an issue.");
-      }
-      const payload = await requestJson(
-        `https://api.github.com/repos/${encodeURIComponent(args.owner)}/${encodeURIComponent(args.repo)}/issues`,
-        {
-          method: "POST",
-          headers: { ...headers, "Content-Type": "application/json" },
-          body: JSON.stringify({ title: args.title, body: args.body || "" }),
-          signal
-        }
-      );
-      return { number: payload.number, title: payload.title, url: payload.html_url, state: payload.state };
-    }
-    throw new Error("Unknown GitHub tool.");
-  }
-};
 
 const dockerhub = {
   id: "dockerhub",
@@ -350,7 +228,7 @@ const devto = {
 };
 
 export const developerAdapters = {
-  github,
+  github: githubAdapter,
   dockerhub,
   npm,
   pypi,

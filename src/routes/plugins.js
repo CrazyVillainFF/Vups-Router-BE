@@ -1,10 +1,12 @@
 import express from "express";
-import { rateLimit } from "express-rate-limit";
+import { ipKeyGenerator, rateLimit } from "express-rate-limit";
 import { requireAuth } from "../middleware.js";
-import { getPlugin } from "../plugins/catalog.js";
-import { buildOAuthAuthorizeUrl, verifyOAuthState } from "../plugins/oauth.js";
+import { getPlugin, oauthCallbackPathId, oauthPluginForCallback } from "../plugins/catalog.js";
+import { consumeOAuthState, oauthClientAppBase } from "../plugins/oauth.js";
 import { PluginError, pluginErrorPayload } from "../plugins/errors.js";
 import {
+  beginOAuthConnection,
+  completeOAuthConnection,
   executePluginTool,
   getPluginDetail,
   installPlugin,
@@ -26,12 +28,79 @@ const pluginRateLimiter = rateLimit({
   message: { message: "Too many plugin requests. Wait a moment and try again.", code: "plugin_rate_limited" }
 });
 
+// The provider redirects the browser here, so this is a plain cross-site GET with
+// no session dependency: the signed, single-use state carried in the query is what
+// identifies the account. It is registered before requireAuth on purpose.
+const oauthCallbackRateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: Number(process.env.OAUTH_CALLBACK_RATE_LIMIT_MAX || 40),
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: ipKeyGenerator,
+  message: { message: "Too many sign-in callbacks. Start the connection again in a moment." }
+});
+
 function fail(res, error) {
   const payload = pluginErrorPayload(error);
   if (payload) return res.status(error.status).json(payload);
   console.error("Plugin route failed:", error?.name || "UnknownError");
   return res.status(500).json({ message: "The plugin request failed. Please try again.", code: "plugin_error" });
 }
+
+function oauthCallbackUri(pluginId, req) {
+  return process.env.PLUGIN_OAUTH_REDIRECT_BASE
+    || `${req.protocol}://${req.get("host")}/api/plugins/${encodeURIComponent(oauthCallbackPathId(pluginId))}/oauth/callback`;
+}
+
+// The app is told only which connection finished and why it failed. No code,
+// state, token, or provider text is put in the browser URL.
+function returnToApp(res, pluginId, outcome, reason = "") {
+  const target = new URL(`${oauthClientAppBase()}/plugins`);
+  target.searchParams.set("plugin", pluginId);
+  target.searchParams.set("oauth", outcome);
+  if (reason) target.searchParams.set("reason", reason);
+  return res.redirect(302, target.toString());
+}
+
+const OAUTH_CANCELLED = "access_denied";
+
+function reasonFor(error) {
+  if (error?.code === "oauth_state_replayed") return "replayed_state";
+  if (error?.code === "invalid_oauth_state") return "invalid_state";
+  if (error?.code === "token_exchange_failed") return "exchange_failed";
+  if (error?.code === "oauth_not_configured") return "not_configured";
+  if (error?.code === "oauth_not_supported") return "unsupported_plugin";
+  return "failed";
+}
+
+router.get("/:pluginId/oauth/callback", oauthCallbackRateLimiter, async (req, res) => {
+  const plugin = oauthPluginForCallback(req.params.pluginId);
+  if (!plugin) {
+    return returnToApp(res, String(req.params.pluginId).slice(0, 80), "error", "unsupported_plugin");
+  }
+  try {
+    if (req.query.error) {
+      return returnToApp(res, plugin.id, "error", String(req.query.error) === OAUTH_CANCELLED ? "cancelled" : "provider_error");
+    }
+    const state = await consumeOAuthState(req.query.state);
+    if (state.pluginId !== plugin.id) {
+      throw new PluginError("That sign-in was started for a different service.", 400, "invalid_oauth_state");
+    }
+    await completeOAuthConnection({
+      userId: state.sub,
+      pluginId: plugin.id,
+      code: String(req.query.code || ""),
+      redirectUri: state.redirectUri || oauthCallbackUri(plugin.id, req),
+      requestId: req.requestId
+    });
+    return returnToApp(res, plugin.id, "connected");
+  } catch (error) {
+    const reason = reasonFor(error);
+    if (error instanceof PluginError) console.warn(`Plugin OAuth callback rejected for ${plugin.id}: ${error.code}`);
+    else console.error("Plugin OAuth callback failed:", error?.name || "UnknownError");
+    return returnToApp(res, plugin.id, "error", reason);
+  }
+});
 
 router.use(requireAuth);
 router.use(pluginRateLimiter);
@@ -140,17 +209,9 @@ router.post("/:pluginId/tools/:toolName", async (req, res, next) => {
 
 router.get("/:pluginId/oauth/start", async (req, res, next) => {
   try {
-    const plugin = getPlugin(req.params.pluginId);
-    if (!plugin) throw new PluginError("That plugin does not exist in the catalog.", 404, "plugin_not_found");
-    if (plugin.auth.type !== "oauth") {
-      throw new PluginError("This plugin does not use OAuth.", 400, "oauth_not_supported");
-    }
-    const base = process.env.PLUGIN_OAUTH_REDIRECT_BASE
-      || `${req.protocol}://${req.get("host")}/api/plugins/${encodeURIComponent(plugin.id)}/oauth/callback`;
-    const result = buildOAuthAuthorizeUrl({
-      pluginId: plugin.id,
-      userId: req.userId,
-      redirectUri: base
+    const result = await beginOAuthConnection(req.userId, req.params.pluginId, {
+      redirectUri: oauthCallbackUri(String(req.params.pluginId), req),
+      requestId: req.requestId
     });
     return res.json(result);
   } catch (error) {
@@ -159,19 +220,21 @@ router.get("/:pluginId/oauth/start", async (req, res, next) => {
   }
 });
 
-router.post("/:pluginId/oauth/callback", async (req, res, next) => {
+// Apps that open the sign-in in a separate browser never see the redirect land,
+// so they poll this instead. It reports only what the account already owns.
+router.get("/:pluginId/oauth/status", async (req, res, next) => {
   try {
-    const plugin = getPlugin(req.params.pluginId);
-    if (!plugin) throw new PluginError("That plugin does not exist in the catalog.", 404, "plugin_not_found");
-    const state = verifyOAuthState(req.body?.state);
-    if (String(state.sub) !== String(req.userId) || state.pluginId !== plugin.id) {
-      throw new PluginError("The OAuth state does not belong to this account or plugin.", 400, "invalid_oauth_state");
-    }
-    throw new PluginError(
-      "The OAuth callback was verified, but token exchange for this provider has not been implemented yet.",
-      501,
-      "oauth_exchange_not_implemented"
-    );
+    const plugin = await getPluginDetail(req.userId, req.params.pluginId);
+    return res.json({
+      pluginId: plugin.id,
+      availability: plugin.availability,
+      oauthConfigured: Boolean(plugin.oauth?.configured),
+      installed: plugin.installed,
+      connection: plugin.connection,
+      account: plugin.config?.account || null,
+      scopes: plugin.config?.scopes || "",
+      lastError: plugin.lastError || plugin.lastTestMessage || ""
+    });
   } catch (error) {
     if (error instanceof PluginError) return fail(res, error);
     return next(error);

@@ -4,6 +4,7 @@ import PluginInstallation from "./installation.js";
 import { PLUGIN_CATALOG, catalogSummary, getPlugin } from "./catalog.js";
 import { getAdapter, publicTools, findTool } from "./adapters/index.js";
 import { PluginError, isPluginError } from "./errors.js";
+import { buildOAuthAuthorizeUrl, exchangeOAuthCode, oauthConfiguration } from "./oauth.js";
 import { redactSecrets, secretValues } from "./redact.js";
 import { splitSecretFields, validateFields, validateInput } from "./validation.js";
 
@@ -53,11 +54,40 @@ function installationView(installation) {
   };
 }
 
-function decorate(plugin, installation) {
+function oauthSummary(plugin, oauthInstallation) {
+  if (!plugin.oauthPluginId) return null;
+  const companion = getPlugin(plugin.oauthPluginId);
+  if (!companion) return null;
+  const view = installationView(oauthInstallation);
+  const config = oauthConfiguration(companion.id);
+  return {
+    pluginId: companion.id,
+    label: companion.auth.label,
+    configured: config.configured,
+    installed: Boolean(view),
+    connection: view?.connection || "disconnected",
+    account: oauthInstallation?.config?.account || null,
+    scopes: oauthInstallation?.config?.scopes || "",
+    // The scope string is public by design (it travels in the authorization URL),
+    // so the app can say what the sign-in will ask for before it asks.
+    offeredScopes: config.scopes,
+    lastCheckAt: view?.lastTestAt || null,
+    lastCheckStatus: view?.lastTestStatus || "",
+    lastError: view?.lastError || ""
+  };
+}
+
+// A sign-in row shares its primary plugin's adapter, so only that row resolves its
+// tool list through the adapter code; every other row keeps the catalog-id lookup.
+function toolsFor(plugin) {
+  return publicTools(plugin.auth.type === "oauth" ? plugin.adapter : plugin.id);
+}
+
+function decorate(plugin, installation, oauthInstallation = null) {
   const view = installationView(installation);
   return {
     ...plugin,
-    tools: publicTools(plugin.id),
+    tools: toolsFor(plugin),
     installed: Boolean(view),
     connection: view?.connection || "disconnected",
     installedAt: view?.installedAt || null,
@@ -66,15 +96,16 @@ function decorate(plugin, installation) {
     lastTestMessage: view?.lastTestMessage || "",
     lastError: view?.lastError || "",
     config: view?.config || {},
-    credentialsConfigured: view?.credentialsConfigured || {}
+    credentialsConfigured: view?.credentialsConfigured || {},
+    oauth: oauthSummary(plugin, oauthInstallation)
   };
 }
 
 export async function listPlugins(userId) {
   const installations = await PluginInstallation.find({ userId }).lean();
   const byId = new Map(installations.map(installation => [installation.pluginId, installation]));
-  const plugins = PLUGIN_CATALOG.map(plugin => decorate(plugin, byId.get(plugin.id)));
-  const installed = plugins.filter(plugin => plugin.installed);
+  const plugins = PLUGIN_CATALOG.map(plugin => decorate(plugin, byId.get(plugin.id), byId.get(plugin.oauthPluginId)));
+  const installed = plugins.filter(plugin => plugin.marketplaceEntry !== false && plugin.installed);
   return {
     plugins,
     summary: {
@@ -89,7 +120,10 @@ export async function getPluginDetail(userId, pluginId) {
   const plugin = getPlugin(pluginId);
   if (!plugin) throw new PluginError("That plugin does not exist in the catalog.", 404, "plugin_not_found");
   const installation = await PluginInstallation.findOne({ userId, pluginId: plugin.id }).lean();
-  return decorate(plugin, installation);
+  const companion = plugin.oauthPluginId
+    ? await PluginInstallation.findOne({ userId, pluginId: plugin.oauthPluginId }).lean()
+    : null;
+  return decorate(plugin, installation, companion);
 }
 
 async function loadInstallation(userId, pluginId, { withCredentials = false } = {}) {
@@ -164,11 +198,19 @@ export async function installPlugin(userId, pluginId, input = {}, { requestId = 
       "adapter_not_available"
     );
   }
-  if (plugin.availability === "oauth_required") {
+  if (plugin.auth.type === "oauth") {
+    if (!oauthConfiguration(plugin.id).configured) {
+      console.warn(`Plugin OAuth is not configured for ${plugin.id}; missing ${oauthConfiguration(plugin.id).variableNames.join(", ")}.`);
+      throw new PluginError(
+        `${plugin.name} needs a sign-in app that has not been configured on this server yet.`,
+        501,
+        "oauth_not_configured"
+      );
+    }
     throw new PluginError(
-      "This plugin needs an OAuth app that has not been configured on this server yet.",
-      501,
-      "oauth_not_configured"
+      `${plugin.name} connects through its own sign-in. Use the connect button instead of sending credentials.`,
+      400,
+      "oauth_connection_required"
     );
   }
 
@@ -199,7 +241,7 @@ export async function installPlugin(userId, pluginId, input = {}, { requestId = 
   ).lean();
   await audit(userId, plugin.id, "install", "success", {
     requestId,
-    metadata: { authType: plugin.auth.type, toolCount: publicTools(plugin.id).length }
+    metadata: { authType: plugin.auth.type, toolCount: toolsFor(plugin).length }
   });
   return { plugin: decorate(plugin, installation), message };
 }
@@ -294,10 +336,135 @@ export async function testPlugin(userId, pluginId, { requestId = "" } = {}) {
 export async function uninstallPlugin(userId, pluginId, { requestId = "" } = {}) {
   const plugin = getPlugin(pluginId);
   if (!plugin) throw new PluginError("That plugin does not exist in the catalog.", 404, "plugin_not_found");
+  await revokeCredentials(userId, plugin, { requestId });
   const result = await PluginInstallation.deleteOne({ userId, pluginId: plugin.id });
   if (!result.deletedCount) throw new PluginError("This plugin is not installed.", 404, "plugin_not_installed");
   await audit(userId, plugin.id, "uninstall", "success", { requestId });
   return { uninstalled: true, pluginId: plugin.id };
+}
+
+// A sign-in token stays valid at the provider after the local record is deleted,
+// so disconnecting asks the provider to drop it too. Failure is logged by name
+// only and never blocks the deletion: the user's intent is to revoke access.
+async function revokeCredentials(userId, plugin, { requestId = "" } = {}) {
+  if (plugin.auth.type !== "oauth") return;
+  const adapter = getAdapter(plugin.adapter);
+  if (!adapter || typeof adapter.revoke !== "function") return;
+  if (!oauthConfiguration(plugin.id).configured) return;
+  const installation = await loadInstallation(userId, plugin.id, { withCredentials: true });
+  if (!installation?.encryptedCredentials) return;
+  let credentials;
+  try {
+    credentials = decryptCredentials(installation);
+  } catch {
+    return;
+  }
+  try {
+    await adapter.revoke(credentials, {
+      config: oauthConfiguration(plugin.id),
+      signal: connectionSignal()
+    });
+  } catch (error) {
+    console.error(`Token revocation failed for ${plugin.id}:`, error?.name || "UnknownError");
+    await audit(userId, plugin.id, "uninstall", "error", {
+      requestId,
+      errorCode: "revocation_failed",
+      metadata: { via: "oauth" }
+    });
+  }
+}
+
+export async function beginOAuthConnection(userId, pluginId, { redirectUri = "", requestId = "" } = {}) {
+  const plugin = getPlugin(pluginId);
+  if (!plugin) throw new PluginError("That plugin does not exist in the catalog.", 404, "plugin_not_found");
+  if (plugin.auth.type !== "oauth") {
+    throw new PluginError("This plugin does not use a sign-in connection.", 400, "oauth_not_supported");
+  }
+  const adapter = getAdapter(plugin.adapter);
+  if (!adapter) throw new PluginError("This plugin has no implemented adapter.", 409, "adapter_not_available");
+  if (!oauthConfiguration(plugin.id).configured) {
+    console.warn(`Plugin OAuth is not configured for ${plugin.id}; missing ${oauthConfiguration(plugin.id).variableNames.join(", ")}.`);
+    throw new PluginError(
+      `${plugin.name} needs a sign-in app that has not been configured on this server yet.`,
+      501,
+      "oauth_not_configured"
+    );
+  }
+  const result = await buildOAuthAuthorizeUrl({ pluginId: plugin.id, userId, redirectUri });
+  await audit(userId, plugin.id, "oauth_start", "success", { requestId, metadata: { via: "oauth" } });
+  // Only the provider URL travels back to the app. The state stays server-side in
+  // the signed token inside that URL and in its single-use record.
+  return { url: result.url };
+}
+
+export async function completeOAuthConnection({
+  userId,
+  pluginId,
+  code,
+  redirectUri,
+  requestId = ""
+}) {
+  const plugin = getPlugin(pluginId);
+  if (!plugin) throw new PluginError("That plugin does not exist in the catalog.", 404, "plugin_not_found");
+  const adapter = getAdapter(plugin.adapter);
+  if (!adapter) throw new PluginError("This plugin has no implemented adapter.", 409, "adapter_not_available");
+  const started = Date.now();
+  const tokens = await exchangeOAuthCode({
+    pluginId: plugin.id,
+    code,
+    redirectUri,
+    signal: connectionSignal()
+  });
+  const credentials = {
+    accessToken: tokens.accessToken,
+    ...(tokens.refreshToken ? { refreshToken: tokens.refreshToken } : {})
+  };
+  const secrets = secretValues(credentials);
+  let account = {};
+  if (typeof adapter.authenticate === "function") {
+    try {
+      account = await adapter.authenticate(credentials, { signal: connectionSignal() });
+    } catch (error) {
+      throw new PluginError(
+        `The sign-in succeeded but ${plugin.name} would not say which account it belongs to: ${safeErrorMessage(error, secrets)}`,
+        422,
+        "account_verification_failed",
+        { cause: error }
+      );
+    }
+  }
+  const message = redactSecrets(
+    account?.login ? `Signed in as ${account.login}.` : `${plugin.name} is connected.`,
+    secrets
+  );
+  const now = new Date();
+  const installation = await PluginInstallation.findOneAndUpdate(
+    { userId, pluginId: plugin.id },
+    {
+      $set: {
+        status: "connected",
+        config: {
+          ...(account && Object.keys(account).length ? { account } : {}),
+          scopes: tokens.scope,
+          connectedVia: "oauth"
+        },
+        credentialKeys: Object.keys(credentials),
+        encryptedCredentials: encryptSecret(JSON.stringify(credentials)),
+        connectedAt: now,
+        lastTestAt: now,
+        lastTestStatus: "connected",
+        lastTestMessage: message,
+        lastError: ""
+      }
+    },
+    { upsert: true, new: true, setDefaultsOnInsert: true, runValidators: true }
+  ).lean();
+  await audit(userId, plugin.id, "oauth_callback", "success", {
+    requestId,
+    durationMs: Date.now() - started,
+    metadata: { via: "oauth", scopes: tokens.scope || "", login: account?.login || "" }
+  });
+  return { plugin: decorate(plugin, installation), message };
 }
 
 export async function executePluginTool(userId, pluginId, toolName, args = {}, {
@@ -388,7 +555,7 @@ export async function toolDefinitionsForUser(userId) {
   for (const installation of installations) {
     const plugin = getPlugin(installation.pluginId);
     if (!plugin) continue;
-    for (const tool of publicTools(plugin.id)) {
+    for (const tool of toolsFor(plugin)) {
       if (tool.sensitive) continue;
       definitions.push({
         type: "function",

@@ -87,7 +87,7 @@ async function fetchFollowingValidatedRedirects(url, init, maxRedirects = 3) {
   throw new PluginError("The plugin service redirected too many times.", 502, "unsafe_redirect");
 }
 
-export async function requestText(url, {
+async function requestWithHeaders(url, {
   method = "GET",
   headers = {},
   body,
@@ -131,7 +131,7 @@ export async function requestText(url, {
     if (text.length > maxBytes) {
       throw new PluginError("The plugin service returned more data than allowed.", 502, "response_too_large");
     }
-    if (response.ok) return text;
+    if (response.ok) return { text, headers: response.headers, status: response.status };
 
     const retryAfter = retryAfterMs(response.headers);
     const message = safeMessage(text, response.status);
@@ -145,13 +145,71 @@ export async function requestText(url, {
   throw lastError || new PluginError("The plugin request failed.", 502, "upstream_error");
 }
 
+export async function requestText(url, options = {}) {
+  return (await requestWithHeaders(url, options)).text;
+}
+
 export async function requestJson(url, options = {}) {
-  const text = await requestText(url, options);
+  const { text } = await requestWithHeaders(url, options);
   try {
     return text ? JSON.parse(text) : {};
   } catch {
     throw new PluginError("The plugin service returned an invalid JSON response.", 502, "invalid_response");
   }
+}
+
+// Some providers page with Link headers and quote the remaining budget in
+// x-ratelimit-* headers. Both are only visible on the response itself, so this
+// returns them next to the parsed body instead of dropping them.
+export async function requestJsonPage(url, options = {}) {
+  const response = await requestWithHeaders(url, options);
+  let data;
+  try {
+    data = response.text ? JSON.parse(response.text) : {};
+  } catch {
+    throw new PluginError("The plugin service returned an invalid JSON response.", 502, "invalid_response");
+  }
+  return { data, ...linkPage(response.headers), rateLimit: rateLimitInfo(response.headers) };
+}
+
+function linkPage(headers) {
+  const link = headers?.get?.("link");
+  if (!link) return {};
+  const rels = {};
+  for (const part of String(link).split(",")) {
+    const match = part.match(/<([^>]+)>\s*;\s*rel="([^"]+)"/);
+    if (match) rels[match[2]] = match[1];
+  }
+  const pageNumber = value => {
+    if (!value) return null;
+    try {
+      const raw = new URL(value).searchParams.get("page");
+      const number = Number(raw);
+      return raw && Number.isFinite(number) ? number : null;
+    } catch {
+      return null;
+    }
+  };
+  const out = {};
+  if (rels.next) out.nextPage = pageNumber(rels.next);
+  if (rels.last) out.lastPage = pageNumber(rels.last);
+  return out;
+}
+
+function rateLimitInfo(headers) {
+  const read = key => {
+    const value = headers?.get?.(key);
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+  };
+  const limit = read("x-ratelimit-limit");
+  if (limit === null) return undefined;
+  return {
+    limit,
+    remaining: read("x-ratelimit-remaining"),
+    used: read("x-ratelimit-used"),
+    resetsAt: read("x-ratelimit-reset") ? new Date(read("x-ratelimit-reset") * 1000).toISOString() : ""
+  };
 }
 
 export function queryString(values) {
