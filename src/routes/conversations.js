@@ -40,6 +40,8 @@ function serializeMessage(message) {
     role: message.role,
     content: message.content,
     ...(message.messageId ? { messageId: message.messageId } : {}),
+    ...(message.status && message.status !== "completed" ? { status: message.status } : {}),
+    ...(message.status === "failed" && message.errorCode ? { errorCode: message.errorCode } : {}),
     ...(message.feedback ? { feedback: message.feedback } : {}),
     ...(Array.isArray(message.attachments) && message.attachments.length > 0
       ? { attachments: message.attachments.map(attachment => ({ name: attachment.name, mimeType: attachment.mimeType, bytes: attachment.bytes })) }
@@ -52,6 +54,24 @@ function serializeMessage(message) {
             status: artifact.status,
             fileCount: artifact.fileCount,
             bytes: artifact.bytes
+          }))
+        }
+      : {}),
+    // The steps a desktop agent turn really ran, projected field by field so a
+    // reloaded chat can replay them instead of showing only the conclusion.
+    ...(Array.isArray(message.progress) && message.progress.length > 0
+      ? {
+          progress: message.progress.map(event => ({
+            seq: event.seq,
+            at: event.at,
+            phase: event.phase,
+            status: event.status,
+            message: event.message,
+            ...(event.tool ? { tool: event.tool } : {}),
+            ...(event.path ? { path: event.path } : {}),
+            ...(event.code ? { code: event.code } : {}),
+            ...(event.callId ? { callId: event.callId } : {}),
+          ...(event.key ? { key: event.key } : {})
           }))
         }
       : {}),

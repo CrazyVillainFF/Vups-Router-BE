@@ -21,6 +21,10 @@ import {
 
 const router = Router();
 
+// One answer for "that ticket does not exist" and "you are not the app that
+// asked", so a poll cannot be used to learn which tickets are live.
+const UNVERIFIABLE_POLL_MESSAGE = "The sign-in request could not be verified. Start again from the app.";
+
 function publicUser(user) {
   return { id: String(user._id), name: user.name, email: user.email };
 }
@@ -65,19 +69,27 @@ router.post("/approve", authRateLimiter, requireAuth, async (req, res, next) => 
   try {
     const ticket = req.body?.ticket;
     if (!isToken(ticket)) {
-      return res.status(400).json({ message: "This sign-in link is incomplete. Start again from the app." });
+      return res.status(400).json({ status: "invalid", message: "This sign-in link is incomplete. Start again from the app." });
     }
     await connectToDatabase();
     const request = await DesktopAuthRequest.findOne({ ticketHash: hashToken(ticket) });
-    if (!request || request.expiresAt.getTime() <= Date.now()) {
-      return res.status(410).json({ message: "This sign-in request expired. Start again from the app." });
+    if (!request) {
+      // Never confirm that a ticket is unknown: the same shape is returned for
+      // an unverifiable link so this endpoint cannot be used to probe tickets.
+      return res.status(400).json({ status: "invalid", message: "This sign-in link is not recognized. Start again from the app." });
+    }
+    if (request.status === "consumed") {
+      return res.status(409).json({ status: "consumed", message: "This sign-in was already completed in the app. Start again from the app." });
+    }
+    if (request.expiresAt.getTime() <= Date.now()) {
+      return res.status(410).json({ status: "expired", message: "This sign-in request expired. Start again from the app." });
     }
     if (request.status === "pending") {
       request.status = "approved";
       request.userId = req.userId;
       await request.save();
     } else if (request.status !== "approved" || String(request.userId) !== String(req.userId)) {
-      return res.status(409).json({ message: "This sign-in request was already used. Start again from the app." });
+      return res.status(409).json({ status: "consumed", message: "This sign-in request was already used. Start again from the app." });
     }
     return res.json({ status: "approved" });
   } catch (error) {
@@ -87,23 +99,37 @@ router.post("/approve", authRateLimiter, requireAuth, async (req, res, next) => 
 
 // The app polls with the verifier. A successful poll consumes the approval
 // exactly once and installs the normal session cookie on the app's origin.
+//
+// Disclosure is verifier-first: an unknown ticket and a wrong verifier return
+// one indistinguishable answer, so no caller who lacks the verifier learns
+// anything about the transaction behind a ticket.
 router.post("/poll", desktopAuthPollRateLimiter, async (req, res, next) => {
   try {
     const ticket = req.body?.ticket;
     const verifier = req.body?.verifier;
     if (!isToken(ticket) || !isToken(verifier)) {
-      return res.status(400).json({ status: "invalid", message: "The sign-in request was malformed. Start again from the app." });
+      return res.status(400).json({ status: "invalid", message: UNVERIFIABLE_POLL_MESSAGE });
     }
     await connectToDatabase();
     const request = await DesktopAuthRequest.findOne({ ticketHash: hashToken(ticket) });
-    if (!request || request.expiresAt.getTime() <= Date.now() || request.status === "consumed") {
+    if (!request || !safeEqual(challengeForVerifier(verifier), request.challenge)) {
+      return res.status(400).json({ status: "invalid", message: UNVERIFIABLE_POLL_MESSAGE });
+    }
+    // A consumed transaction is a completed sign-in, never an expired one, so
+    // this branch has to precede the expiry check. It answers idempotently so a
+    // duplicate poll cannot be mistaken for failure, and it withholds both a
+    // fresh cookie and the account identity because the single issuance already
+    // happened.
+    if (request.status === "consumed") {
+      return res.json({ status: "completed" });
+    }
+    // A ticket that expired while still pending, or while approved but never
+    // redeemed, stays rejected instead of reporting pending forever.
+    if (request.expiresAt.getTime() <= Date.now()) {
       return res.status(410).json({ status: "expired", message: "This sign-in request expired. Start again from the app." });
     }
     if (request.status === "pending") {
       return res.status(202).json({ status: "pending" });
-    }
-    if (!safeEqual(challengeForVerifier(verifier), request.challenge)) {
-      return res.status(400).json({ status: "invalid", message: "The sign-in request could not be verified. Start again from the app." });
     }
     const consumed = await DesktopAuthRequest.findOneAndUpdate(
       { _id: request._id, status: "approved" },
@@ -111,7 +137,7 @@ router.post("/poll", desktopAuthPollRateLimiter, async (req, res, next) => {
       { returnDocument: "before" }
     );
     if (!consumed) {
-      return res.status(410).json({ status: "expired", message: "This sign-in request was already used. Start again from the app." });
+      return res.json({ status: "completed" });
     }
     const user = await User.findById(consumed.userId).select("name email");
     if (!user) {

@@ -132,8 +132,80 @@ test("approval then poll hands the session to the app exactly once", async () =>
     method: "POST",
     body: { ticket, verifier: secret }
   });
-  assert.equal(replay.status, 410);
-  assert.equal(replay.cookie, "");
+  assert.equal(replay.status, 200, "a redeemed transaction answers, it does not fail");
+  assert.equal(replay.json.status, "completed", "a consumed transaction is never called expired");
+  assert.equal(replay.cookie, "", "replay must not issue a second session");
+  assert.equal(replay.json.user, undefined, "replay must not expose the account");
+});
+
+test("replay with the wrong verifier learns nothing more than invalid", async () => {
+  const { ticket, verifier: secret } = await begin();
+  const { cookie } = await signedInUser();
+  await api("/api/auth/desktop/approve", { method: "POST", body: { ticket }, cookie });
+  const redeem = await api("/api/auth/desktop/poll", { method: "POST", body: { ticket, verifier: secret } });
+  assert.equal(redeem.status, 200);
+  assert.equal(redeem.json.status, "approved");
+
+  const stranger = await api("/api/auth/desktop/poll", { method: "POST", body: { ticket, verifier: verifier() } });
+  assert.equal(stranger.status, 400);
+  assert.equal(stranger.json.status, "invalid");
+  assert.equal(stranger.cookie, "");
+  assert.equal(stranger.json.user, undefined);
+});
+
+test("an unknown ticket and a wrong verifier are indistinguishable", async () => {
+  const { verifier: secret } = await begin();
+  const ghost = await api("/api/auth/desktop/poll", {
+    method: "POST",
+    body: { ticket: randomBytes(32).toString("base64url"), verifier: secret }
+  });
+  assert.equal(ghost.status, 400);
+  assert.equal(ghost.json.status, "invalid");
+
+  const wrongVerifier = await api("/api/auth/desktop/poll", {
+    method: "POST",
+    body: { ticket: (await begin()).ticket, verifier: verifier() }
+  });
+  assert.equal(wrongVerifier.status, 400);
+  assert.equal(wrongVerifier.json.status, "invalid");
+  assert.equal(
+    JSON.stringify(ghost.json),
+    JSON.stringify(wrongVerifier.json),
+    "an unknown ticket cannot be told apart from an unverified one"
+  );
+});
+
+test("a ticket that expired while still pending is rejected, not left pending", async () => {
+  const { ticket, verifier: secret } = await begin();
+  await DesktopAuthRequest.updateOne(
+    { ticketHash: hashToken(ticket) },
+    { expiresAt: new Date(Date.now() - 1000) }
+  );
+
+  const poll = await api("/api/auth/desktop/poll", {
+    method: "POST",
+    body: { ticket, verifier: secret }
+  });
+  assert.equal(poll.status, 410);
+  assert.equal(poll.json.status, "expired");
+  assert.equal(poll.cookie, "");
+});
+
+test("a completed sign-in stays completed after its window lapses", async () => {
+  const { ticket, verifier: secret } = await begin();
+  const { cookie } = await signedInUser();
+  await api("/api/auth/desktop/approve", { method: "POST", body: { ticket }, cookie });
+  const redeem = await api("/api/auth/desktop/poll", { method: "POST", body: { ticket, verifier: secret } });
+  assert.equal(redeem.json.status, "approved");
+
+  await DesktopAuthRequest.updateOne(
+    { ticketHash: hashToken(ticket) },
+    { expiresAt: new Date(Date.now() - 1000) }
+  );
+  const late = await api("/api/auth/desktop/poll", { method: "POST", body: { ticket, verifier: secret } });
+  assert.equal(late.status, 200);
+  assert.equal(late.json.status, "completed", "success is never relabelled expired");
+  assert.equal(late.cookie, "");
 });
 
 test("a wrong verifier cannot redeem an approved ticket", async () => {

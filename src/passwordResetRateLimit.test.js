@@ -25,11 +25,14 @@ test("forgot-password, verify-code, and reset-password are independently rate li
   try {
     const forgotOne = await attempt("/api/forgot-password", { email: "not-an-email" });
     assert.equal(forgotOne.status, 400);
+    assert.equal((await forgotOne.json()).state, "invalid_request");
     const forgotTwo = await attempt("/api/forgot-password", { email: "not-an-email" });
     assert.equal(forgotTwo.status, 400);
     const forgotThree = await attempt("/api/forgot-password", { email: "not-an-email" });
     assert.equal(forgotThree.status, 429, "the third forgot-password attempt must be rate limited");
-    assert.match((await forgotThree.json()).message, /Too many password reset requests/);
+    const forgotThreeBody = await forgotThree.json();
+    assert.match(forgotThreeBody.message, /Too many password reset requests/);
+    assert.equal(forgotThreeBody.state, "rate_limited", "a refused request must not look like an accepted one");
 
     const verifyOne = await attempt("/api/verify-code", { email: "not-an-email", code: "000000" });
     assert.equal(verifyOne.status, 400);
@@ -37,7 +40,9 @@ test("forgot-password, verify-code, and reset-password are independently rate li
     assert.equal(verifyTwo.status, 400);
     const verifyThree = await attempt("/api/verify-code", { email: "not-an-email", code: "000000" });
     assert.equal(verifyThree.status, 429, "the third verify-code attempt must be rate limited");
-    assert.match((await verifyThree.json()).message, /Too many code verification attempts/);
+    const verifyThreeBody = await verifyThree.json();
+    assert.match(verifyThreeBody.message, /Too many code verification attempts/);
+    assert.equal(verifyThreeBody.state, "rate_limited");
 
     const resetOne = await attempt("/api/reset-password", { email: "not-an-email", code: "000000", newPassword: "short" });
     assert.equal(resetOne.status, 400);
@@ -47,6 +52,7 @@ test("forgot-password, verify-code, and reset-password are independently rate li
     assert.equal(resetThree.status, 429);
     const resetThreeBody = await resetThree.json();
     assert.match(resetThreeBody.message, /Too many password reset attempts/);
+    assert.equal(resetThreeBody.state, "rate_limited");
     assert.doesNotMatch(JSON.stringify(resetThreeBody), /brevo|api-key|stack/i);
   } finally {
     await new Promise(resolve => server.close(resolve));

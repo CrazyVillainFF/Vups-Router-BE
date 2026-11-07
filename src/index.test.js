@@ -1225,7 +1225,7 @@ test("chat surfaces provider errors clearly (invalid key, rate limit, unavailabl
   fakeProvider.state.reset();
 });
 
-test("stopping a non-streaming chat aborts upstream work and persists nothing", async () => {
+test("stopping a non-streaming chat aborts upstream work and keeps the submitted message", async () => {
   const { cookie } = await signupUser();
   await configureProvider(cookie);
   fakeProvider.state.reset();
@@ -1252,7 +1252,17 @@ test("stopping a non-streaming chat aborts upstream work and persists nothing", 
   await new Promise(resolve => setTimeout(resolve, 500));
   const conversations = await api("/api/conversations", { cookie });
   assert.equal(conversations.status, 200);
-  assert.equal(conversations.body.conversations.length, 0, "a stopped turn must not be saved");
+  // The submitted message is durable before the provider is called, so Stop
+  // settles the turn instead of erasing it. What must never land is the answer
+  // that arrived after the user stopped.
+  assert.equal(conversations.body.conversations.length, 1, "the stopped submission is still recorded");
+  const detail = await api(`/api/conversations/${conversations.body.conversations[0].id}`, { cookie });
+  const [first, last] = detail.body.conversation.messages;
+  assert.equal(first.role, "user");
+  assert.equal(first.content, "This turn will be stopped");
+  assert.equal(last.role, "assistant");
+  assert.equal(last.status, "interrupted");
+  assert.doesNotMatch(JSON.stringify(detail.body.conversation.messages), /Echo from/, "a late answer is discarded");
   fakeProvider.state.reset();
 });
 

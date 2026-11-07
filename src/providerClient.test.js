@@ -725,6 +725,32 @@ test("classifies provider 429s by structured quota, token, concurrency, and shar
   );
 });
 
+test("a busy 409 is a wait, and a 409 without a busy signal stays permanent", () => {
+  const busy = classifyProviderFailure({
+    status: 409,
+    payload: {
+      error: {
+        type: "invalid_request_error",
+        message: "Session is currently processing a turn. Cancel the current turn or wait for completion."
+      }
+    }
+  });
+  assert.equal(busy.category, "session_busy");
+  assert.equal(busy.classification, "transient");
+  assert.equal(busy.retryable, true);
+
+  const conflict = classifyProviderFailure({
+    status: 409,
+    payload: { error: { message: "The session is in a conflicting state." } }
+  });
+  assert.equal(conflict.classification, "permanent");
+  assert.equal(conflict.retryable, false);
+
+  const described = describeProviderError(409, { error: { message: "Session is currently processing a turn." } });
+  assert.equal(described.code, "session_busy");
+  assert.equal(isRetryableProviderError(described), true);
+});
+
 test("HTTP 400 context-window failures are classified as context limits, not credentials", () => {
   const classified = classifyProviderFailure({
     status: 400,

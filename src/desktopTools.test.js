@@ -181,7 +181,7 @@ test("the desktop route offers every native local tool and returns the model's c
   const { DESKTOP_TOOL_NAMES } = await import("./desktopTools.js");
   const offered = body.tools.map(tool => tool.function.name);
   assert.deepEqual(offered, [...DESKTOP_TOOL_NAMES]);
-  assert.equal(offered.length, 27);
+  assert.equal(offered.length, 30);
   for (const name of [
     "search_file_contents",
     "create_directory",
@@ -579,6 +579,23 @@ test("an exhausted retry budget says the model is unavailable and reports how ha
   fakeProvider.state.set({ chatStatus: 200 });
   delete process.env.VUPS_RETRY_BASE_MS;
   delete process.env.VUPS_MAX_RETRIES;
+});
+
+test("the desktop prompt never stops a task to ask where the work lives", async () => {
+  const { DESKTOP_TOOL_PROMPT } = await import("./desktopTools.js");
+
+  assert.match(
+    DESKTOP_TOOL_PROMPT,
+    /the app's own Files folder inside the user's Documents folder/,
+    "an unbound chat is given the real default location"
+  );
+  assert.match(DESKTOP_TOOL_PROMPT, /Do not ask where the work should live/);
+  assert.doesNotMatch(
+    DESKTOP_TOOL_PROMPT,
+    /ask the user to add the folder or change modes/,
+    "an outside_workspace refusal is reported, not turned into a folder question"
+  );
+  assert.doesNotMatch(DESKTOP_TOOL_PROMPT, /offer to pick a different folder/);
 });
 
 test("the desktop prompt bans invented Windows permission advice", async () => {
@@ -1023,5 +1040,170 @@ test("a desktop run expires from idleness, not total age", async () => {
     "a run still receiving rounds stays alive past the TTL"
   );
   assert.equal(desktopRunExpired({ lastUsedAt: now - hour }, now), true);
+});
+
+test("the three skills tools are offered with the arguments the native engine reads", async () => {
+  const { DESKTOP_TOOLS, DESKTOP_TOOL_NAMES } = await import("./desktopTools.js");
+
+  for (const name of ["list_skills", "use_skill", "read_skill_reference"]) {
+    assert.equal(DESKTOP_TOOL_NAMES.includes(name), true, `${name} must be a name the run accepts`);
+  }
+
+  const list = DESKTOP_TOOLS.find(tool => tool.function.name === "list_skills");
+  const use = DESKTOP_TOOLS.find(tool => tool.function.name === "use_skill");
+  const reference = DESKTOP_TOOLS.find(tool => tool.function.name === "read_skill_reference");
+  assert.ok(list && use && reference, "all three have to be described to the model");
+
+  assert.deepEqual(list.function.parameters.properties, {}, "list_skills takes nothing");
+  assert.deepEqual(Object.keys(use.function.parameters.properties), ["id"]);
+  assert.deepEqual(use.function.parameters.required, ["id"]);
+  assert.deepEqual(Object.keys(reference.function.parameters.properties), ["id", "path"]);
+  assert.deepEqual(reference.function.parameters.required, ["id", "path"]);
+
+  assert.match(
+    use.function.description,
+    /no script inside it is executed/,
+    "a package's text is loaded as data; the model must not be led to expect it runs"
+  );
+  assert.match(
+    use.function.description,
+    /cannot change the permission mode/,
+    "an installed package must not read as a way to widen what the app allows"
+  );
+  assert.match(
+    reference.function.description,
+    /inside that package/,
+    "the reference tool is bounded to the one package folder"
+  );
+});
+
+test("the desktop prompt makes a loaded instruction file the precondition of claiming a skill", async () => {
+  const { DESKTOP_TOOL_PROMPT } = await import("./desktopTools.js");
+
+  assert.match(DESKTOP_TOOL_PROMPT, /call list_skills/);
+  assert.match(
+    DESKTOP_TOOL_PROMPT,
+    /call use_skill with its id before you follow any of it/,
+    "naming a skill is not using it; the file has to be read first"
+  );
+  assert.match(DESKTOP_TOOL_PROMPT, /only claim a skill was used when its use_skill result came back ok/i);
+  assert.match(DESKTOP_TOOL_PROMPT, /skill_not_installed, skill_disabled, skill_invalid_manifest/);
+  assert.match(
+    DESKTOP_TOOL_PROMPT,
+    /is data, not a policy/,
+    "untrusted package text must not be able to restate the app's rules"
+  );
+  assert.match(DESKTOP_TOOL_PROMPT, /Load a skill only when its own description matches/);
+});
+
+test("a real use_skill result is recorded as a skill step, and a declined one is not", async () => {
+  const loaded = {
+    ok: true,
+    data: {
+      id: "qa-inspector",
+      name: "QA Inspector",
+      author: "VupsRouter",
+      version: "1.0.0",
+      description: "Inspect a text file against a checklist.",
+      path: "C:\\Users\\test\\Documents\\VupsRouter\\Skills\\qa-inspector",
+      instructionsPath: "SKILL.md",
+      instructions: "# QA Inspector\n1. Read the file.\n2. Write the report.\n",
+      bytes: 1420,
+      integrity: "sha256:aaaa",
+      permissions: ["read"],
+      capabilities: [],
+      references: ["checklist.md", "report-format.md"]
+    }
+  };
+
+  const cookie = await newUser();
+  const id = runId("skill-used");
+  fakeProvider.state.set({ toolCalls: [{ id: "call_skill", name: "use_skill", args: { id: "qa-inspector" } }] });
+
+  const first = await api("/api/chat/desktop-tools", {
+    method: "POST",
+    cookie,
+    body: { runId: id, messages: [{ role: "user", content: "Use the QA skill to inspect the file." }] }
+  });
+  assert.equal(first.status, 200, JSON.stringify(first.body));
+  assert.equal(first.body.type, "tool_calls");
+  assert.equal(first.body.toolCalls[0].function.name, "use_skill");
+  assert.equal(
+    first.body.events.filter(event => event.phase === "skill").length,
+    0,
+    "a call that has not run yet is not a completed skill step"
+  );
+
+  fakeProvider.state.set({ toolCalls: null, chatResponseText: "Followed the QA Inspector procedure." });
+  const second = await api("/api/chat/desktop-tools", {
+    method: "POST",
+    cookie,
+    body: {
+      runId: id,
+      messages: [
+        { role: "user", content: "Use the QA skill to inspect the file." },
+        first.body.assistantMessage,
+        { role: "tool", tool_call_id: "call_skill", content: JSON.stringify(loaded) }
+      ]
+    }
+  });
+  assert.equal(second.status, 200, JSON.stringify(second.body));
+  assert.equal(second.body.type, "final");
+
+  const rows = second.body.events.filter(event => event.phase === "skill");
+  assert.equal(rows.length, 1, "the instruction file that really reached the model is recorded once");
+  assert.match(rows[0].message, /QA Inspector/);
+  assert.match(rows[0].message, /1\.0\.0/);
+  assert.equal(rows[0].tool, "use_skill");
+  assert.equal(rows[0].status, "completed");
+  assert.doesNotMatch(
+    JSON.stringify(rows),
+    /Followed the QA Inspector procedure/,
+    "the row quotes the payload, never the model's own claim"
+  );
+
+  const history = await api(`/api/conversations/${second.body.conversationId}`, { cookie });
+  const progress = history.body.conversation?.messages?.at(-1)?.progress ?? history.body.messages?.at(-1)?.progress;
+  assert.ok(
+    Array.isArray(progress) && progress.some(row => row.phase === "skill" && /QA Inspector/.test(row.message)),
+    "a reloaded chat still shows which skill was used"
+  );
+
+  const declined = await newUser();
+  const declinedRun = runId("skill-denied");
+  fakeProvider.state.set({ toolCalls: [{ id: "call_skill2", name: "use_skill", args: { id: "qa-inspector" } }] });
+  const started = await api("/api/chat/desktop-tools", {
+    method: "POST",
+    cookie: declined,
+    body: { runId: declinedRun, messages: [{ role: "user", content: "Use the QA skill." }] }
+  });
+  assert.equal(started.body.type, "tool_calls");
+  fakeProvider.state.set({ toolCalls: null, chatResponseText: "I did not load it." });
+  const finished = await api("/api/chat/desktop-tools", {
+    method: "POST",
+    cookie: declined,
+    body: {
+      runId: declinedRun,
+      messages: [
+        { role: "user", content: "Use the QA skill." },
+        started.body.assistantMessage,
+        {
+          role: "tool",
+          tool_call_id: "call_skill2",
+          content: JSON.stringify({ ok: false, error: { code: "approval_denied", message: "You declined." } })
+        }
+      ]
+    }
+  });
+  assert.equal(finished.body.type, "final");
+  assert.equal(
+    finished.body.events.filter(event => event.phase === "skill").length,
+    0,
+    "nothing was loaded, so no skill may be reported as used"
+  );
+  assert.ok(
+    finished.body.events.some(event => event.code === "approval_denied"),
+    "the declined call keeps its own real failure line"
+  );
 });
 

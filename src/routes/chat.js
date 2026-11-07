@@ -44,6 +44,20 @@ import {
   lastUserMessageText,
   normalizeDesktopToolCalls
 } from "../desktopTools.js";
+import TaskRun from "../taskRun.js";
+import {
+  answerEvent,
+  appendRunEvents,
+  cancelledEvent,
+  closeRunningEvents,
+  describeToolCall,
+  loadRunEvents,
+  providerAttemptEvent,
+  providerFailureEvent,
+  settleToolResults,
+  taskStartedEvent,
+  toolCallEvents
+} from "../taskEvents.js";
 import {
   VUPS_MODEL_ID,
   buildVupsSystemPrompt,
@@ -128,13 +142,62 @@ const DESKTOP_RUN_TTL_MS = 10 * 60 * 1000;
 // normalizeDesktopToolCalls. A smaller cap rejected the route's own history and
 // made every round after a large write fail with "not recognized".
 const MAX_DESKTOP_CALL_ARG_CHARS = 200000;
-const desktopRuns = new Map();
 
 // A run expires only after it has been idle, never mid-task. Steps that take
 // longer than the TTL (a long build, a slow approval) used to delete their own
 // run, which silently reset the round budget and the quota marker.
 export function desktopRunExpired(run, now = Date.now()) {
   return now - (run?.lastUsedAt || run?.createdAt || 0) > DESKTOP_RUN_TTL_MS;
+}
+
+// The round budget, the tool calls handed to the Windows app that have not
+// reported back, and the progress log the user watches all live in Mongo. They
+// used to be a process-local Map, so a server restart — or a second Render
+// instance answering the next round — erased a task the desktop client was
+// still continuing, and nothing recorded what the agent had really done.
+async function loadDesktopRun(runId) {
+  const run = await TaskRun.findOne({ runId }).lean();
+  if (!run) return null;
+  if (desktopRunExpired(run)) {
+    await TaskRun.deleteOne({ _id: run._id }).catch(() => {});
+    return null;
+  }
+  return run;
+}
+
+// Each accepted round pushes the idle window forward; Mongo's TTL index only
+// removes documents the route has already let go of.
+function runActivity(run) {
+  run.lastUsedAt = Date.now();
+  run.expiresAt = new Date(run.lastUsedAt + DESKTOP_RUN_TTL_MS);
+  return { lastUsedAt: run.lastUsedAt, expiresAt: run.expiresAt };
+}
+
+async function saveDesktopRun(run) {
+  await TaskRun.updateOne(
+    { runId: run.runId },
+    {
+      $set: {
+        ...runActivity(run),
+        busy: run.busy === true,
+        steps: run.steps,
+        pending: run.pending,
+        events: run.events,
+        nudged: run.nudged === true,
+        continued: run.continued === true,
+        quotaConsumed: run.quotaConsumed === true,
+        conversationId: run.conversationId
+      }
+    }
+  );
+}
+
+// The rows the client is shown this round and the rows stored for a reload are
+// the same objects, so a progress line cannot differ between live and replayed.
+async function recordRunEvents(run, events) {
+  const added = appendRunEvents(run, events);
+  if (added.length > 0) await saveDesktopRun(run);
+  return added;
 }
 
 function validDesktopRunId(value) {
@@ -208,13 +271,6 @@ function validateDesktopMessages(value) {
     return "The last desktop tool message must be a user message or a tool result.";
   }
   return { messages };
-}
-
-function cleanupDesktopRuns() {
-  const now = Date.now();
-  for (const [id, run] of desktopRuns) {
-    if (desktopRunExpired(run, now)) desktopRuns.delete(id);
-  }
 }
 
 // Limits enforced before any provider call are still context-limit failures.
@@ -513,6 +569,42 @@ export async function resolveProvider(userId, requestedModel, requestedConfigId,
   };
 }
 
+/**
+ * The provider choice behind one submitted request, resolved the same way for
+ * every caller. A task worker needs this after the request that created the task
+ * is long gone, so the selection — never a key — is what gets stored on the task.
+ */
+export async function resolveChatProvider(userId, body = {}) {
+  const requestedModel = typeof body.model === "string" ? body.model.trim() : "";
+  if (body.vups === true) {
+    const provider = vupsProviderForChat({ images: false });
+    if (requestedModel && requestedModel !== VUPS_MODEL_ID) {
+      throw new ProviderError("This route only serves Vups v3 Galax.", 400, "invalid_model");
+    }
+    return { provider, model: provider.model || VUPS_MODEL_ID };
+  }
+  const requestedConfigId = typeof body.configId === "string" ? body.configId.trim() : "";
+  const requestedProviderId = typeof body.providerId === "string" ? body.providerId.trim().slice(0, 80) : "";
+  const requestedSource = typeof body.source === "string" ? body.source.trim().toLowerCase() : "";
+  const provider = await resolveProvider(
+    userId,
+    requestedModel,
+    requestedConfigId,
+    requestedSource,
+    requestedProviderId
+  );
+  const model = requestedModel || provider.defaultModel;
+  if (!model) {
+    throw new ProviderError("Select a model in Settings or choose one from the model picker.", 400, "no_model");
+  }
+  return { provider, model };
+}
+
+export function chatSystemPrompt(mode = "general", vups = false) {
+  const normalized = CHAT_MODES.has(mode) ? mode : "general";
+  return vups === true ? buildVupsSystemPrompt(normalized) : CHAT_MODES.get(normalized);
+}
+
 async function sharedModelStatusSafely() {
   const fallback = {
     enabled: true,
@@ -592,14 +684,21 @@ export async function persistConversation(userId, conversationId, messages, assi
       (previous[index]?.role === message.role ? previous[index] : null);
     return storedMessage(message, prior);
   });
-  const assistantEntry = storedMessage(
-    { role: "assistant", content: assistantText, messageId: assistant.messageId },
-    null
-  );
-  if (Array.isArray(assistant.artifacts) && assistant.artifacts.length > 0) {
-    assistantEntry.artifacts = assistant.artifacts;
+  if (assistantText !== null) {
+    const assistantEntry = storedMessage(
+      { role: "assistant", content: assistantText, messageId: assistant.messageId },
+      null
+    );
+    if (assistant.status) assistantEntry.status = assistant.status;
+    if (assistant.errorCode) assistantEntry.errorCode = assistant.errorCode;
+    if (Array.isArray(assistant.artifacts) && assistant.artifacts.length > 0) {
+      assistantEntry.artifacts = assistant.artifacts;
+    }
+    if (Array.isArray(assistant.progress) && assistant.progress.length > 0) {
+      assistantEntry.progress = assistant.progress;
+    }
+    storedMessages.push(assistantEntry);
   }
-  storedMessages.push(assistantEntry);
   const kept = trimStoredMessages(storedMessages);
   const firstUser = kept.find(message => message.role === "user");
   const titleSource = (firstUser?.content ?? "").replace(/\s+/g, " ").trim();
@@ -645,7 +744,7 @@ function generatedArtifactStatus(finishReason, failure) {
   return "complete";
 }
 
-async function persistGeneratedTurn({
+export async function persistGeneratedTurn({
   userId,
   conversationId,
   messages,
@@ -654,7 +753,8 @@ async function persistGeneratedTurn({
   finishReason,
   failure,
   title,
-  requestId
+  requestId,
+  progress
 }) {
   const status = generatedArtifactStatus(finishReason, failure);
   const targetConversationId = conversationId && mongoose.isValidObjectId(conversationId)
@@ -678,14 +778,40 @@ async function persistGeneratedTurn({
       : "Generated code is available in this response, but it could not be saved to your history. Copy or download it now.";
   }
   const artifacts = saved.artifact ? [artifactMeta(saved.artifact)] : [];
+  const turnStatus = failure ? (failure.code === "client_aborted" ? "interrupted" : "failed") : "completed";
   const conversation = await persistConversation(
     userId,
     String(targetConversationId),
     messages,
     summary,
-    { messageId, artifacts }
+    { messageId, artifacts, status: turnStatus, errorCode: failure?.code, progress }
   );
   return { conversation, artifact: saved.artifact, artifactError: saved.error, summary };
+}
+
+// A submitted message is durable before the provider is called, so every way a
+// turn can end without an answer still needs a record. Without it a reload shows
+// a chat that looks truncated with nothing to explain or retry.
+export async function recordUnansweredTurn(userId, conversationId, messages, assistantMessageId, failure) {
+  const interrupted = failure?.code === "client_aborted";
+  try {
+    const conversation = await persistConversation(
+      userId,
+      conversationId,
+      messages,
+      interrupted
+        ? "You stopped this response before it produced any text."
+        : (failure?.message || "The model did not answer."),
+      {
+        messageId: assistantMessageId,
+        status: interrupted ? "interrupted" : "failed",
+        errorCode: interrupted ? "cancelled" : failure?.code
+      }
+    );
+    return String(conversation._id);
+  } catch {
+    return conversationId;
+  }
 }
 async function prepareContinuation(userId, conversationId, continuation, messages) {
   if (!conversationId || !mongoose.isValidObjectId(conversationId)) {
@@ -1020,7 +1146,7 @@ function sendProviderFailure(res, failure, error, requestId = null, diagnostic =
   });
 }
 
-function providerFailure(provider, error) {
+export function providerFailure(provider, error) {
   // Context limits are decided by the shared classifier before provider
   // branches. Serializing them as a safe 400 keeps credential and generic
   // mappings from overwriting the decision on the way to the client.
@@ -1162,7 +1288,7 @@ function canTrySharedFallback(provider, error) {
   return true;
 }
 
-function vupsRetryOptions() {
+export function vupsRetryOptions() {
   const number = (name, fallback) => {
     const value = Number(process.env[name]);
     return Number.isFinite(value) && value >= 0 ? Math.floor(value) : fallback;
@@ -2078,17 +2204,6 @@ router.post("/desktop-tools", requireAuth, chatRateLimiter, async (req, res, nex
     if (!validDesktopRunId(runId)) {
       return res.status(400).json({ message: "A valid desktop tool run id is required.", code: "invalid_run_id" });
     }
-    cleanupDesktopRuns();
-    let run = desktopRuns.get(runId);
-    if (run && run.userId !== req.userId) {
-      return res.status(403).json({ message: "That desktop tool run belongs to another account.", code: "run_forbidden" });
-    }
-    if (run?.busy) {
-      return res.status(409).json({ message: "This desktop tool run is already waiting for a model response.", code: "run_busy" });
-    }
-    // Every accepted round proves the run is alive, so idleness — not total age
-    // — is what expires it.
-    if (run) run.lastUsedAt = Date.now();
 
     const validated = validateDesktopMessages(body.messages);
     if (typeof validated === "string") return sendValidationFailure(res, validated);
@@ -2106,11 +2221,27 @@ router.post("/desktop-tools", requireAuth, chatRateLimiter, async (req, res, nex
     const requestedProviderId = typeof body.providerId === "string" ? body.providerId.trim().slice(0, 80) : "";
     const requestedSource = typeof body.source === "string" ? body.source.trim().toLowerCase() : "";
     const requestedConversationId = typeof body.conversationId === "string" ? body.conversationId : null;
+    // The folder the app itself bound to this turn. The server never infers a
+    // workspace from the conversation and never invents one for a progress line.
+    const requestedWorkspacePath =
+      typeof body.workspacePath === "string" ? body.workspacePath.trim().slice(0, 200) : "";
+
+    await connectToDatabase();
+
+    // The run's state lives in Mongo, so it is read after the connection is up.
+    // An expired run is dropped instead of inherited: a fresh round budget and a
+    // fresh quota marker are honest, continuing a half-forgotten task is not.
+    let run = await loadDesktopRun(runId);
+    if (run && String(run.userId) !== String(req.userId)) {
+      return res.status(403).json({ message: "That desktop tool run belongs to another account.", code: "run_forbidden" });
+    }
+    if (run?.busy) {
+      return res.status(409).json({ message: "This desktop tool run is already waiting for a model response.", code: "run_busy" });
+    }
     if (run && requestedConversationId && run.conversationId && requestedConversationId !== run.conversationId) {
       return res.status(400).json({ message: "This desktop tool run is attached to another conversation.", code: "run_conversation_mismatch" });
     }
 
-    await connectToDatabase();
     if (req.user?.aiEnabled === false) {
       return res.status(403).json({ message: "AI chat has been disabled for your account by an administrator.", code: "ai_disabled" });
     }
@@ -2145,16 +2276,21 @@ router.post("/desktop-tools", requireAuth, chatRateLimiter, async (req, res, nex
     // The selected model never gates whether local tools exist.
 
     if (!run) {
-      run = {
+      const created = await TaskRun.create({
+        runId,
         userId: req.userId,
-        conversationId: requestedConversationId,
-        createdAt: Date.now(),
-        lastUsedAt: Date.now(),
+        conversationId: requestedConversationId || "",
+        workspacePath: requestedWorkspacePath,
         steps: 0,
-        quotaConsumed: false,
-        busy: false
-      };
-      desktopRuns.set(runId, run);
+        pending: [],
+        events: [],
+        lastUsedAt: Date.now(),
+        expiresAt: new Date(Date.now() + DESKTOP_RUN_TTL_MS)
+      });
+      run = created.toObject();
+    } else if (requestedWorkspacePath && run.workspacePath !== requestedWorkspacePath) {
+      run.workspacePath = requestedWorkspacePath;
+      await TaskRun.updateOne({ runId }, { $set: { workspacePath: requestedWorkspacePath } });
     }
     if (run.steps >= MAX_DESKTOP_STEPS) {
       return res.status(429).json({
@@ -2169,12 +2305,56 @@ router.post("/desktop-tools", requireAuth, chatRateLimiter, async (req, res, nex
       });
     }
 
-    run.busy = true;
+    // The claim is conditional so two rounds racing to the same run — possibly
+    // on two server instances — cannot both spend the turn budget.
+    const claimed = await TaskRun.findOneAndUpdate(
+      { runId, busy: false },
+      { $set: { busy: true } },
+      { returnDocument: "after" }
+    ).lean();
+    if (!claimed) {
+      releaseSlot(req.userId);
+      return res.status(409).json({ message: "This desktop tool run is already waiting for a model response.", code: "run_busy" });
+    }
+    run = claimed;
+    // Progress recording must never change how a round responds: a log write
+    // that fails is dropped and the turn keeps its real outcome.
+    const record = async (events, settle = null) => {
+      try {
+        // A row this round closes is part of the round's answer: without it the
+        // app would keep showing a step as running while the stored log says it
+        // finished.
+        const closed = settle ? closeRunningEvents(run, settle) : [];
+        return [...closed, ...(await recordRunEvents(run, events))];
+      } catch {
+        return [];
+      }
+    };
     const controller = new AbortController();
     res.on("close", () => {
-      if (!res.writableEnded) controller.abort();
+      if (!res.writableEnded) {
+        // The client left, so no response can clear the flag later. Releasing it
+        // here is what lets "Stop, then send again" reach the run instead of
+        // reading a finished round as one still in flight.
+        run.busy = false;
+        saveDesktopRun(run).catch(() => {});
+        controller.abort();
+      }
     });
     try {
+      // Everything the app reported since the previous round is settled into
+      // the rows those calls already own, before anything else can end this
+      // round, so a denied or failed operation is in the log even when the
+      // model never gets another turn.
+      const addedEvents = [];
+      if ((run.events || []).length === 0) {
+        addedEvents.push(...appendRunEvents(run, [taskStartedEvent(run.workspacePath)]));
+      }
+      const reported = settleToolResults(run, validated.messages);
+      addedEvents.push(...reported.events);
+      run.pending = reported.remaining;
+      if (addedEvents.length > 0) await saveDesktopRun(run).catch(() => {});
+
       if (!run.quotaConsumed) {
         try {
           await consumeDailyQuota(req.userId);
@@ -2230,14 +2410,23 @@ router.post("/desktop-tools", requireAuth, chatRateLimiter, async (req, res, nex
         {
           ...vupsRetryOptions(),
           signal: controller.signal,
-          onRetry: event => logVupsRetry({
-            ...event,
-            requestId: req.requestId,
-            model,
-            providerHost: providerHostFromUrl(provider.baseUrl)
-          })
+          onRetry: event => {
+            logVupsRetry({
+              ...event,
+              requestId: req.requestId,
+              model,
+              providerHost: providerHostFromUrl(provider.baseUrl)
+            });
+            // A retry is a real phase of the turn, so it belongs in the log the
+            // user can replay and not only in the server logs.
+            record([providerAttemptEvent({ attempt: event.attempt, step: run.steps, code: event.error?.code })])
+              .then(rows => addedEvents.push(...rows));
+          }
         }
       );
+      // The app announces the same key before this round is even sent, so the
+      // line the user watches while the model thinks becomes this line.
+      addedEvents.push(...(await record([providerAttemptEvent({ attempt: 1, step: run.steps })])));
       try {
         result = await askModel(upstreamMessages);
       } catch (error) {
@@ -2253,6 +2442,11 @@ router.post("/desktop-tools", requireAuth, chatRateLimiter, async (req, res, nex
               message: error.message,
               code: error.code || "provider_error"
             };
+          await record([providerFailureEvent(failure.code)], {
+            tool: "cancelled",
+            provider: "failed",
+            task: "cancelled"
+          });
           return sendProviderFailure(
             res,
             failure,
@@ -2332,10 +2526,26 @@ router.post("/desktop-tools", requireAuth, chatRateLimiter, async (req, res, nex
       const toolCalls = normalizeDesktopToolCalls(result.toolCalls);
       if (toolCalls.length > 0) {
         run.steps += 1;
+        // These calls are the run's open work. The next round pairs them with
+        // what the app really did, so an outcome is recorded once and a task
+        // that never reports back stays visibly unfinished.
+        run.pending = toolCalls.map(call => {
+          const { id, tool, path } = describeToolCall(call);
+          return { id, tool, path };
+        });
+        const callEvents = await record(toolCallEvents(toolCalls));
+        // The app posts the next round the moment it finishes these calls, and a
+        // quick local read outruns a release written after the response, so the
+        // flag clears before the calls are handed over.
+        run.busy = false;
+        await saveDesktopRun(run).catch(() => {});
         return res.json({
           runId,
           type: "tool_calls",
           conversationId: run.conversationId,
+          steps: run.steps,
+          // This round's rows only; the client keeps what it already showed.
+          events: [...addedEvents, ...callEvents],
           content: result.content,
           finishReason: result.finishReason,
           toolCalls,
@@ -2360,6 +2570,14 @@ router.post("/desktop-tools", requireAuth, chatRateLimiter, async (req, res, nex
           code: "empty_response"
         });
       }
+      // The log travels with the answer, so a reloaded chat shows the steps that
+      // really ran and not only what the turn concluded.
+      const answerEvents = await record([answerEvent()], {
+        tool: "cancelled",
+        provider: "completed",
+        task: "completed"
+      });
+      const progress = (run.events || []).slice();
       const persistMessages = validated.messages.filter(message =>
         (message.role === "user" || message.role === "assistant") &&
         typeof message.content === "string" &&
@@ -2374,13 +2592,17 @@ router.post("/desktop-tools", requireAuth, chatRateLimiter, async (req, res, nex
         finishReason: result.finishReason,
         failure: null,
         title: generatedArtifactTitle(persistMessages),
-        requestId: req.requestId
+        requestId: req.requestId,
+        progress
       });
-      desktopRuns.delete(runId);
+      // Only drop the run once the turn is saved: a failed save leaves the log
+      // readable so a retry can still report what was already done.
+      await TaskRun.deleteOne({ runId });
       return res.json({
         runId,
         type: "final",
         conversationId: String(turn.conversation._id),
+        events: [...addedEvents, ...answerEvents],
         message: { role: "assistant", content: turn.summary, messageId: assistantMessageId },
         content: turn.summary,
         finishReason: result.finishReason,
@@ -2388,9 +2610,39 @@ router.post("/desktop-tools", requireAuth, chatRateLimiter, async (req, res, nex
         ...(turn.artifactError ? { artifactError: { code: turn.artifactError.code, message: turn.artifactError.message } } : {})
       });
     } finally {
+      // A stopped turn has to read as stopped: the rows it left mid-flight are
+      // cancelled, never completed, and the durable log says so.
+      if (controller.signal.aborted) {
+        await record([cancelledEvent()], { tool: "cancelled", provider: "cancelled", task: "cancelled" });
+      }
       run.busy = false;
+      await saveDesktopRun(run).catch(() => {});
       releaseSlot(req.userId);
     }
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.get("/desktop-tools/events", requireAuth, chatRateLimiter, async (req, res, next) => {
+  try {
+    const runId = typeof req.query.runId === "string" ? req.query.runId.trim() : "";
+    if (!validDesktopRunId(runId)) {
+      return res.status(400).json({ message: "A valid desktop tool run id is required.", code: "invalid_run_id" });
+    }
+    await connectToDatabase();
+    const run = await loadRunEvents({
+      runId,
+      userId: req.userId,
+      after: Number.parseInt(req.query.after, 10)
+    });
+    if (!run) {
+      return res.status(404).json({
+        message: "This task is no longer running. Its steps are saved with the answer in the conversation.",
+        code: "run_not_found"
+      });
+    }
+    return res.json({ runId, ...run });
   } catch (error) {
     return next(error);
   }
@@ -2497,12 +2749,33 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
     }
     const prospectiveId = existingConversation ? String(existingConversation._id) : String(new mongoose.Types.ObjectId());
 
+    // Nothing slow happens before the user's message is on disk. A continuation
+    // rewrites a reply that is already stored, so only a fresh turn pre-writes.
+    if (!continuation) {
+      try {
+        await persistConversation(req.userId, prospectiveId, validated.messages, null);
+      } catch {
+        return res.status(503).json({
+          message: "VupsRouter could not save your message, so it was not sent. Try again.",
+          code: "persist_failed"
+        });
+      }
+    }
+
     if (!stream) {
       let result;
       let usedModel = model;
       let fallbackUsed = false;
       let pluginRun = null;
       const halted = new AbortController();
+      // Stop ends the turn, not the submission. The message is already durable
+      // by now, so every way this branch gives up has to leave the same
+      // interrupted record the next load can show and retry. The id is stable,
+      // so a second write rewrites that message instead of adding another.
+      const recordStoppedTurn = () =>
+        recordUnansweredTurn(req.userId, prospectiveId, validated.messages, assistantMessageId, {
+          code: "client_aborted"
+        });
       res.on("close", () => {
         if (!res.writableEnded) halted.abort();
       });
@@ -2526,7 +2799,10 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
           conversationId: prospectiveId
         });
       } catch (error) {
-        if (halted.signal.aborted) return;
+        if (halted.signal.aborted) {
+          await recordStoppedTurn();
+          return;
+        }
         // A provider that fails mid tool loop must not lose the reply; fall back
         // to the plain completion below.
         if (!(error instanceof ProviderError)) {
@@ -2545,7 +2821,10 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
           );
           break;
         } catch (error) {
-          if (halted.signal.aborted) return;
+          if (halted.signal.aborted) {
+            await recordStoppedTurn();
+            return;
+          }
           if (!(error instanceof ProviderError)) throw error;
           logProviderFailure(provider, error);
           if (!fallbackUsed && canTrySharedFallback(provider, error)) {
@@ -2554,6 +2833,7 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
             continue;
           }
           const failure = providerFailure(provider, error);
+          await recordUnansweredTurn(req.userId, prospectiveId, validated.messages, assistantMessageId, failure);
           return sendProviderFailure(
             res,
             failure,
@@ -2567,7 +2847,10 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
       if (pluginRun) result = pluginRun;
       // The user may have stopped while the last provider call was finishing.
       // Nothing this turn produced may land in the conversation after that.
-      if (halted.signal.aborted) return;
+      if (halted.signal.aborted) {
+        await recordStoppedTurn();
+        return;
+      }
       const pluginToolsUsed = pluginRun?.toolsUsed || [];
       if (continuationState) {
         try {
@@ -2680,6 +2963,7 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
             continue;
           }
           const failure = providerFailure(provider, error);
+          await recordUnansweredTurn(req.userId, prospectiveId, validated.messages, assistantMessageId, failure);
           return sendProviderFailure(
             res,
             failure,
@@ -2897,6 +3181,18 @@ router.post("/", requireAuth, chatRateLimiter, async (req, res, next) => {
           );
         }
       }
+    }
+
+    // The submitted message became durable before the provider was called, so an
+    // unanswered turn still has to leave a record the next load can show.
+    if (fullText.length === 0 && !continuationState && (failure || clientAborted)) {
+      savedConversationId = await recordUnansweredTurn(
+        req.userId,
+        prospectiveId,
+        validated.messages,
+        assistantMessageId,
+        failure || { code: "client_aborted" }
+      );
     }
 
     const terminal = resolveTerminalEvent({

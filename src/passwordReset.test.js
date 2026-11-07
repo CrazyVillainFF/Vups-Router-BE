@@ -21,6 +21,10 @@ process.env.MONGODB_URI = mongod.getUri("vupsrouter_reset_test");
 const { default: app } = await import("./index.js");
 const { default: mongoose } = await import("mongoose");
 const { default: User } = await import("./user.js");
+const { default: ResetDelivery } = await import("./resetDeliveryLog.js");
+const { default: ResetSendLog } = await import("./resetSendLog.js");
+const { hashResetEmail } = await import("./resetThrottle.js");
+const { RESET_DELIVERY_FAILING_WINDOW_MS, recordResetDeliveryAttempt } = await import("./resetDeliveryHealth.js");
 const { startFakeBrevo, extractOtpCode, FAKE_BREVO_KEY } = await import("./testUtils/fakeBrevo.js");
 const {
   RESET_AUTH_TTL_MS,
@@ -93,12 +97,22 @@ async function signupUser(password = "correct-horse-battery") {
 
 const SENT_MESSAGE = "If that email exists, we sent a 6-digit code.";
 const INVALID_MESSAGE = "That code is invalid or has expired.";
+const DELIVERY_FAILED_MESSAGE =
+  "We could not send the reset email just now, so no code was sent. Please try again in a few minutes.";
+
+// The provider's rolling outcome is process-wide state, so every test that
+// expects a normal answer starts from a clean record.
+async function clearDeliveryHealth() {
+  await ResetDelivery.deleteMany({});
+}
 
 async function forgotAndGetCode(email) {
   fakeBrevo.state.reset();
+  await clearDeliveryHealth();
   const response = await api("/api/forgot-password", { method: "POST", body: { email } });
   assert.equal(response.status, 200);
   assert.equal(response.body.message, SENT_MESSAGE);
+  assert.equal(response.body.state, "delivery_pending");
   assert.equal(fakeBrevo.state.requests.length, 1);
   const code = extractOtpCode(fakeBrevo.state.requests[0]);
   assert.ok(code, "the email must contain a six-digit code");
@@ -188,6 +202,7 @@ test("forgot-password emails a six-digit code and stores only its bcrypt hash", 
 test("email normalization: mixed-case and padded addresses reach the same account", async () => {
   const user = await signupUser();
   fakeBrevo.state.reset();
+  await clearDeliveryHealth();
   const response = await api("/api/forgot-password", {
     method: "POST",
     body: { email: `  ${user.email.toUpperCase()}  ` }
@@ -202,13 +217,16 @@ test("email normalization: mixed-case and padded addresses reach the same accoun
 
 test("nonexistent accounts receive the identical response and no email", async () => {
   fakeBrevo.state.reset();
+  await clearDeliveryHealth();
   const response = await api("/api/forgot-password", { method: "POST", body: { email: uniqueEmail() } });
   assert.equal(response.status, 200);
   assert.equal(response.body.message, SENT_MESSAGE);
+  assert.equal(response.body.state, "delivery_pending");
   assert.equal(fakeBrevo.state.requests.length, 0);
 
   const invalid = await api("/api/forgot-password", { method: "POST", body: { email: "not-an-email" } });
   assert.equal(invalid.status, 400);
+  assert.equal(invalid.body.state, "invalid_request");
 });
 
 test("missing Brevo configuration fails loudly and stores no code", async () => {
@@ -224,6 +242,8 @@ test("missing Brevo configuration fails loudly and stores no code", async () => 
 
   assert.equal(response.status, 503);
   assert.match(response.body.message, /not configured/i);
+  assert.equal(response.body.state, "delivery_failed", "unconfigured delivery is a failure, never a pending send");
+  assert.equal(response.body.code, "reset_email_not_configured");
   assert.ok(logs.some(line => /not configured/i.test(line)), "the configuration problem must be recorded server-side");
   assert.equal(fakeBrevo.state.requests.length, 0);
   const stored = await storedReset(user.email);
@@ -237,12 +257,14 @@ test("Brevo 401, 429, and network failures invalidate the code, log the provider
   for (const scenario of [{ status: 401 }, { status: 429 }, { status: 400 }]) {
     fakeBrevo.state.reset();
     fakeBrevo.state.set(scenario);
+    await clearDeliveryHealth();
     let response;
     const logs = await captureConsoleError(async () => {
       response = await api("/api/forgot-password", { method: "POST", body: { email: user.email } });
     });
-    assert.equal(response.status, 200, "delivery failures must not reveal account existence");
-    assert.equal(response.body.message, SENT_MESSAGE);
+    assert.equal(response.status, 503, "a rejected delivery must not be reported as a sent code");
+    assert.equal(response.body.message, DELIVERY_FAILED_MESSAGE);
+    assert.equal(response.body.state, "delivery_failed");
     assert.ok(
       logs.some(line => line.includes(`HTTP ${scenario.status}`) && line.includes("{")),
       `the HTTP ${scenario.status} provider body must be logged`
@@ -260,11 +282,12 @@ test("Brevo 401, 429, and network failures invalidate the code, log the provider
   const savedUrl = process.env.BREVO_API_URL;
   process.env.BREVO_API_URL = "http://127.0.0.1:9";
   try {
+    await clearDeliveryHealth();
     let response;
     const logs = await captureConsoleError(async () => {
       response = await api("/api/forgot-password", { method: "POST", body: { email: user.email } });
     });
-    assert.equal(response.status, 200);
+    assert.equal(response.status, 503);
     assert.ok(logs.some(line => /network failure/i.test(line)));
     const stored = await storedReset(user.email);
     assert.equal(stored.resetCodeHash ?? null, null);
@@ -272,6 +295,88 @@ test("Brevo 401, 429, and network failures invalidate the code, log the provider
     process.env.BREVO_API_URL = savedUrl;
   }
   fakeBrevo.state.reset();
+  await clearDeliveryHealth();
+});
+
+test("a delivery failure is answered identically for a registered and an unregistered address", async () => {
+  const user = await signupUser();
+  fakeBrevo.state.reset();
+  fakeBrevo.state.set({ status: 500 });
+  await clearDeliveryHealth();
+
+  let known;
+  await captureConsoleError(async () => {
+    known = await api("/api/forgot-password", { method: "POST", body: { email: user.email } });
+  });
+  assert.equal(known.status, 503);
+  assert.equal(known.body.state, "delivery_failed");
+
+  // The provider is now recorded as failing, so an unknown address must not get
+  // the friendlier "we sent a code" answer — that difference would say whether
+  // the address exists.
+  let unknown;
+  await captureConsoleError(async () => {
+    unknown = await api("/api/forgot-password", { method: "POST", body: { email: uniqueEmail() } });
+  });
+  assert.equal(unknown.status, known.status);
+  assert.deepEqual(unknown.body, known.body);
+  assert.equal(fakeBrevo.state.requests.length, 1, "the refused unknown address must not trigger a second send");
+});
+
+test("the delivery-failed window refuses requests up front, spends nothing, and then clears", async () => {
+  const user = await signupUser();
+  fakeBrevo.state.reset();
+  fakeBrevo.state.set({ status: 503 });
+  await clearDeliveryHealth();
+
+  let first;
+  await captureConsoleError(async () => {
+    first = await api("/api/forgot-password", { method: "POST", body: { email: user.email } });
+  });
+  assert.equal(first.status, 503);
+  assert.equal(first.body.state, "delivery_failed");
+  assert.ok(Number(first.headers.get("retry-after")) > 0, "the refusal must say when to try again");
+
+  // Still inside the window: the request is refused before any account is read,
+  // so nothing reaches the provider, no code is stored, and the 24-hour send
+  // quota keeps the value the first request used.
+  fakeBrevo.state.reset();
+  const second = await api("/api/forgot-password", { method: "POST", body: { email: user.email } });
+  assert.equal(second.status, 503);
+  assert.deepEqual(second.body, first.body);
+  assert.equal(fakeBrevo.state.requests.length, 0, "a refused request must not reach the provider");
+  assert.equal((await storedReset(user.email)).resetCodeHash ?? null, null);
+  const logged = await ResetSendLog.findOne({ emailHash: hashResetEmail(user.email) }).lean();
+  assert.equal(logged.sends.length, 1, "refused requests must not consume the send limit");
+
+  // The window is a report about the provider, not a lockout: once it ages out,
+  // recovery works again on its own.
+  await ResetDelivery.updateOne(
+    { provider: "brevo" },
+    { $set: { lastFailureAt: new Date(Date.now() - RESET_DELIVERY_FAILING_WINDOW_MS - 1000) } }
+  );
+  const recovered = await api("/api/forgot-password", { method: "POST", body: { email: user.email } });
+  assert.equal(recovered.status, 200, "an expired failure window must not keep refusing requests");
+  assert.equal(recovered.body.state, "delivery_pending");
+  assert.equal(fakeBrevo.state.requests.length, 1);
+
+  const healthy = await api("/api/health");
+  assert.equal(healthy.body.features.passwordResetEmailDelivery, "ok");
+});
+
+test("/api/health reports recovery-email configuration by name only, never by value", async () => {
+  const withKey = await api("/api/health");
+  assert.equal(withKey.status, 200);
+  assert.equal(withKey.body.features.passwordResetEmail, "configured");
+  assert.deepEqual(withKey.body.features.passwordResetEmailMissing, []);
+  assert.ok(!JSON.stringify(withKey.body).includes(FAKE_BREVO_KEY), "the API key must never be reported");
+
+  const saved = process.env.BREVO_API_KEY;
+  delete process.env.BREVO_API_KEY;
+  const withoutKey = await api("/api/health");
+  process.env.BREVO_API_KEY = saved;
+  assert.equal(withoutKey.body.features.passwordResetEmail, "missing_configuration");
+  assert.deepEqual(withoutKey.body.features.passwordResetEmailMissing, ["BREVO_API_KEY"]);
 });
 
 // ─── Step 2: verify-code ────────────────────────────────────────────────────
@@ -593,4 +698,144 @@ test("a newer code replaces the previous one and only the newest authorizes a re
     body: { email: user.email, code: secondCode, newPassword: "fresh-code-password-1" }
   });
   assert.equal(fresh.status, 200);
+});
+
+// ─── Honest response states ─────────────────────────────────────────────────
+//
+// `state` is the machine-readable answer to "what actually happened". A request
+// is never reported as delivered because the provider only accepted it, and a
+// provider refusal is never reported as a success because a quota was spent.
+
+const STATES = new Set([
+  "delivery_pending",
+  "delivery_failed",
+  "rate_limited",
+  "invalid_request",
+  "invalid_or_expired_code",
+  "code_verified",
+  "reset_completed"
+]);
+
+test("a successful request reports provider acceptance, never inbox delivery", async () => {
+  const user = await signupUser();
+  const response = await (async () => {
+    fakeBrevo.state.reset();
+    await clearDeliveryHealth();
+    return api("/api/forgot-password", { method: "POST", body: { email: user.email } });
+  })();
+
+  assert.equal(response.status, 200);
+  assert.equal(response.body.state, "delivery_pending");
+  assert.ok(!/delivered|received|arrived/i.test(response.body.message), "no wording may claim the mail arrived");
+
+  const receipt = await ResetDelivery.findOne({ provider: "brevo" }).lean();
+  assert.equal(receipt.lastOutcome, "sent");
+  assert.equal(receipt.lastMessageId, "fake-brevo-message-id", "the provider receipt must be kept for later lookups");
+  assert.equal(receipt.lastFailureCode, null);
+});
+
+test("a refused send stores no receipt and records the provider failure code", async () => {
+  const user = await signupUser();
+  fakeBrevo.state.reset();
+  fakeBrevo.state.set({ status: 401 });
+  await clearDeliveryHealth();
+
+  let response;
+  await captureConsoleError(async () => {
+    response = await api("/api/forgot-password", { method: "POST", body: { email: user.email } });
+  });
+  assert.equal(response.status, 503);
+  assert.equal(response.body.state, "delivery_failed");
+  assert.equal(response.body.code, "reset_email_delivery_failed");
+
+  const record = await ResetDelivery.findOne({ provider: "brevo" }).lean();
+  assert.equal(record.lastOutcome, "failed");
+  assert.equal(record.lastFailureCode, "invalid_api_key");
+  assert.equal(record.lastMessageId ?? null, null, "a rejection must not be remembered as a send");
+});
+
+test("an over-long provider id is truncated instead of stored raw", async () => {
+  await clearDeliveryHealth();
+  await recordResetDeliveryAttempt({ ok: true, messageId: "m".repeat(500) });
+  const record = await ResetDelivery.findOne({ provider: "brevo" }).lean();
+  assert.equal(record.lastOutcome, "sent");
+  assert.equal(record.lastMessageId.length, 120, "the stored receipt is bounded");
+});
+
+test("an unexpected provider error string is stored only as a known code", async () => {
+  await clearDeliveryHealth();
+  await recordResetDeliveryAttempt({ ok: false, code: "smtp error: user@example.com rejected" });
+  const record = await ResetDelivery.findOne({ provider: "brevo" }).lean();
+  assert.equal(record.lastFailureCode, "provider_unavailable", "free-form provider text is never stored");
+});
+
+test("every recovery response uses a state from the documented vocabulary", async () => {
+  const user = await signupUser();
+  const responses = [];
+
+  fakeBrevo.state.reset();
+  await clearDeliveryHealth();
+  responses.push(await api("/api/forgot-password", { method: "POST", body: { email: "not-an-email" } }));
+  responses.push(await api("/api/forgot-password", { method: "POST", body: { email: user.email } }));
+  responses.push(await api("/api/verify-code", { method: "POST", body: { email: user.email, code: "42" } }));
+  responses.push(await api("/api/verify-code", { method: "POST", body: { email: uniqueEmail(), code: "123456" } }));
+  responses.push(
+    await api("/api/reset-password", { method: "POST", body: { email: user.email, code: "123456", newPassword: "x" } })
+  );
+
+  for (const response of responses) {
+    assert.ok(STATES.has(response.body.state), `unexpected state ${JSON.stringify(response.body.state)}`);
+  }
+  assert.equal(responses[0].status, 400);
+  assert.equal(responses[0].body.state, "invalid_request");
+  assert.equal(responses[1].body.state, "delivery_pending");
+  assert.equal(responses[2].body.state, "invalid_request");
+  assert.equal(responses[3].body.state, "invalid_or_expired_code");
+  assert.equal(responses[4].body.state, "invalid_request");
+});
+
+test("a full recovery walks the states pending → verified → completed", async () => {
+  const user = await signupUser();
+  const code = await forgotAndGetCode(user.email);
+
+  const verified = await api("/api/verify-code", { method: "POST", body: { email: user.email, code } });
+  assert.equal(verified.status, 200);
+  assert.equal(verified.body.state, "code_verified");
+
+  const reset = await api("/api/reset-password", {
+    method: "POST",
+    body: {
+      email: user.email,
+      resetAuthorization: verified.body.resetAuthorization,
+      newPassword: "vocabulary-password-1",
+      confirmPassword: "vocabulary-password-1"
+    }
+  });
+  assert.equal(reset.status, 200);
+  assert.equal(reset.body.state, "reset_completed");
+
+  const signin = await api("/api/auth/signin", {
+    method: "POST",
+    body: { email: user.email, password: "vocabulary-password-1" }
+  });
+  assert.equal(signin.status, 200);
+});
+
+test("the success state cannot be an account oracle: registered and unregistered bodies match", async () => {
+  const user = await signupUser();
+  const stranger = uniqueEmail();
+  fakeBrevo.state.reset();
+  await clearDeliveryHealth();
+
+  const known = await api("/api/forgot-password", { method: "POST", body: { email: user.email } });
+  const unknown = await api("/api/forgot-password", { method: "POST", body: { email: stranger } });
+
+  assert.equal(unknown.status, known.status);
+  assert.equal(unknown.body.state, known.body.state);
+  assert.deepEqual(
+    { ...unknown.body, remaining: known.body.remaining, limit: known.body.limit },
+    known.body,
+    "no response field may differ by account existence (remaining/limit are per-address quotas)"
+  );
+  assert.equal(fakeBrevo.state.requests.length, 1, "only the registered address is actually emailed");
 });

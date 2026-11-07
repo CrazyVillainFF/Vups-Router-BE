@@ -37,6 +37,7 @@ export async function startFakeProvider() {
       chatRetryAfter: null,
       chatErrorPayload: null,
       chatResponseHeaders: null,
+      dropConnectionBeforeResponse: false,
       failStreamMidway: false,
       streamWithoutTerminal: false,
       streamErrorPayload: null,
@@ -76,6 +77,7 @@ export async function startFakeProvider() {
       state.behavior.chatRetryAfter = null;
       state.behavior.chatErrorPayload = null;
       state.behavior.chatResponseHeaders = null;
+      state.behavior.dropConnectionBeforeResponse = false;
       state.behavior.failStreamMidway = false;
       state.behavior.streamWithoutTerminal = false;
       state.behavior.streamErrorPayload = null;
@@ -160,6 +162,13 @@ export async function startFakeProvider() {
       state.chatRequests.push({ key, body });
       if (!acceptsKey(key) || state.behavior.invalidKey) {
         return json(res, 401, { error: { message: "Invalid API key provided." } });
+      }
+      if (state.behavior.dropConnectionBeforeResponse) {
+        // A provider that hangs up without ever answering. The request is still
+        // counted, so a test can prove the caller never read that silence as an
+        // answer.
+        res.destroy();
+        return;
       }
       if (state.behavior.failModel && body.model === state.behavior.failModel) {
         return json(res, state.behavior.failModelStatus, {

@@ -21,6 +21,8 @@ process.env.MONGODB_URI = mongod.getUri("vupsrouter_reset_send_limit_test");
 const { default: app } = await import("./index.js");
 const { default: mongoose } = await import("mongoose");
 const { default: ResetSendLog } = await import("./resetSendLog.js");
+const { default: ResetDelivery } = await import("./resetDeliveryLog.js");
+const { RESET_DELIVERY_FAILING_WINDOW_MS } = await import("./resetDeliveryHealth.js");
 const { RESET_SEND_LIMIT, RESET_SEND_WINDOW_MS, hashResetEmail } = await import("./resetThrottle.js");
 const { startFakeBrevo, FAKE_BREVO_KEY } = await import("./testUtils/fakeBrevo.js");
 
@@ -81,6 +83,21 @@ async function signupUser() {
   return { email, cookie: sessionCookie(response) };
 }
 
+// The provider's rolling delivery record is process-wide, so tests that expect
+// normal sends start from a clean record and a failure test can age its own
+// window out explicitly.
+async function clearDeliveryHealth() {
+  await ResetDelivery.deleteMany({});
+}
+
+async function ageOutDeliveryWindow() {
+  await ResetDelivery.updateOne(
+    { provider: "brevo" },
+    { $set: { lastFailureAt: new Date(Date.now() - RESET_DELIVERY_FAILING_WINDOW_MS - 1000) } },
+    { upsert: true }
+  );
+}
+
 test("the limit honors PASSWORD_RESET_SEND_LIMIT_MAX", () => {
   assert.equal(RESET_SEND_LIMIT, 4);
   assert.equal(RESET_SEND_WINDOW_MS, 24 * 60 * 60 * 1000);
@@ -95,6 +112,7 @@ test("four code requests are allowed per 24 hours and the fifth is rejected with
     const response = await forgot(email);
     assert.equal(response.status, 200, `send ${i + 1} must be allowed`);
     assert.equal(response.body.limit, 4);
+    assert.equal(response.body.state, "delivery_pending");
     remaining.push(response.body.remaining);
   }
   assert.deepEqual(remaining, [3, 2, 1, 0], "remaining must count down with each send");
@@ -103,6 +121,7 @@ test("four code requests are allowed per 24 hours and the fifth is rejected with
   const fifth = await forgot(email);
   assert.equal(fifth.status, 429);
   assert.equal(fifth.body.code, "reset_send_limit");
+  assert.equal(fifth.body.state, "rate_limited", "a quota refusal is never reported as a pending send");
   assert.match(fifth.body.message, /at most 4 codes per 24 hours/);
   assert.match(fifth.body.message, /try again in about \d+ minutes?/i);
   assert.ok(Number(fifth.headers.get("retry-after")) > 0, "a Retry-After header must be present");
@@ -175,18 +194,36 @@ test("concurrent requests cannot bypass the limit", async () => {
   }
 });
 
-test("failed email deliveries still count against the limit", async () => {
+test("a delivery that reached the provider still counts, while a refused request costs no quota", async () => {
   const { email } = await signupUser();
+  await clearDeliveryHealth();
   fakeBrevo.state.reset();
   fakeBrevo.state.set({ status: 500 });
 
-  for (let i = 0; i < 4; i += 1) {
-    const response = await forgot(email);
-    assert.equal(response.status, 200, "the API keeps its enumeration-safe response even when delivery fails");
-  }
-  assert.equal(fakeBrevo.state.requests.length, 4, "all four attempts reached the email provider");
+  const first = await forgot(email);
+  assert.equal(first.status, 503, "a rejected delivery is reported as a delivery failure");
+  assert.equal(first.body.state, "delivery_failed");
+  assert.equal(fakeBrevo.state.requests.length, 1);
 
+  const refused = await forgot(email);
+  assert.equal(refused.status, 503);
+  assert.equal(fakeBrevo.state.requests.length, 1, "the second request is refused before any send");
+
+  const during = await ResetSendLog.findOne({ emailHash: hashResetEmail(email) }).lean();
+  assert.equal(during.sends.length, 1, "only the send that reached the provider is counted");
+
+  // The counted failures stay counted once the provider window ages out, so a
+  // broken provider cannot be used to keep the daily quota open forever.
+  for (let i = 0; i < 3; i += 1) {
+    await ageOutDeliveryWindow();
+    const response = await forgot(email);
+    assert.equal(response.status, 503, `send ${i + 2} reaches the provider and fails`);
+  }
+  assert.equal(fakeBrevo.state.requests.length, 4, "all four allowed attempts reached the email provider");
+
+  await ageOutDeliveryWindow();
   fakeBrevo.state.set({ status: 201 });
   const fifth = await forgot(email);
   assert.equal(fifth.status, 429, "a failed delivery must not reset the counter");
+  assert.equal(fakeBrevo.state.requests.length, 4);
 });

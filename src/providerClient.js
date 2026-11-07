@@ -651,7 +651,7 @@ function qoderBusinessError(url, response, payload, credentials, context) {
   } else if (response.status === 409) {
     // Qoder answers 409 while a turn is still running, so the message has to
     // say what to do rather than report a generic failure.
-    const busy = String(url).endsWith("/events") || /processing a turn|rescheduling/i.test(detail);
+    const busy = String(url).endsWith("/events") || SESSION_BUSY_ERROR_TEXT.test(detail);
     error.code = busy ? "session_busy" : "provider_conflict";
     error.message = busy
       ? `Qoder is still working on the previous reply in this conversation (HTTP 409). Wait for it to finish, or press Stop and send again.${suffix}`
@@ -1972,6 +1972,9 @@ const QUOTA_ERROR_CODE = /insufficient_quota|billing_hard_limit|credit_balance|i
 // rate limit unless the payload actually reports an exhausted balance.
 const QUOTA_ERROR_TEXT = /insufficient (?:quota|credits?)|credit balance|billing (?:hard )?limit|payment required|exceeded (?:your|the) (?:current )?quota|quota (?:is )?(?:exhausted|depleted)|out of quota|spend(?:ing)? limit|free-models-per-day|free models per day|per[- ]day|daily limit|requests per day|tokens per day|\bRPD\b|\bTPD\b|monthly limit/i;
 const CONCURRENCY_ERROR_TEXT = /concurren|parallel|simultaneous|in.?flight/i;
+// A session still finishing its previous reply answers 409 and clears in seconds: a
+// wait, not a failure. One regex drives both the retry classification and the message.
+const SESSION_BUSY_ERROR_TEXT = /processing a turn|turn is in progress|wait for (?:the )?(?:current )?(?:turn|completion)|rescheduling/i;
 const TOKEN_RATE_ERROR_TEXT = /tokens? per min|\bTPM\b|token[- ]rate|tokens?.*(?:minute|min\b)/i;
 const REQUEST_RATE_ERROR_TEXT = /requests? per min|\bRPM\b|too many requests|rate.?limit|request rate/i;
 const INVALID_MODEL_ERROR_TEXT = /model.*(?:not found|does not exist|not available|invalid)|invalid model|unknown model|no endpoints found|must reference an available model/i;
@@ -2002,6 +2005,7 @@ export function classifyProviderFailure({ status = null, payload = null, message
   const quota = QUOTA_ERROR_CODE.test(`${fields.code} ${fields.type} ${fields.providerCode}`)
     || QUOTA_ERROR_TEXT.test(signal);
   const concurrency = CONCURRENCY_ERROR_TEXT.test(signal);
+  const sessionBusy = SESSION_BUSY_ERROR_TEXT.test(signal);
   const tokenRate = TOKEN_RATE_ERROR_TEXT.test(signal);
   const requestRate = REQUEST_RATE_ERROR_TEXT.test(signal);
   const invalidModel = INVALID_MODEL_ERROR_TEXT.test(signal);
@@ -2035,6 +2039,7 @@ export function classifyProviderFailure({ status = null, payload = null, message
     return result("ambiguous_rate_limit", "ambiguous", true);
   }
   if (statusCode === 409 && concurrency) return result("concurrency_limit", "transient", true);
+  if (statusCode === 409 && sessionBusy) return result("session_busy", "transient", true);
   if (statusCode === 408) return result("timeout", "transient", true);
   if (statusCode >= 500) {
     if (/overload|capacity|temporar/i.test(signal)) return result("overloaded", "transient", true);
@@ -2192,6 +2197,9 @@ export function describeProviderError(status, payload) {
   if (status === 404) return new ProviderError(`The provider returned HTTP 404. The API base URL or model ID is likely wrong.${suffix}`, status, "not_found");
   if (status === 405) return new ProviderError(`The provider rejected the request method or endpoint (HTTP 405). Check the API base URL, and in Settings choose OpenAI-compatible for /chat/completions or OpenAI Responses for /responses.${suffix}`, status, "method_not_allowed");
   if (status === 408) return new ProviderError(`The provider timed out (HTTP 408).${suffix}`, status, "timeout");
+  if (status === 409 && classification.category === "session_busy") {
+    return new ProviderError(`The model is still finishing the previous reply (HTTP 409). Wait a moment and try again.${suffix}`, status, "session_busy");
+  }
   if (status === 413) return new ProviderError(`The conversation is too large for this provider (HTTP 413).${suffix}`, status, "too_large");
   if (status === 422) return new ProviderError(`The provider could not process the request (HTTP 422). Check the model ID.${suffix}`, status, "unprocessable");
   if (status === 429) {
@@ -2264,6 +2272,7 @@ export function isRetryableProviderError(error) {
   if (error.code === "cancelled" || error.code === "free_quota_exhausted" || error.code === "quota_exhausted") return false;
   if (isQuotaExhaustedError(error)) return false;
   if (error.code === "rate_limited") return true;
+  if (error.code === "session_busy") return true;
   if (error.code === "timeout") return true;
   if (["network_error", "connection_refused", "provider_unavailable"].includes(error.code)) return true;
   if (error.status === 408 || error.status === 429) return true;
@@ -2319,7 +2328,11 @@ export async function withProviderRetry(operation, options = {}) {
       const delay = retryDelayMs(error, attempt, options);
       if (delay === null) throw error;
       if (options.signal?.aborted) throw new ProviderError("Request cancelled.", null, "cancelled");
-      options.onRetry?.({ attempt: attempt + 1, delay, error });
+      // Awaited on purpose: a caller that records the attempt it is about to
+      // make has to finish recording before the wait starts, and a failure it
+      // reports back (a task that was cancelled while we were calling) has to
+      // stop the loop here instead of another request going out.
+      await options.onRetry?.({ attempt: attempt + 1, delay, error });
       await sleep(delay, options.signal);
     }
   }
@@ -3073,6 +3086,9 @@ function openAiToolCalls(payload) {
 // older snapshot, a proxy that strips them, or a model retired upstream. Only
 // that exact rejection switches the same turn to the text protocol; any other
 // 400 keeps its own honest message and is never retried as a tool request.
+// "unsupported" alone is not a tool rejection: "Unsupported parameter:
+// temperature." names a field this fallback cannot repair, and retrying it
+// would spend a second provider call on a failure that was never about tools.
 function toolsTransportRejected(status, payload) {
   if (status !== 400 && status !== 404 && status !== 422) return false;
   const parts = [
@@ -3081,7 +3097,7 @@ function toolsTransportRejected(status, payload) {
     typeof payload?.error === "string" ? payload.error : "",
     typeof payload === "string" ? payload : ""
   ].filter(part => typeof part === "string");
-  return /\btools?\b|tool_choice|function[_ ]?calling|tool_use|unsupported/i.test(parts.join(" "));
+  return /\btools?\b|tool_calls?|tool_choice|function[_ ]?calling|tool_use|\bfunctions?\b/i.test(parts.join(" "));
 }
 
 export async function chatCompletion({ baseUrl, apiKey, model, messages, temperature, maxTokens, providerType = "openai_compatible", authMode = "pat", openapiBaseUrl = "", reasoning, requestId = null, attempt = null, tools = null, toolChoice = null, conversationId = null }, signal) {

@@ -205,7 +205,7 @@ export const forgotPasswordRateLimiter = rateLimit({
   limit: Number(process.env.PASSWORD_RESET_RATE_LIMIT_MAX || 10),
   standardHeaders: true,
   legacyHeaders: false,
-  message: { message: "Too many password reset requests. Please wait 15 minutes and try again." }
+  message: { message: "Too many password reset requests. Please wait 15 minutes and try again.", state: "rate_limited" }
 });
 
 export const verifyCodeRateLimiter = rateLimit({
@@ -213,7 +213,7 @@ export const verifyCodeRateLimiter = rateLimit({
   limit: Number(process.env.VERIFY_CODE_RATE_LIMIT_MAX || 20),
   standardHeaders: true,
   legacyHeaders: false,
-  message: { message: "Too many code verification attempts. Please wait 15 minutes and try again." }
+  message: { message: "Too many code verification attempts. Please wait 15 minutes and try again.", state: "rate_limited" }
 });
 
 export const resetPasswordRateLimiter = rateLimit({
@@ -221,5 +221,5 @@ export const resetPasswordRateLimiter = rateLimit({
   limit: Number(process.env.PASSWORD_RESET_ATTEMPT_LIMIT_MAX || 20),
   standardHeaders: true,
   legacyHeaders: false,
-  message: { message: "Too many password reset attempts. Please wait 15 minutes and try again." }
+  message: { message: "Too many password reset attempts. Please wait 15 minutes and try again.", state: "rate_limited" }
 });

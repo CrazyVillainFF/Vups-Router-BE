@@ -1,4 +1,5 @@
 import mongoose from "mongoose";
+import { progressEventSchema } from "./taskRun.js";
 
 // Attachment metadata only (name/type/size) — image bytes are never stored.
 const attachmentSchema = new mongoose.Schema({
@@ -19,9 +20,16 @@ const messageSchema = new mongoose.Schema({
   messageId: { type: String, maxlength: 80 },
   role: { type: String, enum: ["user", "assistant"], required: true },
   content: { type: String, default: "", maxlength: 100000 },
+  status: { type: String, enum: ["completed", "interrupted", "failed"], default: "completed" },
+  // Machine-readable reason for a turn that did not complete, so a reloaded
+  // chat can show the same card the user saw live.
+  errorCode: { type: String, maxlength: 60 },
   feedback: { type: String, enum: ["like", "dislike"], default: undefined },
   attachments: { type: [attachmentSchema], default: undefined },
   artifacts: { type: [artifactRefSchema], default: undefined },
+  // The steps a desktop agent turn really ran, kept with the answer so a
+  // reloaded chat shows what happened instead of only what it concluded.
+  progress: { type: [progressEventSchema], default: undefined },
   createdAt: { type: Date, default: Date.now }
 }, { _id: false });
 

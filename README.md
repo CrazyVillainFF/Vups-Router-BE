@@ -137,6 +137,53 @@ All admin routes return `403` unless the signed-in user's email is listed in `AD
 
 `GET /api/health` pings MongoDB and returns `503` when it is unavailable. `GET /` is a liveness response.
 
+## Background tasks (authenticated)
+
+A task is a durable MongoDB record worked by an in-process worker, not a promise held by the chat screen that submitted it. `POST /api/tasks` returns `202` with the task ID immediately; navigating away, closing the chat, or restarting the client does not stop it.
+
+| Method | Path | Notes |
+| --- | --- | --- |
+| `POST` | `/api/tasks` | `{ prompt, conversationId?, model?, configId?, providerId?, source?, mode?, temperature?, workspacePath? }` → `202 { task }`. `prompt` is trimmed but otherwise sent to the model as typed; empty or over-long prompts return `400 invalid_prompt`. The provider is resolved when the task runs, so a rotated key is picked up without resubmitting. |
+| `GET` | `/api/tasks` | `{ tasks }`, most recently active first; `?state=queued,running&limit=50` (limit capped at 200) |
+| `GET` | `/api/tasks/:taskId` | Full record: state, stage, plan steps, `modelRequests`, `toolOperations`, `retry`, `error`, `waitingOn` |
+| `GET` | `/api/tasks/:taskId/events?after=N` | Ordered progress rows after sequence `N`, plus the current `state`, for replay after a reconnect |
+| `POST` | `/api/tasks/:taskId/cancel` | Cooperative cancel; also aborts an in-flight provider wait, so a cancelled retry sends nothing more |
+| `POST` | `/api/tasks/:taskId/resume` | Continues a `paused`, `waiting_for_user` or `waiting_for_permission` task. A terminal task answers `409 task_terminal` ("Start a new task to do it again.") and any other state `409 state_conflict` |
+
+**Scheduling and concurrency.** Every server process runs its own scheduler. Each tick it looks for claimable work, and a task is claimable only when it is `queued` or `recovering` and its lease is empty or lapsed — a live lease means another worker is already running that task. A claim is a compare-and-set on the row the worker actually read, so two schedulers that reach for the same task cannot both win it: the loser moves to the next candidate inside the same pass instead of waiting for the next tick. A worker renews the lease while the task runs; if the process dies, the lease lapses, and the periodic reconcile pass moves the orphaned task to `recovering` so another worker can take it. Recovery never re-runs finished work: completed plan steps, saved messages, `modelRequests`, `toolOperations` and progress events all stay on the record, and a task whose user pressed Stop is not resurrected.
+
+Two limits answer two different questions, so they are separate variables:
+
+| Variable | Question it answers | Default |
+| --- | --- | --- |
+| `TASK_WORKER_CONCURRENCY` | how many tasks this process executes at once | `AI_MAX_CONCURRENCY`, which is `3` |
+| `TASK_USER_CONCURRENCY` | how many tasks belonging to one account may be held at once, across every process | `2` |
+| `TASK_LEASE_MS` | how long a claim is honoured before another worker may recover the task (floor `1000`) | `30000` |
+| `TASK_WORKER_TICK_MS` | how often each scheduler looks for work (floor `50`; the reconcile pass runs every 30 ticks) | `1000` |
+| `TASK_WORKER_DISABLED` | `1` = serve the task API but run nothing — for tests and for a deployment where only a dedicated worker executes | unset |
+| `TASK_RETENTION_DAYS` | how long a terminal task is kept before cleanup writes `expiresAt`; read once when the module loads | `30` |
+
+`TASK_USER_CONCURRENCY` is the fairness rule. Without it, one account that submits twenty tasks from one chat takes the entire worker pool and every other user queues behind them. "Held" is counted as a live lease rather than as an executing state, which closes the gap between claiming a task and moving it out of `queued`. A task that waits behind its own cap stays `queued` with no lease — it is delayed, never skipped or lost — and a released lease puts unfinished work back at the head of its owner's queue, so the oldest outstanding task runs first. Defaults are set so one account never owns the whole pool: the pool is `3` and any single user may hold `2`.
+
+The cap is measured when a claim is taken, from what the table says at that moment. Within one process it is exact: a process runs one claim pass at a time, and a pass that started while another was still waiting on the database would count the same held tasks twice. Between processes it is close but not atomic — two workers on separate machines can each read "this user has room" before either write lands, so a user can briefly be held one or two tasks above the cap. Nothing is executed twice (the compare-and-set still decides that), and a standalone MongoDB has no transactions to close the window, so the cap is documented as a fairness limit rather than a hard per-user quota.
+
+One process never runs the same task twice at the same moment. The compare-and-set decides that between processes, and inside a process the claim pass additionally excludes every task it is already running: a row can come back to a claimable shape from outside — a whole-document write from a copy taken before the claim, or a recovery pass that blanks the lease of work still in flight — and then the table offers that process its own running task again. Its in-flight set is the one thing a process knows better than the database, so it is what the claim filters on. The rule is about simultaneity, not about counts: a task whose record really was rewound is *meant* to be run again by whoever holds it next, and that is how an interrupted task is recovered. `taskQueue.test.js` 4.12 pins both halves — one request in the model during the first run, and a single sequential re-run after the record is rewound under it.
+
+The same promise holds across the exit, and it is an ordering rule, not a state rule: an execution gives up its lease only after its outcome is on the record. A terminal write and a lease release are two writes, and a release that lands first leaves `running` with no owner for the few hundred microseconds in between — which is exactly the shape the reconcile pass calls abandoned, so a task that had already decided to fail was re-queued, re-run and asked the model a second time from `attempt: 1`. Every exit path in `executeTask` is therefore awaited before the `finally` runs, so a finished task is terminal before it is unowned and `markTaskInterrupted` still finds the lease it is guarded on when an abort or a shutdown is what ended the run. `taskQueue.test.js` 4.13 pins the ordering by reconciling at the instant the lease is dropped, and 4.14 pins the interruption record a shutdown owes.
+
+**Retry policy for the model request inside a step.** Transient provider failures are waited out, not reported as task failures: request/token/concurrency rate limits (`429`), upstream saturation and outage (`503`/`5xx`), request timeouts (`408`), a dropped connection, and a model that is still busy with the previous reply (`409` whose provider message reports a turn in progress — `category: "session_busy"`). The delay grows as `VUPS_RETRY_BASE_MS × 2^attempt`, gains up to 25% more as jitter, and is then capped at `VUPS_RETRY_MAX_MS`. A provider `Retry-After` is honoured instead of the formula when it fits `VUPS_RETRY_MAX_RETRY_AFTER_MS`; a longer one is not retried at all, so no task ever sleeps on a wait the policy cannot bound. Cancelling during the wait ends the retry loop before another request leaves the server.
+
+Permanent failures are never retried, because a second identical request cannot change the outcome: `401`/`403` credentials, `402` and exhausted-quota `429`, unknown/invalid model (`404`, `invalid_model`), malformed request (`400`/`422`), context-window overflow, and `413`. They fail the task with the classified `error.kind` and an actionable `error.message`.
+
+| Variable | Applies to | Default |
+| --- | --- | --- |
+| `VUPS_MAX_RETRIES` | model requests in chat and in tasks; capped at `5` | `2` (so at most 3 attempts) |
+| `VUPS_RETRY_BASE_MS` | backoff base | `500` |
+| `VUPS_RETRY_MAX_MS` | maximum single backoff delay | `8000` |
+| `VUPS_RETRY_MAX_RETRY_AFTER_MS` | largest accepted upstream `Retry-After` | `15000` |
+
+**What a retry leaves behind.** Each attempt is its own `modelRequests` row (same `requestId`, incrementing `attempt`) marked `failed` with its code, so a completed step is never re-run just because a later model call failed and a report can count attempts instead of guessing. `retry` on the record carries `attempts`, `maxAttempts`, `nextAttemptAt`, `lastCode`, `lastCategory`, `lastErrorAt`, `retryAfterMs`, and `policy: "provider_backoff"`, written in the same update that moves the task to `retrying`; the task is `running` again when the next request actually goes out. The wait is a real progress row (`phase: "provider"`) naming the cause and the delay the worker chose. Provider keys, bearer tokens, and raw provider bodies never reach the record or the events endpoint.
+
 ## Render deployment
 
 The backend repo (`CrazyVillainFF/Vups-Router-BE`) is connected to the Render service behind `https://vups-router-be.onrender.com`. Pushing to `main` triggers a redeploy.

@@ -16,8 +16,12 @@ import comboRoutes from "./routes/combo.js";
 import imageRoutes from "./routes/images.js";
 import adminRoutes from "./routes/admin.js";
 import pluginRoutes from "./routes/plugins.js";
+import taskRoutes from "./routes/tasks.js";
+import { startTaskWorker, stopTaskWorker } from "./taskWorker.js";
 import { requireJsonBody, verifyOrigin } from "./middleware.js";
 import { chatJsonBodyLimit } from "./chatImages.js";
+import { emailProviderConfiguration } from "./email.js";
+import { resetEmailDeliveryState } from "./resetDeliveryHealth.js";
 import { vupsExecutionConfiguration, vupsTextConfiguration, vupsVisionConfiguration } from "./vupsGalax.js";
 
 const app = express();
@@ -135,13 +139,21 @@ app.get("/api/health", async (_req, res) => {
     const vision = vupsVisionConfiguration();
     const text = vupsTextConfiguration();
     const execution = vupsExecutionConfiguration();
+    const email = emailProviderConfiguration();
+    const delivery = await resetEmailDeliveryState();
     return res.json({
       success: true,
       service: "VupsRouter",
       status: "online",
       database: "connected",
+      environment: process.env.NODE_ENV || "development",
       release: (process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || "unknown").slice(0, 40),
       features: {
+        // Presence-only: whether recovery email can work here and whether the
+        // provider has been accepting sends. No values, addresses or keys.
+        passwordResetEmail: email.configured ? "configured" : "missing_configuration",
+        passwordResetEmailMissing: email.missing,
+        passwordResetEmailDelivery: delivery.failing ? "failing" : "ok",
         vupsRetry: true,
         vupsDiagnostics: true,
         vupsImageGeneration: vision.enabled,
@@ -175,7 +187,7 @@ app.get("/api", (_req, res) => res.json({
   service: "VupsRouter",
   message: "VupsRouter API index. All application routes are served under /api/*.",
   health: "/api/health",
-  routes: ["/api/auth", "/api/forgot-password", "/api/verify-code", "/api/reset-password", "/api/settings", "/api/conversations", "/api/chat", "/api/images", "/api/plugins", "/api/admin"]
+  routes: ["/api/auth", "/api/forgot-password", "/api/verify-code", "/api/reset-password", "/api/settings", "/api/conversations", "/api/chat", "/api/tasks", "/api/images", "/api/plugins", "/api/admin"]
 }));
 
 app.use("/api/auth/desktop", desktopAuthRoutes);
@@ -187,6 +199,7 @@ app.use("/api/chat", chatRoutes);
 app.use("/api/combo", comboRoutes);
 app.use("/api/images", imageRoutes);
 app.use("/api/plugins", pluginRoutes);
+app.use("/api/tasks", taskRoutes);
 app.use("/api/admin", adminRoutes);
 
 app.use((_req, res) => {
@@ -226,7 +239,46 @@ app.use((error, req, res, _next) => {
 });
 
 if (process.env.NODE_ENV !== "test") {
-  app.listen(port, () => console.log(`VupsRouter API listening on port ${port}`));
+  const httpServer = app.listen(port, () => {
+    console.log(`VupsRouter API listening on port ${port}`);
+    // One line per start that names the environment and whether password
+    // recovery email can work here, so a deployed instance is never guessed at.
+    const email = emailProviderConfiguration();
+    console.log(
+      `Environment: NODE_ENV=${process.env.NODE_ENV || "unset"} · password recovery email ${
+        email.configured ? "configured" : `not configured (missing ${email.missing.join(", ")})`
+      }`
+    );
+  });
+
+  // Tasks are run by the server, not by the request that submitted them, so the
+  // worker starts with the process. A deployment that wants the web role and a
+  // worker role apart can turn this off without touching anything else.
+  let workerStarted = false;
+  if (process.env.TASK_WORKER_DISABLED === "1") {
+    console.log("Task worker disabled (TASK_WORKER_DISABLED=1).");
+  } else {
+    startTaskWorker();
+    workerStarted = true;
+  }
+
+  // A platform stop is not a reason to lose work: give the running tasks back to
+  // the queue with their interruption recorded, so the next boot recovers them
+  // instead of waiting for a lease to expire.
+  let closing = false;
+  for (const signal of ["SIGTERM", "SIGINT"]) {
+    process.on(signal, () => {
+      if (closing) return;
+      closing = true;
+      const finish = () => {
+        httpServer.close(() => process.exit(0));
+        // Never let a keep-alive connection hold the process past a shutdown.
+        setTimeout(() => process.exit(0), 5000).unref();
+      };
+      if (workerStarted) stopTaskWorker().catch(() => {}).finally(finish);
+      else finish();
+    });
+  }
 }
 
 export default app;

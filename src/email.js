@@ -33,13 +33,20 @@ export function brevoApiUrl() {
   return raw.replace(/\/+$/, "");
 }
 
+// Presence-only view of the email configuration: which required variables are
+// missing, never their values. /api/health reports it so an operator can tell a
+// misconfigured deployment apart from a working one without dashboard access.
+export function emailProviderConfiguration() {
+  const missing = [];
+  if (!process.env.BREVO_API_KEY || !process.env.BREVO_API_KEY.trim()) missing.push("BREVO_API_KEY");
+  if (!isValidEmail(process.env.SENDER_EMAIL)) missing.push("SENDER_EMAIL");
+  return { configured: missing.length === 0, missing };
+}
+
 export function brevoConfigError() {
-  if (!process.env.BREVO_API_KEY || !process.env.BREVO_API_KEY.trim()) {
-    return "BREVO_API_KEY is not configured.";
-  }
-  if (!isValidEmail(process.env.SENDER_EMAIL)) {
-    return "SENDER_EMAIL is not a valid email address.";
-  }
+  const { missing } = emailProviderConfiguration();
+  if (missing.includes("BREVO_API_KEY")) return "BREVO_API_KEY is not configured.";
+  if (missing.includes("SENDER_EMAIL")) return "SENDER_EMAIL is not a valid email address.";
   return null;
 }
 
