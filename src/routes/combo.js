@@ -16,7 +16,7 @@ import ComboConfig, {
 } from "../comboConfig.js";
 import { comboCatalogForUser, descriptorFromCatalog } from "../comboCatalog.js";
 import { ComboCancelledError, runAvailabilityChecks, runModelTest } from "../comboAvailability.js";
-import { ComboError, runComboChat } from "../comboOrchestrator.js";
+import { COMBO_EXECUTION, ComboError, runComboChat } from "../comboOrchestrator.js";
 
 const router = Router();
 
@@ -303,7 +303,7 @@ router.post("/chat", chatRateLimiter, async (req, res, next) => {
       conversationId: prospectiveId,
       messageId: assistantMessageId,
       selectedCount: config.selected.length,
-      strategy: config.settings?.strategy || "parallel"
+      execution: COMBO_EXECUTION
     });
     const result = await runComboChat({
       userId: req.userId,

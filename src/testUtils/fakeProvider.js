@@ -26,6 +26,9 @@ function json(res, status, payload) {
 export async function startFakeProvider() {
   const state = {
     chatRequests: [],
+    chatInFlight: 0,
+    chatMaxInFlight: 0,
+    chatOverlaps: [],
     modelsRequests: 0,
     keyRequests: 0,
     behavior: {
@@ -45,6 +48,8 @@ export async function startFakeProvider() {
       failModel: null,
       failModelStatus: 404,
       failModelMessage: "",
+      modelFailures: {},
+      modelDelayMs: {},
       invalidKey: false,
       finishReason: "stop",
       usageChunk: false,
@@ -67,6 +72,10 @@ export async function startFakeProvider() {
     },
     reset() {
       state.chatRequests.length = 0;
+      openFlights.length = 0;
+      state.chatInFlight = 0;
+      state.chatMaxInFlight = 0;
+      state.chatOverlaps.length = 0;
       state.modelsRequests = 0;
       state.keyRequests = 0;
       state.behavior.listStatus = 200;
@@ -85,6 +94,8 @@ export async function startFakeProvider() {
       state.behavior.failModel = null;
       state.behavior.failModelStatus = 404;
       state.behavior.failModelMessage = "";
+      state.behavior.modelFailures = {};
+      state.behavior.modelDelayMs = {};
       state.behavior.invalidKey = false;
       state.behavior.finishReason = "stop";
       state.behavior.usageChunk = false;
@@ -110,6 +121,11 @@ export async function startFakeProvider() {
     const accepted = state.behavior.acceptedKeys;
     return Array.isArray(accepted) ? accepted.includes(key) : key === FAKE_API_KEY;
   }
+
+  // Open chat requests, in arrival order. A sequential orchestrator must never
+  // let this hold two entries for one task; the peak and the overlap log are the
+  // evidence a test asserts on.
+  const openFlights = [];
 
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, "http://localhost");
@@ -160,8 +176,46 @@ export async function startFakeProvider() {
     if (url.pathname.endsWith("/chat/completions") && req.method === "POST") {
       const body = JSON.parse((await readBody(req)) || "{}");
       state.chatRequests.push({ key, body });
+      const flight = { model: body.model, startedAt: Date.now() };
+      openFlights.push(flight);
+      state.chatInFlight = openFlights.length;
+      state.chatMaxInFlight = Math.max(state.chatMaxInFlight, openFlights.length);
+      if (openFlights.length > 1) {
+        state.chatOverlaps.push({ models: openFlights.map(entry => entry.model), at: Date.now() });
+      }
+      // "finish" fires when the body is handed to the socket, which is strictly
+      // before the caller can read it; "close" also covers an aborted request.
+      // Whichever arrives first ends the flight, so a sequential caller is never
+      // charged with an overlap it did not cause.
+      const finishFlight = () => {
+        const at = openFlights.indexOf(flight);
+        if (at >= 0) openFlights.splice(at, 1);
+        state.chatInFlight = openFlights.length;
+      };
+      res.once("finish", finishFlight);
+      res.once("close", finishFlight);
       if (!acceptsKey(key) || state.behavior.invalidKey) {
         return json(res, 401, { error: { message: "Invalid API key provided." } });
+      }
+      const modelDelay = Number(state.behavior.modelDelayMs?.[body.model]) || 0;
+      if (modelDelay > 0) await new Promise(resolve => setTimeout(resolve, modelDelay));
+      if (res.writableEnded || res.destroyed) return;
+      const modelFailure = state.behavior.modelFailures?.[body.model];
+      if (modelFailure && (!Number.isInteger(modelFailure.remaining) || modelFailure.remaining > 0)) {
+        if (Number.isInteger(modelFailure.remaining)) modelFailure.remaining -= 1;
+        const status = Number(modelFailure.status) || 429;
+        res.writeHead(status, {
+          "Content-Type": "application/json",
+          ...(modelFailure.retryAfter ? { "Retry-After": String(modelFailure.retryAfter) } : {}),
+          ...(modelFailure.headers || {})
+        });
+        return res.end(JSON.stringify(modelFailure.payload || {
+          error: {
+            message: modelFailure.message || `Simulated provider failure for ${body.model}.`,
+            ...(modelFailure.code ? { code: modelFailure.code } : {}),
+            ...(modelFailure.type ? { type: modelFailure.type } : {})
+          }
+        }));
       }
       if (state.behavior.dropConnectionBeforeResponse) {
         // A provider that hangs up without ever answering. The request is still

@@ -1,12 +1,7 @@
 import mongoose from "mongoose";
 
 export const COMBO_SETTINGS_DEFAULTS = {
-  strategy: "parallel",
-  review: true,
-  synthesizer: "auto",
-  minWorkingModels: 1,
   maxWorkingModels: 4,
-  allowSingleFallback: true,
   autoAvailability: true,
   healthTtlMs: 120000,
   timeoutMs: 60000,
@@ -16,7 +11,6 @@ export const COMBO_SETTINGS_DEFAULTS = {
 };
 
 const SETTINGS_LIMITS = {
-  minWorkingModels: { min: 0, max: 8 },
   maxWorkingModels: { min: 1, max: 8 },
   healthTtlMs: { min: 15000, max: 1800000 },
   timeoutMs: { min: 5000, max: 300000 },
@@ -82,16 +76,9 @@ export function normalizeSelectedModels(input) {
 export function normalizeComboSettings(input) {
   const source = input && typeof input === "object" ? input : {};
   const settings = { ...COMBO_SETTINGS_DEFAULTS };
-  if (source.strategy === "sequential" || source.strategy === "parallel") settings.strategy = source.strategy;
-  if (typeof source.review === "boolean") settings.review = source.review;
-  settings.synthesizer = text(source.synthesizer, 220) || "auto";
-  if (typeof source.allowSingleFallback === "boolean") settings.allowSingleFallback = source.allowSingleFallback;
   if (typeof source.autoAvailability === "boolean") settings.autoAvailability = source.autoAvailability;
   for (const [name, limits] of Object.entries(SETTINGS_LIMITS)) {
     settings[name] = clampInteger(source[name], COMBO_SETTINGS_DEFAULTS[name], limits);
-  }
-  if (settings.maxWorkingModels < settings.minWorkingModels) {
-    settings.maxWorkingModels = Math.max(settings.minWorkingModels, 1);
   }
   return settings;
 }
@@ -129,12 +116,7 @@ const selectedModelSchema = new mongoose.Schema({
 }, { _id: false });
 
 const comboSettingsSchema = new mongoose.Schema({
-  strategy: { type: String, enum: ["parallel", "sequential"], default: COMBO_SETTINGS_DEFAULTS.strategy },
-  review: { type: Boolean, default: COMBO_SETTINGS_DEFAULTS.review },
-  synthesizer: { type: String, default: COMBO_SETTINGS_DEFAULTS.synthesizer, maxlength: 220 },
-  minWorkingModels: { type: Number, default: COMBO_SETTINGS_DEFAULTS.minWorkingModels, min: 0, max: 8 },
   maxWorkingModels: { type: Number, default: COMBO_SETTINGS_DEFAULTS.maxWorkingModels, min: 1, max: 8 },
-  allowSingleFallback: { type: Boolean, default: COMBO_SETTINGS_DEFAULTS.allowSingleFallback },
   autoAvailability: { type: Boolean, default: COMBO_SETTINGS_DEFAULTS.autoAvailability },
   healthTtlMs: { type: Number, default: COMBO_SETTINGS_DEFAULTS.healthTtlMs, min: 15000, max: 1800000 },
   timeoutMs: { type: Number, default: COMBO_SETTINGS_DEFAULTS.timeoutMs, min: 5000, max: 300000 },
