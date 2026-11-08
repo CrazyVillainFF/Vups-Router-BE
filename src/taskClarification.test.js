@@ -505,6 +505,30 @@ test("PH4-08 another account cannot read or answer the question", async () => {
 
 // ─── T-7 / T-8 / T-9: what may not be resumed, cancelled, or answered ────────
 
+test("O-9 a paused task can still answer the question it was already holding", async () => {
+  const parked = await parkATask("Pause before answering.", "Which environment should this target?");
+  await Task.updateOne(
+    { taskId: parked.taskId },
+    {
+      $set: {
+        state: "paused",
+        stage: "paused",
+        lease: { owner: "", claimedAt: null, heartbeatAt: null, expiresAt: null }
+      }
+    }
+  );
+
+  const answered = await answer(parked.cookie, parked, { answer: "production" });
+  assert.equal(answered.status, 200, JSON.stringify(answered.body));
+  assert.equal(answered.body.task.state, "queued", "the paused task did not return to the queue");
+
+  const after = await record(parked.taskId);
+  assert.equal(after.state, "queued");
+  const row = after.clarifications.find(item => item.clarificationId === parked.clarification.clarificationId);
+  assert.equal(row.status, "answered");
+  assert.equal(row.answer, "production");
+});
+
 test("PH4-09 resume is not a way past the question, cancel outranks it, and a terminal task refuses", async () => {
   const parked = await parkATask("Publish the newsletter.", "Which mailing list should receive it?");
 

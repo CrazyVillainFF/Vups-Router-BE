@@ -33,6 +33,18 @@ const CONVERSATION_MESSAGE_CAP = 200;
 
 export const ASK_USER_TOOL_NAME = "ask_user";
 
+/**
+ * States in which a pending question may be answered.
+ *
+ * `waiting_for_user → paused` is a legal transition, so a person can pause a
+ * task that is already holding a question. The question outlives the state it
+ * was asked in: refusing the answer there leaves the task with no way forward,
+ * because `/resume` also refuses any task holding a pending row. Both states are
+ * parked and neither is claimable (CLAIMABLE_STATES is queued/recovering), so
+ * answering either one queues the same task exactly once.
+ */
+export const ANSWERABLE_STATES = Object.freeze(["waiting_for_user", "paused"]);
+
 export const TASK_CLARIFY_TOOLS = Object.freeze([
   {
     type: "function",
@@ -257,7 +269,7 @@ export async function answerClarification({ task, clarificationId, answer, now =
       `This task is ${task.state}. Start a new task to do it again.`
     );
   }
-  if (task.state !== "waiting_for_user") {
+  if (!ANSWERABLE_STATES.includes(task.state)) {
     throw new ClarificationError(
       409,
       "state_conflict",
@@ -314,7 +326,7 @@ export async function answerClarification({ task, clarificationId, answer, now =
     // repeat, so the answer is finished here instead of stranding the task.
     const fresh = await Task.findOne({ taskId: task.taskId }).lean();
     const stored = (fresh?.clarifications || []).find(item => item.clarificationId === row.clarificationId);
-    if (stored?.status !== "answered" || fresh.state !== "waiting_for_user") {
+    if (stored?.status !== "answered" || !ANSWERABLE_STATES.includes(fresh.state)) {
       throw new ClarificationError(
         409,
         "clarification_answered",
