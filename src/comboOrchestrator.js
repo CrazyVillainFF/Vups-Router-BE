@@ -6,6 +6,7 @@ import {
   resolveComboProvider
 } from "./comboAvailability.js";
 import { comboFailoverCategory, comboFailureReason } from "./comboFailover.js";
+import { COMBO_MAX_SELECTED_MODELS } from "./comboConfig.js";
 
 export const COMBO_EXECUTION = "sequential-failover";
 
@@ -121,7 +122,7 @@ export async function runComboChat({ userId, config, messages, signal = null, on
   }
   if (cancelled(signal)) throw new ComboCancelledError();
 
-  const limit = Math.max(1, Math.min(8, Number(settings.maxWorkingModels) || 4));
+  const limit = Math.max(1, Math.min(COMBO_MAX_SELECTED_MODELS, Number(settings.maxWorkingModels) || 4));
   const candidates = descriptors.slice(0, limit);
   const deferred = descriptors.slice(limit);
   const runId = randomUUID();

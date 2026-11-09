@@ -10,8 +10,12 @@ export const COMBO_SETTINGS_DEFAULTS = {
   probeTimeoutMs: 20000
 };
 
+// A run may attempt every model the user selected: capping failover below the
+// selection size would strand a working model behind earlier rate-limited ones.
+export const COMBO_MAX_SELECTED_MODELS = 32;
+
 const SETTINGS_LIMITS = {
-  maxWorkingModels: { min: 1, max: 8 },
+  maxWorkingModels: { min: 1, max: COMBO_MAX_SELECTED_MODELS },
   healthTtlMs: { min: 15000, max: 1800000 },
   timeoutMs: { min: 5000, max: 300000 },
   retries: { min: 0, max: 2 },
@@ -19,7 +23,6 @@ const SETTINGS_LIMITS = {
   probeTimeoutMs: { min: 5000, max: 60000 }
 };
 
-export const COMBO_MAX_SELECTED_MODELS = 32;
 const MODEL_KINDS = ["saved", "shared", "vups"];
 const AVAILABILITY_STATUSES = ["working", "not_working", "unknown"];
 
@@ -116,7 +119,7 @@ const selectedModelSchema = new mongoose.Schema({
 }, { _id: false });
 
 const comboSettingsSchema = new mongoose.Schema({
-  maxWorkingModels: { type: Number, default: COMBO_SETTINGS_DEFAULTS.maxWorkingModels, min: 1, max: 8 },
+  maxWorkingModels: { type: Number, default: COMBO_SETTINGS_DEFAULTS.maxWorkingModels, min: 1, max: COMBO_MAX_SELECTED_MODELS },
   autoAvailability: { type: Boolean, default: COMBO_SETTINGS_DEFAULTS.autoAvailability },
   healthTtlMs: { type: Number, default: COMBO_SETTINGS_DEFAULTS.healthTtlMs, min: 15000, max: 1800000 },
   timeoutMs: { type: Number, default: COMBO_SETTINGS_DEFAULTS.timeoutMs, min: 5000, max: 300000 },

@@ -945,6 +945,85 @@ test("availability checks can be cancelled without corrupting the saved statuses
   assert.equal(health.status, 200);
 });
 
+test("ten configured models fail over sequentially, max concurrency = 1, first success stops execution", async () => {
+  const EXTRA_MODEL_TEMPLATE = "extra-model-";
+  const tenModels = Array.from({ length: 9 }, (_, i) => `${EXTRA_MODEL_TEMPLATE}${i + 1}`).concat([FAKE_MODELS[0]]);
+  const extraModelEntries = Array.from({ length: 9 }, (_, i) => ({
+    id: `${EXTRA_MODEL_TEMPLATE}${i + 1}`,
+    name: `${EXTRA_MODEL_TEMPLATE}${i + 1}`,
+    owned_by: "fake",
+    pricing: { prompt: "0", completion: "0", request: "0" }
+  }));
+
+  fake.state.reset();
+  fake.state.set({
+    extraModels: extraModelEntries,
+    chatResponder: (body, model) => `ANSWER:${model}`
+  });
+
+  const { cookie } = await signupUser();
+  await saveProvider(cookie, { id: "10model-provider", name: "10 Model Provider", key: FAKE_API_KEY, models: tenModels });
+
+  const { catalog } = await comboState(cookie);
+  const selected = tenModels.map(model => {
+    const entry = catalog.models.find(row => row.kind === "saved" && row.model === model);
+    assert.ok(entry, `catalog entry for ${model}`);
+    return entry;
+  });
+
+  const config = await selectModels(cookie, selected, { maxWorkingModels: 10, timeoutMs: 30000, retries: 0 });
+  assert.equal(config.settings.maxWorkingModels, 10, "the ceiling admits a 10-model attempt list");
+
+  // First 9 models fail with rate limits, 10th succeeds
+  const failingModels = tenModels.slice(0, 9);
+  fake.state.set({
+    modelFailures: Object.fromEntries(failingModels.map(model => [
+      model,
+      { status: 429, message: "Rate limit reached." }
+    ]))
+  });
+
+  clearRequestLog();
+
+  const run = await runCombo(cookie);
+  assert.equal(run.status, 200, run.raw);
+
+  const done = doneEvent(run.events);
+  assert.ok(done, "should reach a done event");
+  assert.equal(done.attemptedCount, 10, "all 10 models should be attempted");
+  assert.equal(done.finalModel.model, FAKE_MODELS[0], "tenth model should answer");
+  assert.equal(done.switches.length, 9, "nine switches between models");
+
+  // Verify exact execution order
+  const actualModels = requestedModels();
+  assert.deepEqual(actualModels, tenModels, "exact sequential order preserved");
+
+  // Verify no overlaps occurred
+  assertOneAtATime();
+
+  // Verify event stream shows correct switching phases
+  const stagePhases = eventOfType(run.events, "stage").map(e => e.phase);
+  assert.ok(stagePhases.includes("starting"), "must have starting phase");
+  assert.ok(stagePhases.includes("switching"), "must have switching phases");
+  assert.ok(stagePhases.includes("finalizing"), "must have finalizing phase");
+
+  const modelStarted = eventOfType(run.events, "model").filter(e => e.status === "started");
+  assert.equal(modelStarted.length, 10, "all 10 models must show started");
+
+  const modelFinished = eventOfType(run.events, "model").filter(e => e.status === "finished");
+  assert.equal(modelFinished.length, 1, "only tenth model shows finished");
+
+  const modelFailed = eventOfType(run.events, "model").filter(e => e.status === "failed");
+  assert.equal(modelFailed.length, 9, "first nine models show failed");
+
+  // All failures must be rate_limit_requests category
+  const failedCategories = modelFailed.map(e => e.category).sort((a, b) => a.localeCompare(b));
+  assert.deepEqual(failedCategories, Array(9).fill("rate_limit_requests"));
+
+  // Delta content comes only from the tenth model
+  assert.equal(deltaText(run.events), `ANSWER:${FAKE_MODELS[0]}`);
+});
+
 // A Combo turn is sent from the chat composer, so it has to land in the same
 // reloadable history as a single-model answer. These run against the real route,
 // a real database and the fake provider - no mocked persistence layer.
