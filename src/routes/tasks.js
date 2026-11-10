@@ -23,6 +23,7 @@ import {
   pendingClarificationPayload
 } from "../taskClarification.js";
 import { abortTask } from "../taskWorker.js";
+import { notifyTaskCancelled, notifyTaskQueued } from "../taskDispatch.js";
 import { progressText } from "../taskEvents.js";
 
 /**
@@ -55,6 +56,14 @@ function textBody(value, limit = MAX_MESSAGE_ID_CHARS) {
 
 function taskField(task) {
   return { task: withClarification(taskSummary(task), task, { full: false }) };
+}
+
+/**
+ * Nudge the service that runs tasks. The queue row is the authority and the worker polls it, so this
+ * only removes the wait for that poll — never awaited, and never allowed to fail a user's request.
+ */
+function wakeRunner(taskId) {
+  notifyTaskQueued(taskId).catch(() => {});
 }
 
 /** The full record, for the screen that shows the question and takes the answer. */
@@ -124,6 +133,7 @@ router.post("/", chatRateLimiter, async (req, res, next) => {
       ...(conversationId ? { conversationId } : {}),
       request: requestFrom(req.body)
     });
+    wakeRunner(task.taskId);
     return res.status(202).json(taskField(task));
   } catch (error) {
     return next(error);
@@ -206,6 +216,7 @@ router.post("/:taskId/cancel", chatRateLimiter, async (req, res, next) => {
     await connectToDatabase();
     const { task } = await cancelTask({ taskId: req.params.taskId, userId: req.userId });
     abortTask(task.taskId);
+    notifyTaskCancelled(task.taskId).catch(() => {});
     return res.json(taskDetailField(task));
   } catch (error) {
     if (error instanceof TaskNotFoundError) {
@@ -255,6 +266,7 @@ router.post("/:taskId/resume", chatRateLimiter, async (req, res, next) => {
       stage: "queued",
       event: { phase: "task", status: "running", key: "queued", message: progressText("Queued again to carry on.") }
     });
+    wakeRunner(task.taskId);
     return res.json(taskDetailField(task));
   } catch (error) {
     if (error instanceof TaskNotFoundError) {
@@ -293,6 +305,7 @@ router.post("/:taskId/clarifications/:clarificationId/answer", chatRateLimiter, 
       clarificationId: req.params.clarificationId,
       answer: req.body?.answer
     });
+    wakeRunner(answered.taskId);
     return res.json(taskDetailField(answered));
   } catch (error) {
     if (error instanceof TaskNotFoundError) {

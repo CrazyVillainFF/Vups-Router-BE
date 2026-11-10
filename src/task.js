@@ -179,6 +179,22 @@ const leaseSchema = new mongoose.Schema({
   expiresAt: { type: Date, default: null }
 }, { _id: false });
 
+const dispatchSchema = new mongoose.Schema({
+  // What happened when the service that accepted the submission told the service that runs tasks
+  // that the work exists. It is a hand-off receipt, not a requirement: `not_configured` is the
+  // normal steady state for a single-service deployment, and a task reaches `completed` whatever
+  // is in here, because the queue row — not this notification — is what carries the work.
+  status: {
+    type: String,
+    enum: ["", "accepted", "rejected", "unreachable", "timeout", "not_configured"],
+    default: ""
+  },
+  code: { type: String, default: "", maxlength: 60 },
+  httpStatus: { type: Number, default: 0 },
+  attempts: { type: Number, default: 0 },
+  lastAt: { type: Date, default: null }
+}, { _id: false });
+
 const requestSchema = new mongoose.Schema({
   // The selection the user made, not the resolved key: a task re-resolves its
   // provider when it runs, so a rotated key is picked up and no secret is stored.
@@ -226,6 +242,7 @@ const taskSchema = new mongoose.Schema({
   request: { type: requestSchema, default: () => ({}) },
   result: { type: resultSchema, default: () => ({}) },
   lease: { type: leaseSchema, default: () => ({}) },
+  dispatch: { type: dispatchSchema, default: () => ({}) },
   cancelRequestedAt: { type: Date, default: null },
   cancelRequestedBy: { type: String, default: "", maxlength: 40 },
   steps: { type: Number, default: 0 },

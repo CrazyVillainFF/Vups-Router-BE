@@ -116,6 +116,20 @@ export function runningTaskIds() {
   return [...inFlight.keys()];
 }
 
+/**
+ * Look for work now rather than on the next tick.
+ *
+ * This is what a hand-off from the service that accepted a submission is worth: it shortens the wait
+ * for the first claim pass to one request. It claims nothing by itself — `tick` answers the same way
+ * it always does when a pass is already under way, and when no scheduler is running here it does
+ * nothing at all, which is the correct answer on a Main-only process.
+ */
+export async function kickTaskWorker() {
+  if (timer === null || shuttingDown) return false;
+  await tick().catch(() => {});
+  return true;
+}
+
 export function isTaskRunningLocally(taskId) {
   return inFlight.has(taskId);
 }
@@ -322,6 +336,15 @@ export async function executeTask(claimed, controllerOverride) {
           lostLease = true;
           controller.abort();
         }
+      })
+      .catch(() => {});
+    // The same beat reads the one thing a peer service can only write. A cancellation always
+    // reaches the record first — the cancel route owns that transition — and this is what lets a
+    // run held here stop because of it even when the process the user talked to is not this one
+    // and the interrupt request between them never arrived.
+    cancelRequested(task.taskId)
+      .then(status => {
+        if (status.cancelled) controller.abort();
       })
       .catch(() => {});
   }, Math.max(1000, Math.floor(taskLeaseMs() / 3)));

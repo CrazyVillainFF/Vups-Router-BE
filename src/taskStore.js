@@ -63,7 +63,13 @@ function descriptionText(value) {
   return String(value ?? "").trim().slice(0, MAX_TASK_DESCRIPTION_CHARS);
 }
 
-/** Fields a plain writer may change. `state` is deliberately absent. */
+/**
+ * Fields a plain writer may change. `state` is deliberately absent, and so are `lease` and
+ * `dispatch`: those are written by a named owner with its own guarded update, and carrying them here
+ * would let a holder's copy — loaded before the other service wrote its row — stamp the older value
+ * back over it. A hand-off receipt erased by the first transition of the task it describes is the
+ * bug that rule prevents.
+ */
 function mutableFields(task) {
   return {
     conversationId: task.conversationId || "",
@@ -417,6 +423,41 @@ export async function releaseLease(task, { owner }) {
   );
 }
 
+// A hand-off that did not land still has a reason, and the reason decides whether a report can say
+// "the runner was told" or only "the runner found the work by itself".
+const DISPATCH_STATUS_BY_CODE = Object.freeze({
+  accepted: "accepted",
+  dispatch_timeout: "timeout",
+  dispatch_unreachable: "unreachable",
+  dispatch_not_configured: "not_configured"
+});
+
+/**
+ * Write down what the notification to the runner achieved.
+ *
+ * A terminal task is not written to: a hand-off that arrives after the work is over is late, not
+ * interesting, and rewriting a finished record's history for it would be exactly the thing the other
+ * guarded writers here exist to prevent.
+ */
+export async function recordDispatchAttempt(taskId, outcome = {}) {
+  const status = outcome.ok
+    ? "accepted"
+    : DISPATCH_STATUS_BY_CODE[outcome.code] || "rejected";
+  await Task.updateOne(
+    { taskId, state: { $nin: TERMINAL_STATES } },
+    {
+      $inc: { "dispatch.attempts": 1 },
+      $set: {
+        "dispatch.status": status,
+        "dispatch.code": progressText(outcome.code, 60),
+        "dispatch.httpStatus": Number.isFinite(outcome.status) ? Math.trunc(outcome.status) : 0,
+        "dispatch.lastAt": new Date()
+      }
+    }
+  );
+  return status;
+}
+
 /**
  * A user cancelling a task is the only thing that may stop it besides a real
  * terminal condition, so it is a recorded action with its own event — not a
@@ -542,7 +583,14 @@ export function taskSummary(task) {
       retryable: task.error?.retryable === true,
       providerStatus: task.error?.providerStatus ?? null
     },
-    waitingOn: waitingOn(task)
+    waitingOn: waitingOn(task),
+    // How the work reached a runner. Empty means nothing was ever sent, which is the ordinary
+    // single-service case and not a fault.
+    dispatch: {
+      status: task.dispatch?.status || "",
+      attempts: task.dispatch?.attempts || 0,
+      lastAt: task.dispatch?.lastAt || null
+    }
   };
 }
 
